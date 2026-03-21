@@ -1,0 +1,39 @@
+collection_name: agent
+persist_directory: chroma_db
+k: 8              # 增加召回数量
+data_path: data
+md5_hex_store: md5.text
+allow_knowledge_file_type: ["txt", "pdf", "docx", "ppt", "pptx", "png", "jpg", "jpeg", "webp", "gif", "bmp"]
+
+# ============== 分块配置 - 优化版 ==============
+chunk_size: 1000      # 增大，单页PPT内容较多
+chunk_overlap: 200    # 增加重叠，保持上下文连贯
+separators: [
+  "\n\n\n",      # 大段落分隔
+  "\n\n",        # 段落分隔
+  "\n",          # 换行
+  "。",          # 中文句子
+  "！",          # 感叹句
+  "？",          # 疑问句
+  ". ",          # 英文句子
+  "! ",          # 英文感叹
+  "? ",          # 英文疑问
+  ", ",          # 英文逗号
+  " ",           # 空格
+  ""             # 字符级
+]
+
+# ============== 混合检索配置 ==============
+# BM25 + 向量 RRF 混合检索
+bm25_weight: 0.3      # BM25 权重 (关键词匹配)
+vector_weight: 0.7    # 向量权重 (语义匹配)
+rrf_k: 60            # RRF 公式参数
+
+# 检索参数
+retrieve_top_k: 10    # 混合检索召回数量
+rerank_top_k: 8      # 重排候选数量
+rerank_final_k: 5    # 最终返回数量
+
+# MMR 多样性参数 (可选)
+mmr_enabled: false    # 是否启用 MMR 多样性检索
+mmr_lambda: 0.5       # 0=多样性, 1=相关性

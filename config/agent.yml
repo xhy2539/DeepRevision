@@ -1,0 +1,6 @@
+external_data_path: data/external/records.csv
+
+# 联网搜索配置
+web_search:
+  enabled: true  # 是否启用联网搜索功能 (true=启用, false=禁用)
+  # 如果启用，Agent 可以联网搜索来辅助验证答案和查找试卷格式

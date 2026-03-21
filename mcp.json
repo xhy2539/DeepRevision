@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "G:/复习助手/DeepRevision/data"]
+    },
+    "deep-revision": {
+      "command": "python",
+      "args": ["G:/复习助手/DeepRevision/mcp_server.py"]
+    }
+  }
+}

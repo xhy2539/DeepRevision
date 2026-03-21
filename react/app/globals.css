@@ -1,0 +1,212 @@
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============== DeepRevision 设计系统 ============== */
+@layer base {
+  :root {
+    /* 学术优雅风配色 */
+    --brand: 13 148 136;        /* 青绿 #0D9488 */
+    --brand-dark: 15 118 110;   /* 深青绿 #0F766E */
+    --accent: 245 158 11;       /* 琥珀色 #F59E0B */
+
+    --background: 250 250 250;  /* 浅灰白 */
+    --foreground: 24 24 27;     /* 近黑色 */
+
+    --card: 255 255 255;
+    --card-foreground: 24 24 27;
+
+    --popover: 255 255 255;
+    --popover-foreground: 24 24 27;
+
+    --primary: 13 148 136;
+    --primary-foreground: 255 255 255;
+
+    --secondary: 241 245 249;
+    --secondary-foreground: 51 65 85;
+
+    --muted: 241 245 249;
+    --muted-foreground: 100 116 139;
+
+    --accent: 245 158 11;
+    --accent-foreground: 0 0 0;
+
+    --destructive: 239 68 68;
+    --destructive-foreground: 255 255 255;
+
+    --border: 226 232 240;
+    --input: 226 232 240;
+    --ring: 13 148 136;
+
+    --radius: 0.75rem;
+
+    /* 题型颜色 */
+    --quiz-choice: 59 130 246;   /* 蓝色 - 选择题 */
+    --quiz-fill: 34 197 94;      /* 绿色 - 填空题 */
+    --quiz-judge: 249 115 22;    /* 橙色 - 判断题 */
+    --quiz-short: 168 85 247;    /* 紫色 - 简答题 */
+  }
+
+  /* 暗色主题（可选） */
+  .dark {
+    --background: 15 23 42;
+    --foreground: 248 250 252;
+
+    --card: 30 41 59;
+    --card-foreground: 248 250 252;
+
+    --popover: 30 41 59;
+    --popover-foreground: 248 250 252;
+
+    --primary: 20 184 166;
+    --primary-foreground: 0 0 0;
+
+    --secondary: 51 65 85;
+    --secondary-foreground: 248 250 252;
+
+    --muted: 51 65 85;
+    --muted-foreground: 148 163 184;
+
+    --border: 51 65 85;
+    --input: 51 65 85;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-[rgb(var(--background))] text-[rgb(var(--foreground))];
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}
+
+/* ============== 动画系统 ============== */
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes scaleIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+/* 消息动画 */
+.message-enter {
+  animation: slideUp 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.message-enter:nth-child(1) { animation-delay: 0s; }
+.message-enter:nth-child(2) { animation-delay: 0.05s; }
+.message-enter:nth-child(3) { animation-delay: 0.1s; }
+.message-enter:nth-child(4) { animation-delay: 0.15s; }
+.message-enter:nth-child(5) { animation-delay: 0.2s; }
+
+/* 题目卡片动画 */
+.quiz-card {
+  animation: scaleIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  animation-delay: calc(var(--card-index, 0) * 0.05s);
+  opacity: 0;
+}
+
+/* 思考链打字机效果 */
+.thought-typing {
+  animation: pulse-soft 1s ease-in-out infinite;
+}
+
+/* 毛玻璃效果 */
+.glass {
+  background: rgba(255, 255, 255, 0.8);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+/* 按钮悬停效果 */
+.btn-hover {
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.btn-hover:hover {
+  transform: scale(1.02);
+  box-shadow: 0 4px 12px rgba(13, 148, 136, 0.2);
+}
+
+.btn-hover:active {
+  transform: scale(0.98);
+}
+
+/* 输入框聚焦效果 */
+.input-focus {
+  transition: all 0.2s ease;
+}
+
+.input-focus:focus {
+  box-shadow: 0 0 0 3px rgba(13, 148, 136, 0.15);
+  border-color: rgb(var(--brand));
+}
+
+/* 滚动条美化 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* 题型标签颜色 */
+.quiz-tag-choice {
+  @apply bg-blue-100 text-blue-700 border-blue-200;
+}
+
+.quiz-tag-fill {
+  @apply bg-green-100 text-green-700 border-green-200;
+}
+
+.quiz-tag-judge {
+  @apply bg-orange-100 text-orange-700 border-orange-200;
+}
+
+.quiz-tag-short {
+  @apply bg-purple-100 text-purple-700 border-purple-200;
+}
