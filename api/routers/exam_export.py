@@ -89,15 +89,19 @@ def parse_exam_content(exam_paper: str) -> dict:
         if not line:
             continue
 
-        # 检测题型
+        # 检测题型（fix #11：用 matched 标志位，避免 current_section 非空后短路）
+        matched = False
         for qtype, patterns in type_patterns.items():
             for pattern in patterns:
                 if pattern.search(line):
                     current_section = qtype
                     current_question = None
+                    matched = True
                     break
-            if current_section:
+            if matched:
                 break
+        if matched:
+            continue
 
         # 检测题目编号
         q_match = re.match(r'^(\d+)[.、]\s*(.+)', line)
@@ -318,15 +322,24 @@ async def generate_answer_sheet(request: AnswerSheetRequest):
 
 @router.get("/download/{filename}")
 async def download_file(filename: str):
-    """下载文件"""
-    filepath = os.path.join(TEMP_DIR, filename)
+    """下载文件（fix #1：路径遍历防护；fix #18：下载后自动删除临时文件）"""
+    from fastapi.responses import FileResponse
+    from starlette.background import BackgroundTask
+
+    # 只取文件名部分，防止路径遍历
+    safe_name = os.path.basename(filename)
+    filepath = os.path.realpath(os.path.join(TEMP_DIR, safe_name))
+    temp_dir_real = os.path.realpath(TEMP_DIR)
+
+    if not filepath.startswith(temp_dir_real + os.sep):
+        raise HTTPException(status_code=400, detail="非法文件名")
 
     if not os.path.exists(filepath):
         raise HTTPException(status_code=404, detail="文件不存在")
 
-    from fastapi.responses import FileResponse
     return FileResponse(
         filepath,
         media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        filename=filename
+        filename=safe_name,
+        background=BackgroundTask(os.remove, filepath),
     )

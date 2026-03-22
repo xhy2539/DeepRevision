@@ -4,6 +4,7 @@ from langchain_community.retrievers import BM25Retriever
 from model.factory import chat_model
 from rag.vector_store import VectorStoreService
 from utils.prompt_loader import load_rag_prompts
+from utils.config_handler import chroma_conf
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from typing import List, Dict, Any
@@ -76,17 +77,18 @@ class RagSummarizeService:
         self.vector_retriever = self.vector_store_service.get_retriever()
         self.bm25_retriever = None
 
-        # ============== 检索配置 (从 chroma.yml 读取) ==============
-        self.rerank_top_k = 15    # 混合检索召回数量（增加以获得更多上下文）
-        self.final_top_k = 8      # 最终返回数量（增加给 Agent 更多参考）
-        self.rrf_k = 60          # RRF 公式中的 k 值
-        self.mmr_enabled = False  # MMR 多样性检索
-        self.mmr_lambda = 0.5     # MMR 平衡参数
+        # ============== 检索配置（从 chroma.yml 读取）==============
+        self.rerank_top_k = chroma_conf.get('retrieve_top_k', 10)
+        self.final_top_k = chroma_conf.get('rerank_top_k', 8)
+        self.rrf_k = chroma_conf.get('rrf_k', 60)
+        self.mmr_enabled = chroma_conf.get('mmr_enabled', False)
+        self.mmr_lambda = chroma_conf.get('mmr_lambda', 0.5)
 
         logger.info("[RAG] 初始化混合检索系统 (BM25 + 向量 RRF)")
 
         # ============== 创建混合检索器 ==============
         self.refresh()
+
     def refresh(self):
         """
         刷新检索器状态。当知识库（Chroma）中文档发生变化时，调用此方法重新构建 BM25 索引。
@@ -137,18 +139,14 @@ class RagSummarizeService:
     async def retriever_docs(self, query: str) -> list[Document]:
         return await self.retriever.ainvoke(query)
 
-    def _rerank(self, query: str, docs: list[Document]) -> list[Document]:
+    async def _rerank(self, query: str, docs: list[Document]) -> list[Document]:
         """
-        使用 LLM 对检索结果重排序
+        使用 LLM 对检索结果重排序（fix #9：改为 async，使用 ainvoke 避免阻塞 event loop）
         """
         if not docs or len(docs) <= 1:
             return docs
 
         try:
-            # 使用 LLM 对文档进行相关性打分和排序
-            from langchain_core.output_parsers import StrOutputParser
-
-            # 构建 prompt
             doc_texts = "\n\n".join([
                 f"【文档{i+1}】{doc.page_content[:500]}"
                 for i, doc in enumerate(docs)
@@ -163,35 +161,49 @@ class RagSummarizeService:
 
 请按相关性从高到低排序，返回文档编号列表（格式：1, 2, 3... 只返回编号列表，不需要其他内容）。"""
 
-            # 调用 LLM
-            response = chat_model.invoke(rerank_prompt)
+            # 异步调用 LLM（fix #9）
+            response = await chat_model.ainvoke(rerank_prompt)
             ranking = response.content.strip()
 
-            # 解析排序结果
             try:
-                # 尝试解析返回的编号
                 ranks = [int(x.strip()) for x in ranking.split(",") if x.strip().isdigit()]
                 if ranks:
-                    # 按排名顺序重排
                     reranked = []
                     for rank in ranks:
                         if 0 < rank <= len(docs):
                             reranked.append(docs[rank - 1])
-                    # 添加未收录的文档
                     for doc in docs:
                         if doc not in reranked:
                             reranked.append(doc)
                     print(f"[LLM Rerank] 原始 {len(docs)} 个 -> 重排后 {len(reranked)} 个")
                     return reranked[:self.final_top_k]
-            except:
+            except Exception:  # fix #15：不用裸 except
                 pass
 
-            # 如果解析失败，直接返回原始结果
             return docs[:self.final_top_k]
 
         except Exception as e:
             logger.warning(f"[LLM Rerank] 重排序失败: {e}")
             return docs[:self.final_top_k]
+
+    async def retrieve_context(self, query: str) -> str:
+        """
+        只做检索，返回格式化后的原始课件片段字符串，不调用最终 LLM。
+        供 Supervisor RAG SubAgent 使用，避免双重 LLM 调用。
+        """
+        try:
+            expanded_query = await self.rewrite_chain.ainvoke({"question": query})
+        except Exception:
+            expanded_query = query
+
+        context_docs = await self.retriever_docs(expanded_query)
+        if context_docs and len(context_docs) > 1:
+            context_docs = await self._rerank(expanded_query, context_docs)
+
+        context = ""
+        for i, doc in enumerate(context_docs, 1):
+            context += f"[参考资料{i}]:参考资料:{doc.page_content}|参考元数据:{doc.metadata}\n"
+        return context
 
     async def rag_summarize(self, query: str) -> str:
         # [高级流机制1] Query Rewrite
@@ -208,7 +220,7 @@ class RagSummarizeService:
 
         # [高级流机制3] Cross-Encoder 重排序，精筛 Top 3
         if context_docs and len(context_docs) > 1:
-            context_docs = self._rerank(expanded_query, context_docs)
+            context_docs = await self._rerank(expanded_query, context_docs)
 
         context = ""
         counter = 0

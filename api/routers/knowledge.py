@@ -1,4 +1,6 @@
 import os
+import re
+import json
 import hashlib
 import shutil
 from typing import List
@@ -16,6 +18,19 @@ router = APIRouter()
 MAX_FILES = 5
 ALLOWED_SUFFIX = {".pdf", ".docx", ".txt", ".ppt", ".pptx", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 
+# session_id 白名单校验（防止路径遍历，允许中文）
+_VALID_SESSION_ID = re.compile(r'^[\u4e00-\u9fa5a-zA-Z0-9_\-]{1,64}$')
+
+
+def _validate_session_id(session_id: str) -> str:
+    """校验 session_id，防止路径遍历攻击"""
+    if not _VALID_SESSION_ID.match(session_id):
+        raise HTTPException(
+            status_code=400,
+            detail="session_id 格式非法，只允许字母、数字、中文、下划线和连字符（最长64位）",
+        )
+    return session_id
+
 
 def _compute_bytes_md5(data: bytes) -> str:
     """计算内存中字节流的 MD5"""
@@ -32,19 +47,33 @@ def _load_existing_md5s(md5_path: str) -> set:
 
 def process_document_task(filenames: list, session_id: str = "default"):
     """
-    后台处理任务：执行向量存入操作（支持多文件批量）
+    后台处理任务：执行向量存入操作（支持多文件批量）。
+    FastAPI BackgroundTasks 对同步函数在线程池中运行，
+    故用 asyncio.run() 驱动内部的异步 load_document（fix：之前未 await 导致向量化从不执行）。
     """
-    current_session_id.set(session_id)
-    try:
+    import asyncio as _asyncio
+
+    async def _run():
+        current_session_id.set(session_id)
         vs = VectorStoreService()
-        vs.load_document()
-        
+        await vs.load_document()
+
         # 触发 RAG 缓存刷新，确保 BM25 索引同步更新
-        if session_id in _rag_cache:
-            logger.info(f"[后台任务] 正在刷新 session [{session_id}] 的 RAG 缓存...")
-            _rag_cache[session_id].refresh()
-            
+        # fix: 即使 _rag_cache 中没有该 session，也需要刷新或创建新实例
+        from agent.tools.agent_tools import _rag_cache as rag_cache_ref
+        if session_id in rag_cache_ref:
+            logger.info(f"[后台任务] 刷新已有 session [{session_id}] 的 RAG 缓存...")
+            rag_cache_ref[session_id].refresh()
+        else:
+            # 如果缓存中没有，创建新实例（确保 BM25 索引正确加载）
+            logger.info(f"[后台任务] 为 session [{session_id}] 创建新的 RAG 实例...")
+            from rag.rag_service import RagSummarizeService
+            rag_cache_ref[session_id] = RagSummarizeService()
+
         logger.info(f"[后台任务] 批次 {filenames} 已成功载入科目 [{session_id}] 知识库，并完成向量化！")
+
+    try:
+        _asyncio.run(_run())
     except Exception as e:
         logger.error(f"[后台任务] 批次 {filenames} 知识库解析失败: {str(e)}")
 
@@ -59,10 +88,12 @@ async def upload_documents(
     接收用户上传的文件（txt/pdf/docx），最多 5 个。
     在保存前先对内存字节做 MD5 去重，避免重复文件入库。
     """
+    logger.info(f"[上传] 收到请求，session_id={session_id}，files={[f.filename for f in files]}")
+    logger.info(f"[上传] 调试 - 接收到的 session_id: '{session_id}'")
     if len(files) > MAX_FILES:
         raise HTTPException(status_code=400, detail=f"每次最多上传 {MAX_FILES} 个文件，当前选择了 {len(files)} 个。")
 
-    # 绑定会话上下文
+    _validate_session_id(session_id)  # fix #2
     current_session_id.set(session_id)
 
     data_root = get_abs_path(chroma_conf['data_path'])
@@ -170,7 +201,7 @@ def _parse_sample_paper_format(content: str) -> dict:
 只返回JSON格式。"""
 
     try:
-        from langchain_core.prompts import PromptTemplate
+        from langchain_core.prompts import PromptTemplate  # fix #17：删除下方重复 import
         prompt_template = PromptTemplate.from_template(prompt)
         chain = prompt_template | chat_model | StrOutputParser()
 
@@ -195,22 +226,24 @@ async def upload_sample_paper(
     file: UploadFile = File(...),
     session_id: str = Query(default="default")
 ):
-    """
-    上传样卷，学习试卷格式
-    """
-    # 读取文件内容
+    """上传样卷，学习试卷格式"""
+    _validate_session_id(session_id)  # fix #2
+
+    # fix #12：提前校验文件名，避免 splitext(None) 抛 AttributeError
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="文件名不能为空")
+
     content = await file.read()
 
-    # 解析格式
     from utils.file_handler import document_loader
     import tempfile
 
-    # 保存到临时文件进行解析
-    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
-        tmp.write(content)
-        tmp_path = tmp.name
-
+    tmp_path = None  # fix #12：提前初始化，防止 finally 中 NameError
     try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+
         # 解析文档
         docs = document_loader(tmp_path)
         text_content = "\n\n".join([doc.page_content for doc in docs])
@@ -249,16 +282,15 @@ async def upload_sample_paper(
             "message": f"样卷上传失败: {str(e)}"
         }
     finally:
-        # 清理临时文件
-        if os.path.exists(tmp_path):
+        # fix #12：tmp_path 可能未赋值（异常发生在 NamedTemporaryFile 之前时）
+        if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
 
 
 @router.get("/sample")
 async def get_sample_paper(session_id: str = Query(default="default")):
-    """
-    获取当前科目的样卷内容和格式
-    """
+    """获取当前科目的样卷内容和格式"""
+    _validate_session_id(session_id)  # fix #2
     sample_dir = os.path.join(SAMPLE_PAPER_DIR, session_id)
     sample_file = os.path.join(sample_dir, "sample_paper.txt")
     format_file = os.path.join(sample_dir, "sample_format.json")
@@ -341,9 +373,8 @@ def get_sample_paper_context(session_id: str) -> str:
 
 @router.delete("/sample")
 async def delete_sample_paper(session_id: str = Query(default="default")):
-    """
-    删除样卷
-    """
+    """删除样卷"""
+    _validate_session_id(session_id)  # fix #2
     sample_dir = os.path.join(SAMPLE_PAPER_DIR, session_id)
 
     if not os.path.exists(sample_dir):
@@ -358,10 +389,8 @@ async def delete_sample_paper(session_id: str = Query(default="default")):
 
 @router.get("/list")
 async def list_documents(session_id: str = Query(default="default")):
-    """
-    列出当前 Session 知识库中已完成向量化嵌入的文件。
-    判定标准：文件的 MD5 已记录在 md5_hex_store 中，即真正入库完毕。
-    """
+    """列出当前 Session 知识库中已上传的文件（不管是否完成向量化）。"""
+    _validate_session_id(session_id)  # fix #2
     data_root = get_abs_path(chroma_conf['data_path'])
     session_data_dir = os.path.join(data_root, session_id)
     md5_store_name = chroma_conf.get('md5_hex_store', '.md5_hex_store')
@@ -370,7 +399,7 @@ async def list_documents(session_id: str = Query(default="default")):
     if not os.path.isdir(session_data_dir):
         return {"code": 200, "files": [], "total": 0}
 
-    # 读取已完成向量化的 MD5 集合
+    # 读取已完成向量化的 MD5 集合（用于标记状态）
     embedded_md5s = _load_existing_md5s(md5_store_path)
 
     files = []
@@ -383,21 +412,21 @@ async def list_documents(session_id: str = Query(default="default")):
 
         fpath = os.path.join(session_data_dir, fname)
 
-        # 只显示 MD5 已记录的文件（向量化完成）
         try:
             with open(fpath, "rb") as f:
                 file_md5 = hashlib.md5(f.read()).hexdigest()
         except Exception:
             continue
 
-        if file_md5 not in embedded_md5s:
-            continue  # 尚未完成向量化，跳过
-
         stat = os.stat(fpath)
+        # 检查是否已完成向量化
+        embedded = file_md5 in embedded_md5s
+
         files.append({
             "filename": fname,
             "size": stat.st_size,
             "modified_at": int(stat.st_mtime),
+            "embedded": embedded,  # 标记是否已完成向量化
         })
 
     # 按修改时间倒序（最新在前）

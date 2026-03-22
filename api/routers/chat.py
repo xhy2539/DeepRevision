@@ -1,58 +1,58 @@
 import json
 import asyncio
-from fastapi import APIRouter, Body, Request
+import re
+from fastapi import APIRouter, Body, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from langchain_classic.agents import create_tool_calling_agent, AgentExecutor
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
 
-from model.factory import chat_model
-from utils.prompt_loader import load_system_prompts
-from agent.tools.agent_tools import tools, clear_rag_cache
-from utils.logger_handler import logger, update_token_stats
+from agent.tools.agent_tools import clear_rag_cache
+from agent.multi_agent.supervisor import supervisor_workflow
+from utils.logger_handler import logger, update_token_stats, get_system_stats
 from utils.memory_service import memory_manager
 from utils.session_context import current_session_id
 from rag.vector_store import VectorStoreService
 
 router = APIRouter()
 
+# Supervisor 子 Agent 进度提示语
+_NODE_LABELS = {
+    "rag_agent":     "知识库检索中...",
+    "quiz_agent":    "生成题目（Reflexion 优化中）...",
+    "exam_agent":    "生成试卷（Reflexion 优化中）...",
+    "planner_agent": "制定复习计划...",
+}
+
 class ChatRequest(BaseModel):
     query: str
     session_id: str = "default_session"
 
-def init_agent():
-    # 获取重写后的主系统提示词
-    system_prompt = load_system_prompts()
-    
-    # 动态插入记忆图谱和近期滑窗插槽
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt + "\n\n{memory_context}"),
-        MessagesPlaceholder(variable_name="chat_history"),
-        MessagesPlaceholder(variable_name="agent_scratchpad"),
-        ("human", "{input}")
-    ])
-    
-    agent = create_tool_calling_agent(chat_model, tools, prompt)
-    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
-    return agent_executor
-
-app_agent = init_agent()
 
 @router.post("/stream")
 async def chat_stream_endpoint(request: Request):
     """
-    流式对话接口，包含记忆组装与对话截断入库。
+    流式对话接口：Supervisor 多 Agent 路由 + 记忆组装与入库。
     """
+    logger.info("=" * 50)
+    logger.info(f"收到对话请求")
     body = await request.json()
     session_id = body.get("session_id", "default")
     query = body.get("query", "")
+    logger.info(f"session_id={session_id}, query={query[:50]}...")
 
-    # 注册当前的 Session ID 给线程内上下文，保证 RAG 检索时知道该查哪个集合
+    # 安全校验：session_id 路径穿越防护（允许中文）
+    if not re.match(r'^[\u4e00-\u9fa5a-zA-Z0-9_\-]{1,64}$', session_id):
+        logger.warning(f"非法 session_id: {session_id}")
+        raise HTTPException(status_code=400, detail="非法 session_id")
+
+    # 输入校验：query 长度限制
+    query = query[:2000]
+
+    # 注册当前 Session ID，保证 RAG 检索走对应集合
     current_session_id.set(session_id)
-    
-    # 1. 向模型拉取近期记录转为LangChain格式
+
+    # 1. 近期滑窗记录 → LangChain 消息格式
     memory_manager._init_session(session_id)
     recent_records = memory_manager.store[session_id]["recent"]
     chat_history = []
@@ -61,95 +61,119 @@ async def chat_stream_endpoint(request: Request):
             chat_history.append(HumanMessage(content=msg["content"]))
         else:
             chat_history.append(AIMessage(content=msg["content"]))
-            
-    # 2. 提取长期图谱记忆
+
+    # 2. 长期图谱记忆摘要
     graph_context = memory_manager.get_memory_context(session_id)
 
     async def event_stream():
         full_response = ""
+        shown_nodes: set = set()  # 避免重复显示进度提示
 
+        initial_state = {
+            "input": query,
+            "chat_history": chat_history,
+            "memory_context": graph_context,
+            "session_id": session_id,
+            "route": "",
+            "route_reason": "",
+            "route_params": {},
+            "subagent_result": "",
+            "final_answer": "",
+        }
+
+        logger.info("开始执行 Supervisor 工作流...")
         try:
-            # 3. 把用户最新的话和所有记忆投入执行器
-            async for event in app_agent.astream_events({
-                "input": query,
-                "chat_history": chat_history,
-                "memory_context": graph_context
-            }, version="v1"):
+            async for event in supervisor_workflow.astream_events(initial_state, version="v2"):
                 kind = event["event"]
+                node = event.get("metadata", {}).get("langgraph_node", "")
+                logger.debug(f"event: kind={kind}, node={node}")
+
+                # Supervisor 节点的 LLM 输出是 JSON 路由决策，不暴露给用户
+                if node == "supervisor":
+                    continue
+
                 if kind == "on_chat_model_stream":
                     content = event["data"]["chunk"].content
                     if content:
                         full_response += content
                         yield f"data: {json.dumps({'text': content}, ensure_ascii=False)}\n\n"
 
-                elif kind == "on_tool_start":
-                    tool_name = event['name']
-                    msg = f"\n**[系统思考：正在使用 {tool_name} 查阅资料...]**\n"
-                    yield f"data: {json.dumps({'text': msg}, ensure_ascii=False)}\n\n"
+                elif kind == "on_chain_start" and node and node not in shown_nodes:
+                    # 子 Agent 启动时显示一次进度提示
+                    label = _NODE_LABELS.get(node, "")
+                    if label:
+                        shown_nodes.add(node)
+                        msg = f"\n**[{label}]**\n"
+                        yield f"data: {json.dumps({'text': msg}, ensure_ascii=False)}\n\n"
 
-                elif kind == "on_tool_end":
-                    tool_name = event['name']
-                    # 获取工具输出内容
-                    tool_output = event.get('data', {}).get('output', '')
-                    if tool_output:
-                        # 输出工具返回的内容
-                        yield f"data: {json.dumps({'text': tool_output}, ensure_ascii=False)}\n\n"
-                    msg = f"\n**[系统思考：{tool_name} 执行完成]**\n"
-                    yield f"data: {json.dumps({'text': msg}, ensure_ascii=False)}\n\n"
+                elif kind == "on_chain_end":
+                    output = event.get("data", {}).get("output", {})
+                    # 处理 LangChain Message 对象
+                    if hasattr(output, 'content'):
+                        output = output.content
+                    logger.info(f"[Chain End] node={node}, output_type={type(output).__name__}")
+                    if node in ("quiz_agent", "exam_agent"):
+                        # Quiz/Exam 子 Agent 不逐 token 流式输出，拿到完整结果后假流式输出
+                        answer = ""
+                        if isinstance(output, dict):
+                            answer = output.get("final_answer", "") or output.get("revised_exam", "") or output.get("exam_paper", "") or output.get("subagent_result", "")
+                        elif isinstance(output, str):
+                            answer = output
+                        elif hasattr(output, 'content'):
+                            answer = str(output.content)
+                        logger.info(f"[Exam Answer] length={len(answer) if answer else 0}")
+                        # 直接输出，不管 full_response 是否已有值
+                        if answer:
+                            full_response = answer
+                            logger.info(f"[SSE] 开始流式输出试卷，共 {len(answer.splitlines())} 行")
+                            # 按行拆分逐行输出，保留 Markdown 结构
+                            for line in answer.splitlines(keepends=True):
+                                yield f"data: {json.dumps({'text': line}, ensure_ascii=False)}\n\n"
+                                await asyncio.sleep(0.03)
+                            logger.info(f"[SSE] 试卷输出完成")
 
                 elif kind == "on_chat_model_end":
-                    # 尝试从模型输出中提取 Token 元数据
+                    # Token 消耗统计
                     try:
                         output = event["data"].get("output")
                         usage = None
-
-                        # 尝试多种可能的格式
                         if hasattr(output, "usage_metadata") and output.usage_metadata:
                             usage = output.usage_metadata
                         elif hasattr(output, "response_metadata"):
-                            # MiniMax/通义千问格式
                             rm = output.response_metadata
                             if isinstance(rm, dict):
                                 usage = rm.get("token_usage") or rm.get("usage") or rm.get("prompt_tokens")
-                                # MiniMax 可能直接返回嵌套的 usage 对象
-                                if isinstance(usage, dict):
-                                    pass  # 保持原样
 
                         if usage:
-                            # 兼容不同格式
                             if isinstance(usage, dict):
                                 token_info = {
-                                    "prompt_tokens": usage.get("input_tokens") or usage.get("prompt_tokens") or usage.get("prompt_token_usage", 0),
-                                    "completion_tokens": usage.get("output_tokens") or usage.get("completion_tokens") or usage.get("completion_token_usage", 0),
-                                    "total_tokens": usage.get("total_tokens") or usage.get("total") or usage.get("total_usage", 0)
+                                    "prompt_tokens":      usage.get("input_tokens")      or usage.get("prompt_tokens")     or usage.get("prompt_token_usage", 0),
+                                    "completion_tokens":  usage.get("output_tokens")     or usage.get("completion_tokens") or usage.get("completion_token_usage", 0),
+                                    "total_tokens":       usage.get("total_tokens")      or usage.get("total")             or usage.get("total_usage", 0),
                                 }
                             elif isinstance(usage, (int, float)):
-                                # 直接返回 total 的情况
                                 token_info = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": usage}
                             else:
                                 token_info = None
 
                             if token_info and token_info["total_tokens"] > 0:
                                 update_token_stats(token_info)
-                                logger.info(f"【算力监控】拦截到 Token 消耗: {token_info}")
+                                logger.info(f"【算力监控】Token 消耗: {token_info}")
                     except Exception as e:
                         logger.error(f"提取 Token 统计失败: {e}")
 
                 await asyncio.sleep(0.01)
+
         except Exception as e:
             logger.error(f"流式输出异常: {e}")
             yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
 
-        try:
-            yield "data: [DONE]\n\n"
-        except Exception as e:
-            logger.error(f"发送结束信号失败: {e}")
-        
-        # 4. 对话结束后，把一来一回塞入管理器的管道。
-        # 内部超过阈值会自动把老记录打入垃圾桶提取图谱晶体
-        memory_manager.add_message(session_id, "user", query)
-        memory_manager.add_message(session_id, "ai", full_response)
-            
+        yield "data: [DONE]\n\n"
+
+        # 对话结束后入库；超阈值自动触发后台图谱提纯
+        await memory_manager.add_message(session_id, "user", query)
+        await memory_manager.add_message(session_id, "ai", full_response)
+
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 @router.delete("/session/{session_id}")
@@ -163,7 +187,7 @@ async def delete_session(session_id: str):
     # 销毁知识库实体与物理文件
     try:
         vs = VectorStoreService()
-        vs.destroy_knowledge_base()
+        await vs.destroy_knowledge_base()  # fix #5：async def 必须 await
     except Exception as e:
         print(f"知识库清理失败: {e}")
 
@@ -208,7 +232,26 @@ async def get_all_sessions():
     sessions = memory_manager.get_all_sessions()
     return {"code": 200, "data": sessions}
 
-from utils.logger_handler import get_system_stats
+
+@router.get("/messages")
+async def get_session_messages(session_id: str):
+    """
+    获取指定会话的历史消息
+    """
+    memory_manager._init_session(session_id)
+    recent_records = memory_manager.store[session_id]["recent"]
+
+    messages = []
+    for msg in recent_records:
+        messages.append({
+            "id": f"{msg.get('timestamp', 0)}",
+            "role": msg["role"],
+            "content": msg["content"],
+            "timestamp": msg.get("timestamp", 0)
+        })
+
+    return {"code": 200, "data": messages}
+
 
 @router.get("/tokens")
 async def get_tokens():

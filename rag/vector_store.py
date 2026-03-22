@@ -1,4 +1,5 @@
 import os.path
+import asyncio
 import hashlib
 
 from langchain_chroma import Chroma
@@ -14,8 +15,12 @@ import shutil
 
 
 class VectorStoreService():
+    # 图片并发控制：避免触发 API rate limit
+    MAX_CONCURRENT_IMAGES = 5
+
     def __init__(self):
         self.session_id = current_session_id.get()
+        self._image_semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_IMAGES)
         _md5 = hashlib.md5(self.session_id.encode("utf-8")).hexdigest()[:16]
         safe_col_name = f"col_{_md5}"
         
@@ -81,7 +86,8 @@ class VectorStoreService():
 
     async def load_document(self):
         """
-        从数据文件夹读取数据转为向量存入向量库
+        从数据文件夹读取数据转为向量存入向量库。
+        图片描述通过 asyncio.gather 并发调用视觉模型，避免串行阻塞。
         """
         def chunk_md5_hex(md5_for_check: str):
             if not os.path.exists(self.session_md5_path):
@@ -94,7 +100,6 @@ class VectorStoreService():
                 f.write(md5_for_check + "\n")
 
         async def get_file_document(read_path: str):
-            # 使用优化后的文档加载器，支持 PDF/PPT/图片/文档等所有格式
             if read_path.endswith(".txt"):
                 return txt_loader(read_path)
             elif read_path.endswith(".pdf"):
@@ -106,6 +111,50 @@ class VectorStoreService():
             elif read_path.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")):
                 return image_loader(read_path)
             return []
+
+        async def _enrich_images(documents: list) -> list:
+            """
+            对 ppt_loader 返回的 Document 并发处理图片描述。
+            图片字节暂存在 metadata['_image_blobs']，处理后追加到 page_content 并清除。
+            """
+            from utils.file_handler import _summarize_image
+
+            async def _describe_one(blob: bytes, context: str, label: str) -> str:
+                # 用 Semaphore 控制并发，避免触发 API rate limit
+                async with self._image_semaphore:
+                    loop = asyncio.get_event_loop()
+                    # _summarize_image 是同步调用，放到线程池避免阻塞事件循环
+                    desc = await loop.run_in_executor(None, _summarize_image, blob, context)
+                    return label, desc
+
+            tasks = []
+            doc_indices = []
+            for doc_idx, doc in enumerate(documents):
+                blobs = doc.metadata.pop("_image_blobs", [])
+                context = doc.metadata.pop("_slide_context", "")
+                for img_idx, (_, blob) in enumerate(blobs, 1):
+                    label = f"【图片 {img_idx} 描述】"
+                    tasks.append(_describe_one(blob, context, label))
+                    doc_indices.append(doc_idx)
+
+            if not tasks:
+                return documents
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            images_by_doc: dict[int, list[str]] = {}
+            for doc_idx, result in zip(doc_indices, results):
+                if isinstance(result, Exception):
+                    logger.warning(f"[图片并发处理] 失败: {result}")
+                    continue
+                label, desc = result
+                if desc and desc != "无有效信息":
+                    images_by_doc.setdefault(doc_idx, []).append(f"\n{label}\n{desc}\n")
+
+            for doc_idx, descs in images_by_doc.items():
+                documents[doc_idx].page_content += "\n【图片内容】" + "".join(descs)
+
+            logger.info(f"[图片并发处理] 共处理 {len(tasks)} 张图片")
+            return documents
 
         # 确保会话目录存在
         os.makedirs(self.session_data_path, exist_ok=True)
@@ -127,13 +176,14 @@ class VectorStoreService():
                     logger.info(f"[加载知识库]{path}文件内没有有效文本，跳过")
                     continue
 
+                # 并发处理图片（PPT/PDF 中的图片字节暂存在 metadata）
+                documents = await _enrich_images(documents)
+
                 split_document = self.spliter.split_documents(documents)
                 if not split_document:
                     logger.info(f"[加载知识库]{path}分片内无有效内容，跳过")
                     continue
 
-                # Chroma add_documents is typically sync in langchain-chroma 0.1.x
-                # but we wrap the call for future-proofing or if it supports async
                 self.vector_store.add_documents(split_document)
                 save_md5_hex(md5_hex)
                 logger.info(f"[加载知识库]{path}加载成功")

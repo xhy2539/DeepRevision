@@ -210,22 +210,18 @@ def _detect_formulas(text: str) -> List[Dict[str, Any]]:
 # ================= PPT 解析器 =================
 def ppt_loader(filepath: str) -> list[Document]:
     """
-    PPT/PPTX 解析器 - 增强版
-    优先使用 Unstructured，失败则回退到自定义解析
+    PPT/PPTX 解析器 - 优先使用自定义按页解析（保留图片多模态理解）
+    回退到 Unstructured 兜底
     """
-    # 优先尝试 Unstructured
-    docs = _unstructured_loader(filepath)
-    if docs:
-        return docs
-
-    # 回退到自定义解析器
-    logger.info(f"[PPT解析] Unstructured 失败，使用自定义解析器: {filepath}")
     from pptx import Presentation
-    from pptx.util import Inches, Pt
+
+    try:
+        prs = Presentation(filepath)
+    except Exception:
+        logger.info(f"[PPT解析] python-pptx 打开失败，回退到 Unstructured: {filepath}")
+        return _unstructured_loader(filepath)
 
     documents = []
-    prs = Presentation(filepath)
-
     logger.info(f"[PPT解析] 开始解析: {filepath}, 共 {len(prs.slides)} 页")
 
     for slide_num, slide in enumerate(prs.slides, 1):
@@ -240,12 +236,14 @@ def ppt_loader(filepath: str) -> list[Document]:
                 slide_content.append(f"标题: {title}")
 
         # 2. 提取所有文本框内容
+        title_shape = slide.shapes.title
+        title_text = title_shape.text if title_shape else ""
         for shape in slide.shapes:
             if hasattr(shape, "text") and shape.text.strip():
-                if shape == slide.shapes.title:
+                if shape == title_shape:
                     continue
                 text = shape.text.strip()
-                if text and text != slide.shapes.title.text:
+                if text and text != title_text:
                     formulas = _detect_formulas(text)
                     if formulas:
                         for f in formulas:
@@ -254,13 +252,13 @@ def ppt_loader(filepath: str) -> list[Document]:
                     slide_content.append(text)
 
         # 3. 提取表格
-        for table in slide.shapes:
-            if table.has_table:
+        for shape in slide.shapes:
+            if shape.has_table:
                 table_text = "【表格】\n"
-                headers = [cell.text.strip() for cell in table.table.rows[0].cells]
+                headers = [cell.text.strip() for cell in shape.table.rows[0].cells]
                 if headers:
                     table_text += "表头: " + " | ".join(headers) + "\n"
-                for row_idx, row in enumerate(table.table.rows[1:], 1):
+                for row_idx, row in enumerate(shape.table.rows[1:], 1):
                     row_text = " | ".join([cell.text.strip() for cell in row.cells])
                     table_text += f"第{row_idx}行: {row_text}\n"
                 page_text += table_text + "\n"
@@ -278,28 +276,18 @@ def ppt_loader(filepath: str) -> list[Document]:
                 if hasattr(shape, "text") and shape.text.strip():
                     page_text += f"【超链接】{shape.text.strip()} -> {link}\n"
 
-        # 6. 提取图片
-        images_text = ""
-        image_count = 0
-
+        # 6. 收集图片字节（延迟到并发处理）
+        image_blobs = []
         for idx, shape in enumerate(slide.shapes):
             if hasattr(shape, "image") and shape.image:
                 try:
-                    image = shape.image
-                    image_bytes = image.blob
-                    if len(image_bytes) < 5000:
-                        continue
-                    image_count += 1
-                    context = "\n".join(slide_content[:3])
-                    image_desc = _summarize_image(image_bytes, context=context)
-                    if image_desc and image_desc != "无有效信息":
-                        images_text += f"\n【图片 {image_count} 描述】\n{image_desc}\n"
+                    blob = shape.image.blob
+                    if len(blob) >= 5000:
+                        image_blobs.append((idx, blob))
                 except Exception as e:
-                    logger.warning(f"[PPT解析] 第 {slide_num} 页第 {idx} 张图片处理失败: {e}")
+                    logger.warning(f"[PPT解析] 第 {slide_num} 页图片读取失败: {e}")
 
-        if images_text:
-            page_text += f"\n【图片内容】{images_text}\n"
-
+        # 图片描述由调用方（load_document）并发处理；此处先存 metadata
         doc = Document(
             page_content=page_text,
             metadata={
@@ -307,7 +295,9 @@ def ppt_loader(filepath: str) -> list[Document]:
                 "page": slide_num,
                 "type": "ppt",
                 "total_slides": len(prs.slides),
-                "images_count": image_count
+                "images_count": len(image_blobs),
+                "_image_blobs": image_blobs,          # 供异步处理使用
+                "_slide_context": "\n".join(slide_content[:3]),
             }
         )
         documents.append(doc)
@@ -384,17 +374,16 @@ def _ocr_image(image_bytes: bytes) -> Optional[str]:
 # ================= 升级版 PDF 解析器 =================
 def pdf_loader(filepath: str, passwd=None) -> list[Document]:
     """
-    PDF 加载器 - 优先使用 Unstructured
-    回退到自定义解析（保留 OCR、表格等增强功能）
+    PDF 加载器 - 优先使用自定义按页解析（保留图片/表格/OCR增强）
+    回退到 Unstructured 兜底
     """
-    # 优先尝试 Unstructured
-    docs = _unstructured_pdf_loader(filepath)
+    docs = _custom_pdf_loader(filepath, passwd)
     if docs:
         return docs
 
-    # 回退到自定义解析器
-    logger.info(f"[PDF解析] Unstructured 失败，使用自定义解析器: {filepath}")
-    return _custom_pdf_loader(filepath, passwd)
+    # 回退到 Unstructured
+    logger.info(f"[PDF解析] 自定义解析器无输出，回退到 Unstructured: {filepath}")
+    return _unstructured_pdf_loader(filepath)
 
 
 def _custom_pdf_loader(filepath: str, passwd=None) -> list[Document]:
@@ -472,7 +461,7 @@ def _custom_pdf_loader(filepath: str, passwd=None) -> list[Document]:
 
         # 5. 图片
         image_list = page.get_images()
-        images_text = ""
+        image_blobs = []
         ocr_text = ""
 
         if image_list:
@@ -485,19 +474,17 @@ def _custom_pdf_loader(filepath: str, passwd=None) -> list[Document]:
                     if len(image_bytes) < 5000:
                         continue
 
-                    # OCR
+                    # OCR（同步，轻量，保留）
                     ocr_result = _ocr_image(image_bytes)
                     if ocr_result and len(ocr_result) > 20:
                         ocr_text += f"\n【图片 {img_idx + 1} OCR文字】\n{ocr_result}\n"
 
-                    # 多模态理解
-                    image_desc = _summarize_image(image_bytes, context=text[:500] if text else "")
-                    if image_desc and image_desc != "无有效信息":
-                        images_text += f"\n【图片 {img_idx + 1} 描述】\n{image_desc}\n"
+                    # 收集字节供并发视觉理解（不在此处串行调用）
+                    image_blobs.append((img_idx + 1, image_bytes))
                 except Exception as e:
                     logger.warning(f"[PDF解析] 图片提取失败: {e}")
 
-        # OCR 页面（文本少时，需要安装 pytesseract）
+        # OCR 页面（文本少时）
         if not text or len(text.strip()) < 50:
             try:
                 import pytesseract
@@ -507,16 +494,14 @@ def _custom_pdf_loader(filepath: str, passwd=None) -> list[Document]:
                 if ocr_page_result and len(ocr_page_result) > 20:
                     ocr_text += f"\n【页面OCR识别】\n{ocr_page_result.strip()}\n"
             except ImportError:
-                pass  # 未安装 OCR
+                pass
             except Exception:
                 pass
 
-        # 合并内容
+        # 合并文本内容（图片描述由 load_document 并发追加）
         full_content = page_text
         if ocr_text:
             full_content += f"\n{ocr_text}\n"
-        if images_text:
-            full_content += f"\n【图片内容】{images_text}\n"
 
         doc_obj = Document(
             page_content=full_content,
@@ -527,10 +512,13 @@ def _custom_pdf_loader(filepath: str, passwd=None) -> list[Document]:
                 "total_pages": len(doc),
                 "has_images": len(image_list) > 0,
                 "title": title,
-                "author": author
+                "author": author,
+                "_image_blobs": image_blobs,          # 供异步处理使用
+                "_slide_context": text[:500] if text else "",
             }
         )
         documents.append(doc_obj)
+
 
     doc.close()
     logger.info(f"[PDF解析] 解析完成，共 {len(documents)} 页")
@@ -587,16 +575,9 @@ def image_loader(filepath: str) -> list[Document]:
 # ================= 通用文档加载器 =================
 def document_loader(filepath: str) -> list[Document]:
     """
-    通用文档加载器 - 优先使用 Unstructured
+    通用文档加载器 - 优先使用自定义按页解析，Unstructured 作兜底
     """
     ext = os.path.splitext(filepath)[1].lower()
-
-    # 优先使用 Unstructured
-    if ext in [".pdf", ".pptx", ".ppt", ".docx", ".doc"]:
-        docs = _unstructured_loader(filepath)
-        if docs:
-            return docs
-        # 回退到自定义加载器
 
     if ext == ".txt":
         return txt_loader(filepath)
@@ -609,5 +590,8 @@ def document_loader(filepath: str) -> list[Document]:
     elif ext in [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"]:
         return image_loader(filepath)
     else:
-        logger.warning(f"[document_loader] 不支持的文件类型: {ext}")
-        return []
+        # 未知格式尝试 Unstructured 兜底
+        docs = _unstructured_loader(filepath)
+        if not docs:
+            logger.warning(f"[document_loader] 不支持的文件类型: {ext}")
+        return docs
