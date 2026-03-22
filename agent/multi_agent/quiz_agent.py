@@ -703,7 +703,7 @@ async def run_quiz_agent(
 async def run_exam_agent(
     topics: List[str],
     quiz_types: List[str],
-    total_questions: int = 10,
+    total_questions: int = 34,
     sample_paper_context: str = None
 ) -> str:
     """
@@ -713,7 +713,11 @@ async def run_exam_agent(
     # 参数校验和修正
     if not quiz_types or len(quiz_types) == 0:
         quiz_types = ['选择题', '填空题', '判断题', '简答题']
-    if total_questions <= 0 or total_questions > 50:
+
+    # 如果有4种题型，默认生成34道题（综合卷）
+    if len(quiz_types) >= 4:
+        total_questions = 34
+    elif total_questions <= 0 or total_questions > 50:
         total_questions = 10  # 限制题目数量范围
 
     logger.info(f"[Exam Agent] 校验后参数: quiz_types={quiz_types}, total_questions={total_questions}")
