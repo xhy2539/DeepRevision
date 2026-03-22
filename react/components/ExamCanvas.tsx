@@ -49,12 +49,19 @@ function parseExamContent(content: string): ExamData {
   let globalQuestionNumber = 0;  // 统一编号计数器
 
   const typePatterns: Record<string, RegExp> = {
-    '选择题': /(一、选择题|选择题)/,
-    '填空题': /(二、填空题|填空题)/,
-    '判断题': /(三、判断题|判断题)/,
-    '简答题': /(四、简答题|简答题|解答题)/,
-    '计算题': /(五、计算题|计算题)/,
+    // 选择题：1-10题
+    '选择题': /(一[、.]\s*)?选择题|^[1-9]\d{0,1}\.\s.*[A-D][.、]/,
+    // 填空题：11-20题
+    '填空题': /(二[、.]\s*)?填空题|^1[1-9]\.\s/,
+    // 判断题：21-30题
+    '判断题': /(三[、.]\s*)?判断题|^2[1-9]\.\s/,
+    // 简答题：31-34题
+    '简答题': /(四[、.]\s*)?简答题|(四[、.]\s*)?解答题|^3[1-4]\.\s/,
+    // 计算题
+    '计算题': /(五[、.]\s*)?计算题/,
+    // 名词解释
     '名词解释': /(名词解释)/,
+    // 论述题
     '论述题': /(论述题)/,
   };
 
@@ -383,13 +390,17 @@ export default function ExamCanvas({ examContent, courseName = "期末考试", o
     );
   }
 
-  // 按题型分组
+  // 按题型分组，并按全局题号排序
   const questionsByType: Record<string, Question[]> = {};
   for (const q of examData.questions) {
     if (!questionsByType[q.type]) {
       questionsByType[q.type] = [];
     }
     questionsByType[q.type].push(q);
+  }
+  // 确保每个题型内按题号升序排列
+  for (const type of Object.keys(questionsByType)) {
+    questionsByType[type].sort((a, b) => a.number - b.number);
   }
 
   return (
@@ -485,9 +496,16 @@ export default function ExamCanvas({ examContent, courseName = "期末考试", o
           ))}
         </div>
 
-        {/* 题目内容 */}
+        {/* 题目内容 - 按标准顺序显示：选择->填空->判断->简答 */}
         <div className="space-y-8">
-          {Object.entries(questionsByType).map(([type, questions]) => (
+          {Object.entries(questionsByType)
+            .sort(([a], [b]) => {
+              const order = ['选择题', '填空题', '判断题', '简答题', '计算题', '名词解释', '论述题'];
+              const idxA = order.indexOf(a);
+              const idxB = order.indexOf(b);
+              return (idxA === -1 ? 99 : idxA) - (idxB === -1 ? 99 : idxB);
+            })
+            .map(([type, questions]) => (
             <div key={type}>
               {/* 题型标题 */}
               <h2 className="text-lg font-bold text-slate-800 mb-4 pb-2 border-b border-slate-200">
