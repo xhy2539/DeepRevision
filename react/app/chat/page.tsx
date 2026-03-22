@@ -291,32 +291,61 @@ function KnowledgePanel({
   const handleUpload = async () => {
     if (selectedFiles.length === 0 || !sessionId) return;
 
+    console.log("[上传] sessionId:", sessionId);
     setIsUploading(true);
     setUploadStatus("上传中...");
 
     const formData = new FormData();
     formData.append("session_id", sessionId);
+    console.log("[上传] 表单中的 session_id:", sessionId);
     selectedFiles.forEach(file => formData.append("files", file));
 
     try {
-      const res = await fetch("/api/knowledge/upload", {
+      const res = await fetch(`/api/knowledge/upload?session_id=${encodeURIComponent(sessionId)}`, {
         method: "POST",
         body: formData
       });
       const data = await res.json();
+      console.log("[上传] 响应:", data);
       if (res.ok) {
-        setUploadStatus(`成功上传 ${selectedFiles.length} 个文件，正在向量化...`);
         setSelectedFiles([]);
-        setActiveTab("list");
+        // 不立即切换 tab，让用户看到进度
+        setUploadStatus("上传成功，开始向量化...");
 
-        // 轮询等待向量化完成（最多10次，间隔2秒）
+        // 轮询等待向量化完成
         let attempts = 0;
-        const pollInterval = setInterval(() => {
+        const maxAttempts = 60; // 最多 2 分钟
+        const pollInterval = setInterval(async () => {
           attempts++;
-          fetchFiles();
-          if (attempts >= 10) {
+          console.log("[轮询] 第", attempts, "次");
+          // 重新获取文件列表
+          try {
+            const listRes = await fetch(`/api/knowledge/list?session_id=${encodeURIComponent(sessionId)}`);
+            const listData = await listRes.json();
+            console.log("[轮询] 文件列表:", listData);
+            if (listData.files && listData.files.length > 0) {
+              const completedCount = listData.files.filter((f: KnowledgeFile) => f.embedded === true).length;
+              const totalCount = listData.files.length;
+              console.log("[轮询] 完成:", completedCount, "/", totalCount);
+              if (completedCount < totalCount) {
+                setUploadStatus(`向量化中... ${completedCount}/${totalCount} 个文件已完成`);
+              } else {
+                setUploadStatus("向量化完成！");
+                clearInterval(pollInterval);
+                setActiveTab("list");
+                setTimeout(() => setUploadStatus(""), 2000);
+              }
+            } else {
+              setUploadStatus(`向量化中...（等待文件出现）`);
+            }
+          } catch (e) {
+            console.error("轮询失败:", e);
+          }
+
+          if (attempts >= maxAttempts) {
             clearInterval(pollInterval);
-            setUploadStatus("");
+            setUploadStatus("向量化超时，请刷新页面查看");
+            setActiveTab("list");
           }
         }, 2000);
         // 立即执行一次
@@ -354,10 +383,9 @@ function KnowledgePanel({
     const file = e.target.files[0];
     setSampleStatus("正在上传和分析样卷...");
     const formData = new FormData();
-    formData.append("session_id", sessionId);
     formData.append("file", file);
     try {
-      const res = await fetch("/api/knowledge/sample/upload", { method: "POST", body: formData });
+      const res = await fetch(`/api/knowledge/sample/upload?session_id=${encodeURIComponent(sessionId)}`, { method: "POST", body: formData });
       const data = await res.json();
       if (res.ok) {
         setSampleStatus("样卷上传成功，格式已学习！");
@@ -969,7 +997,7 @@ export default function ChatPage() {
                     sampleInfo = "\n\n【重要】请参考已上传的样卷格式出题，包括题型分布、分值、编号风格等。";
                   }
                 } catch (e) {}
-                const prompt = `请根据已上传的课件内容，生成一份期末复习综合测试卷。考点范围请从课件中提取关键知识点。${sampleInfo}
+                const prompt = `请出一套综合测试卷题目，选择10道，判断5道，填空5道，简答3道。根据已上传的课件内容生成，考点范围请从课件中提取关键知识点。${sampleInfo}
 
 请生成完整试卷，包含题目、答案和解析。`;
                 setInput(prompt);

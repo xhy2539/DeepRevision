@@ -317,7 +317,8 @@ async def generate_single_type_paper(
     """
     end_num = start_num + num - 1
     total_score = num * score_per_question
-    sub_score = score_per_question // 2 if score_per_question >= 10 else 2
+    # 简答题每问的分值 = 总分 // 2（如果每题10分则每问5分，如果每题20分则每问10分）
+    sub_score = score_per_question // 2
 
     # 获取格式示例
     format_example = SINGLE_TYPE_FORMAT_EXAMPLES.get(
@@ -567,7 +568,7 @@ EXAM_GENERATE_WITH_REASONING_PROMPT = """【警告-绝对禁止】绝对禁止�
    - 选择题：{choice_count}题 × 2分，编号1到{choice_end}
    - 填空题：{fill_count}题 × 2分，编号{fill_start}到{fill_end}
    - 判断题：{judge_count}题 × 2分，编号{judge_start}到{judge_end}
-   - 简答题：{essay_count}题 × 10分，编号{essay_start}到{essay_end}
+   - 简答题：{essay_count}题 × {essay_score}分，编号{essay_start}到{essay_end}
 4. 选择题必须有 A、B、C、D 四个完整选项，题干描述要详细（至少30字）
 5. 题目必须全部统一编号：1→2→3→...→{total_questions}，不能每个题型单独从1开始编号
 6. 【灵活出题】答案可以参考课件内容，如果课件提到某知识点但内容不够详细，可以结合联网搜索的参考资料来出题。允许标注"参考答案"。
@@ -865,6 +866,21 @@ async def generate_exam_with_reasoning_node(state: ExamPaperState) -> ExamPaperS
         judge_count = total // 4
         essay_count = total - 3 * (total // 4)
 
+    # 固定分值配置
+    choice_score = 2
+    fill_score = 2
+    judge_score = 2
+
+    # 动态计算简答题分数，确保总分=100分
+    base_score = choice_count * choice_score + fill_count * fill_score + judge_count * judge_score
+    remaining_score = 100 - base_score
+    if essay_count > 0:
+        essay_score = remaining_score // essay_count
+    else:
+        essay_score = 0
+
+    logger.info(f"[出卷] 题型数量: 选择{choice_count}×{choice_score}分, 填空{fill_count}×{fill_score}分, 判断{judge_count}×{judge_score}分, 简答{essay_count}×{essay_score}分, 总分={choice_count*choice_score + fill_count*fill_score + judge_count*judge_score + essay_count*essay_score}")
+
     # 计算编号范围
     current_num = 1
     choice_start = current_num
@@ -905,8 +921,8 @@ async def generate_exam_with_reasoning_node(state: ExamPaperState) -> ExamPaperS
         tasks.append(generate_and_collect("判断题", judge_count, judge_start, 2))
         task_info.append({"type": "判断题", "count": judge_count})
     if essay_count > 0:
-        tasks.append(generate_and_collect("简答题", essay_count, essay_start, 10))
-        task_info.append({"type": "简答题", "count": essay_count})
+        tasks.append(generate_and_collect("简答题", essay_count, essay_start, essay_score))
+        task_info.append({"type": "简答题", "count": essay_count, "score": essay_score})
 
     # 并行执行
     results = await asyncio.gather(*tasks, return_exceptions=True)
