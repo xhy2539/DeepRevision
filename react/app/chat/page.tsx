@@ -971,7 +971,7 @@ export default function ChatPage() {
                 } catch (e) {}
                 const prompt = `请根据已上传的课件内容，生成一份期末复习综合测试卷。考点范围请从课件中提取关键知识点。${sampleInfo}
 
-请直接输出试卷题目，不需要答案和解析。`;
+请生成完整试卷，包含题目、答案和解析。`;
                 setInput(prompt);
                 setTimeout(() => {
                   const btn = document.getElementById('send-btn');
