@@ -24,6 +24,7 @@ interface KnowledgeFile {
   filename: string;
   size: number;
   modified_at: number;
+  embedded?: boolean;  // 是否已完成向量化
 }
 
 // ============== 设计系统 ==============
@@ -183,13 +184,15 @@ function QuizCard({ questions }: { questions: Array<{ type: string; question: st
 }
 
 function MarkdownContent({ content, onRequestAnswers }: { content: string; onRequestAnswers?: () => void }) {
-  const { isQuiz, questions } = parseQuizContent(content);
-
   // 检测是否为试卷格式，使用 Canvas 渲染
   if (isExamContent(content)) {
+    // 直接使用 ExamCanvas 渲染，它内部会处理解析失败的情况
+    // 解析失败时会渲染原始内容作为后备
     return <ExamCanvas examContent={content} courseName="期末考试" onRequestAnswers={onRequestAnswers} />;
   }
 
+  // 尝试用简单方式解析题目
+  const { isQuiz, questions } = parseQuizContent(content);
   if (isQuiz && questions.length > 0) {
     return <QuizCard questions={questions} />;
   }
@@ -302,9 +305,21 @@ function KnowledgePanel({
       });
       const data = await res.json();
       if (res.ok) {
-        setUploadStatus(`成功上传 ${selectedFiles.length} 个文件`);
+        setUploadStatus(`成功上传 ${selectedFiles.length} 个文件，正在向量化...`);
         setSelectedFiles([]);
         setActiveTab("list");
+
+        // 轮询等待向量化完成（最多10次，间隔2秒）
+        let attempts = 0;
+        const pollInterval = setInterval(() => {
+          attempts++;
+          fetchFiles();
+          if (attempts >= 10) {
+            clearInterval(pollInterval);
+            setUploadStatus("");
+          }
+        }, 2000);
+        // 立即执行一次
         fetchFiles();
       } else {
         setUploadStatus(data.detail || "上传失败");
@@ -517,7 +532,11 @@ function KnowledgePanel({
                       </span>
                       <div className="flex-1 min-w-0">
                         <p className="truncate text-xs font-medium text-slate-800">{file.filename}</p>
-                        <p className="text-xs font-mono text-slate-400">{formatBytes(file.size)} · {dateStr}</p>
+                        <p className="text-xs font-mono text-slate-400">
+                          {formatBytes(file.size)} · {dateStr}
+                          {file.embedded === false && <span className="text-amber-500 ml-1">（处理中）</span>}
+                          {file.embedded === true && <span className="text-green-500 ml-1">✓</span>}
+                        </p>
                       </div>
                     </li>
                   );
@@ -685,7 +704,7 @@ export default function ChatPage() {
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // 加载会话列表
+  // 加载会话列表和消息历史
   useEffect(() => {
     fetch("/api/chat/sessions")
       .then(res => res.json())
@@ -695,6 +714,8 @@ export default function ChatPage() {
           setSessions(data.data);
           setCurrentSession(data.data[0].id);
           setCurrentSessionName(data.data[0].name);
+          // 加载第一个会话的历史消息
+          loadSessionMessages(data.data[0].id);
         } else {
           // 默认会话
           setSessions([{ id: "default", name: "默认科目" }]);
@@ -706,6 +727,18 @@ export default function ChatPage() {
         setSessions([{ id: "default", name: "默认科目" }]);
       });
   }, []);
+
+  // 加载会话消息历史
+  const loadSessionMessages = (sessionId: string) => {
+    fetch(`/api/chat/messages?session_id=${encodeURIComponent(sessionId)}`)
+      .then(res => res.json())
+      .then(data => {
+        if (data.code === 200 && data.data) {
+          setMessages(data.data);
+        }
+      })
+      .catch(err => console.error("加载消息失败:", err));
+  };
 
   // 滚动到底部
   useEffect(() => {
@@ -926,265 +959,32 @@ export default function ChatPage() {
           {/* 出题按钮组 */}
           <div className="relative group">
             <button
+              onClick={async () => {
+                if (!currentSession || isLoading) return;
+                let sampleInfo = "";
+                try {
+                  const sampleRes = await fetch(`/api/knowledge/sample?session_id=${encodeURIComponent(currentSession)}`);
+                  const sampleData = await sampleRes.json();
+                  if (sampleData.code === 200 && sampleData.data?.has_sample) {
+                    sampleInfo = "\n\n【重要】请参考已上传的样卷格式出题，包括题型分布、分值、编号风格等。";
+                  }
+                } catch (e) {}
+                const prompt = `请根据已上传的课件内容，生成一份期末复习综合测试卷。考点范围请从课件中提取关键知识点。${sampleInfo}
+
+请直接输出试卷题目，不需要答案和解析。`;
+                setInput(prompt);
+                setTimeout(() => {
+                  const btn = document.getElementById('send-btn');
+                  if (btn) btn.click();
+                }, 100);
+              }}
               className="px-4 py-1.5 text-xs font-medium text-teal-700 bg-teal-50 hover:bg-teal-100 border border-teal-200 rounded-md transition-all flex items-center gap-1"
             >
               <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
               </svg>
-              出题
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-              </svg>
+              综合测试卷
             </button>
-            {/* 下拉菜单 */}
-            <div className="absolute top-full left-0 mt-1 w-48 bg-white border border-slate-200 rounded-lg shadow-lg opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all z-50">
-              <button
-                onClick={async () => {
-                  if (!currentSession || isLoading) return;
-                  let sampleInfo = "";
-                  try {
-                    const sampleRes = await fetch(`/api/knowledge/sample?session_id=${encodeURIComponent(currentSession)}`);
-                    const sampleData = await sampleRes.json();
-                    if (sampleData.code === 200 && sampleData.data?.has_sample) {
-                      sampleInfo = "\n\n【重要】请参考已上传的样卷格式出题，包括题型分布、分值、编号风格等。";
-                    }
-                  } catch (e) {}
-                  const prompt = `请根据已上传的课件内容，生成一份期末复习综合测试题。考点范围请从课件中提取关键知识点。
-
-要求：
-1. 题型包含：选择题（10题，每题2分）、填空题（5题，每题2分）、判断题（5题，每题2分）
-2. 每题都要有正确答案和详细解析
-3. 优先覆盖课件中的重点、难点内容
-4. 题目难度要适中，符合期末考试水平${sampleInfo}
-
-请直接输出题目，格式如下：
-【选择题】
-1. [题目内容]
-A. 选项1
-B. 选项2
-C. 选项3
-D. 选项4
-答案：A
-解析：[详细解析]
-
-【填空题】
-6. [题目内容]
-答案：[答案]
-解析：[详细解析]
-
-【判断题】
-11. [题目内容]
-答案：正确/错误
-解析：[详细解析]`;
-                  setInput(prompt);
-                  setTimeout(() => {
-                    const btn = document.getElementById('send-btn');
-                    if (btn) btn.click();
-                  }, 100);
-                }}
-                className="w-full text-left px-4 py-2 text-xs hover:bg-slate-50 rounded-t-lg"
-              >
-                📋 综合测试题
-              </button>
-              <button
-                onClick={async () => {
-                  if (!currentSession || isLoading) return;
-                  const prompt = `请根据已上传的课件内容，生成10道选择题。考点范围请从课件中提取关键知识点。
-
-要求：
-1. 每题4个选项，只有一个正确答案
-2. 每题都要有正确答案和详细解析
-3. 优先覆盖课件中的重点、难点内容
-4. 题目难度要适中，符合期末考试水平
-
-请直接输出题目，格式如下：
-1. [题目内容]
-A. 选项1
-B. 选项2
-C. 选项3
-D. 选项4
-答案：A
-解析：[详细解析]
-
-2. ...`;
-                  setInput(prompt);
-                  setTimeout(() => {
-                    const btn = document.getElementById('send-btn');
-                    if (btn) btn.click();
-                  }, 100);
-                }}
-                className="w-full text-left px-4 py-2 text-xs hover:bg-slate-50"
-              >
-                ✓ 选择题专项
-              </button>
-              <button
-                onClick={async () => {
-                  if (!currentSession || isLoading) return;
-                  const prompt = `请根据已上传的课件内容，生成10道填空题。考点范围请从课件中提取关键知识点。
-
-要求：
-1. 每题需要填写1-2个关键答案
-2. 每题都要有正确答案和详细解析
-3. 优先覆盖课件中的重点概念和定义
-4. 题目难度要适中，符合期末考试水平
-
-请直接输出题目，格式如下：
-1. [题目内容]
-答案：[答案1]、[答案2]
-解析：[详细解析]
-
-2. ...`;
-                  setInput(prompt);
-                  setTimeout(() => {
-                    const btn = document.getElementById('send-btn');
-                    if (btn) btn.click();
-                  }, 100);
-                }}
-                className="w-full text-left px-4 py-2 text-xs hover:bg-slate-50"
-              >
-                ✏️ 填空题专项
-              </button>
-              <button
-                onClick={async () => {
-                  if (!currentSession || isLoading) return;
-                  const prompt = `请根据已上传的课件内容，生成10道判断题。考点范围请从课件中提取关键知识点。
-
-要求：
-1. 判断题只需要判断"正确"或"错误"
-2. 每题都要有正确答案和详细解析
-3. 优先覆盖课件中容易混淆的知识点
-4. 题目难度要适中，符合期末考试水平
-
-请直接输出题目，格式如下：
-1. [题目内容]
-答案：正确
-解析：[详细解析]
-
-2. ...`;
-                  setInput(prompt);
-                  setTimeout(() => {
-                    const btn = document.getElementById('send-btn');
-                    if (btn) btn.click();
-                  }, 100);
-                }}
-                className="w-full text-left px-4 py-2 text-xs hover:bg-slate-50"
-              >
-                ✓ 判断题专项
-              </button>
-              <div className="border-t border-slate-100"></div>
-              <button
-                onClick={async () => {
-                  if (!currentSession || isLoading) return;
-                  const prompt = `请根据已上传的课件内容，生成10道名词解释题。考点范围请从课件中提取重要概念和定义。
-
-要求：
-1. 每题解释一个关键概念/名词
-2. 答案要简明扼要，控制在50字以内
-3. 优先覆盖课件中的核心概念
-4. 题目难度要适中，符合期末考试水平
-
-请直接输出题目，格式如下：
-1. [名词]
-答案：[解释内容]
-
-2. ...`;
-                  setInput(prompt);
-                  setTimeout(() => {
-                    const btn = document.getElementById('send-btn');
-                    if (btn) btn.click();
-                  }, 100);
-                }}
-                className="w-full text-left px-4 py-2 text-xs hover:bg-slate-50"
-              >
-                📝 名词解释专项
-              </button>
-              <button
-                onClick={async () => {
-                  if (!currentSession || isLoading) return;
-                  const prompt = `请根据已上传的课件内容，生成5道简答题。考点范围请从课件中提取重要知识点。
-
-要求：
-1. 每题需要简要回答，包含关键要点
-2. 每题都要有参考答案要点
-3. 优先覆盖课件中的重点、难点内容
-4. 题目难度要适中，符合期末考试水平
-
-请直接输出题目，格式如下：
-1. [问题]
-参考答案要点：
-- 要点1
-- 要点2
-- 要点3
-
-2. ...`;
-                  setInput(prompt);
-                  setTimeout(() => {
-                    const btn = document.getElementById('send-btn');
-                    if (btn) btn.click();
-                  }, 100);
-                }}
-                className="w-full text-left px-4 py-2 text-xs hover:bg-slate-50"
-              >
-                📖 简答题专项
-              </button>
-              <button
-                onClick={async () => {
-                  if (!currentSession || isLoading) return;
-                  const prompt = `请根据已上传的课件内容，生成3道论述题。考点范围请从课件中提取需要综合理解的知识点。
-
-要求：
-1. 每题需要详细论述，包含背景、分析、结论
-2. 每题都要有详细的参考答案
-3. 优先覆盖需要综合理解的知识点
-4. 题目难度要适中，符合期末考试水平
-
-请直接输出题目，格式如下：
-1. [论述题题干]
-参考答案：
-[详细论述内容]
-
-2. ...`;
-                  setInput(prompt);
-                  setTimeout(() => {
-                    const btn = document.getElementById('send-btn');
-                    if (btn) btn.click();
-                  }, 100);
-                }}
-                className="w-full text-left px-4 py-2 text-xs hover:bg-slate-50"
-              >
-                📄 论述题专项
-              </button>
-              <button
-                onClick={async () => {
-                  if (!currentSession || isLoading) return;
-                  const prompt = `请根据已上传的课件内容，生成5道计算题。考点范围请从课件中提取需要计算的知识点。
-
-要求：
-1. 每题需要给出具体计算过程
-2. 每题都要有完整计算步骤和最终答案
-3. 优先覆盖课件中涉及公式、计算的知识点
-4. 题目难度要适中，符合期末考试水平
-
-请直接输出题目，格式如下：
-1. [计算题题干]
-解：
-计算步骤1
-计算步骤2
-最终答案：[结果]
-答案：[最终结果]
-
-2. ...`;
-                  setInput(prompt);
-                  setTimeout(() => {
-                    const btn = document.getElementById('send-btn');
-                    if (btn) btn.click();
-                  }, 100);
-                }}
-                className="w-full text-left px-4 py-2 text-xs hover:bg-slate-50 rounded-b-lg"
-              >
-                🧮 计算题专项
-              </button>
-            </div>
           </div>
           <button
             onClick={clearMemory}
@@ -1225,32 +1025,40 @@ D. 选项4
                   className={`w-full flex items-start gap-4 message-enter ${message.role === "user" ? "flex-row-reverse" : ""}`}
                   style={{ animationDelay: `${idx * 0.05}s` }}
                 >
-                  {/* Avatar */}
+                  {/* Avatar - 精致圆形头像 */}
                   {message.role === "user" ? (
-                    <div className="w-8 h-8 rounded-full bg-gradient-to-br from-slate-800 to-slate-900 text-white flex items-center justify-center flex-shrink-0 mt-1 shadow-md">
-                      <span className="font-medium text-xs">我</span>
+                    <div className="w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 mt-1 shadow-sm"
+                      style={{
+                        background: 'linear-gradient(135deg, #e2e8f0 0%, #cbd5e1 100%)',
+                        border: '2px solid rgba(255,255,255,0.8)'
+                      }}>
+                      <span className="font-medium text-xs" style={{ color: '#64748b' }}>我</span>
                     </div>
                   ) : (
-                    <div className="w-8 h-8 rounded-full bg-gradient-to-br from-teal-400 to-teal-600 text-white flex items-center justify-center flex-shrink-0 mt-1 shadow-md">
-                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <div className="w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 mt-1 shadow-md"
+                      style={{
+                        background: 'linear-gradient(135deg, #0d9488 0%, #0f766e 100%)',
+                        border: '2px solid rgba(255,255,255,0.8)'
+                      }}>
+                      <svg className="w-4 h-4" fill="none" stroke="white" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
                       </svg>
                     </div>
                   )}
 
                   <div className={`flex-1 max-w-3xl ${message.role === "user" ? "text-right" : ""}`}>
-                    <div className="text-[0.65rem] font-semibold text-slate-400 uppercase tracking-wider mb-2 flex items-center gap-2">
+                    <div className="text-[0.65rem] font-semibold mb-2 flex items-center gap-2" style={{ color: '#a0a0a0', letterSpacing: '0.05em' }}>
                       {message.role === "user" ? (
                         <>
-                          <span>你</span>
-                          <span className="text-slate-300">·</span>
-                          <span className="text-slate-400">{new Date(message.timestamp).toLocaleTimeString()}</span>
+                          <span style={{ color: '#6b7280' }}>你</span>
+                          <span style={{ opacity: 0.5 }}>·</span>
+                          <span style={{ color: '#a0a0a0' }}>{new Date(message.timestamp).toLocaleTimeString()}</span>
                         </>
                       ) : (
                         <>
-                          <span className="text-teal-600">DeepRevision</span>
-                          <span className="text-slate-300">·</span>
-                          <span className="text-slate-400">AI 助手</span>
+                          <span style={{ color: '#0d9488', fontWeight: 600 }}>DeepRevision</span>
+                          <span style={{ opacity: 0.5 }}>·</span>
+                          <span style={{ color: '#a0a0a0' }}>AI 助手</span>
                         </>
                       )}
                     </div>
@@ -1259,11 +1067,17 @@ D. 选项4
                       <ThoughtChain thoughts={thoughts} />
                     )}
 
-                    <div className={`inline-block ${
+                    <div className={`inline-block px-5 py-3.5 rounded-2xl shadow-sm ${
                       message.role === "user"
-                        ? "bg-gradient-to-br from-slate-800 to-slate-900 text-white px-4 py-3 rounded-2xl rounded-tr-sm shadow-md"
-                        : "bg-white border border-slate-200 rounded-2xl rounded-tl-sm shadow-sm"
-                    }`}>
+                        ? "rounded-tr-md"
+                        : "rounded-tl-md border"
+                    }`} style={{
+                      background: message.role === "user"
+                        ? '#f1f5f9'
+                        : 'rgba(255,255,255,0.9)',
+                      color: message.role === "user" ? '#334155' : '#1e293b',
+                      borderColor: 'rgba(180,170,150,0.2)'
+                    }}>
                       <MarkdownContent
                         content={message.content || (message.role === "assistant" && isLoading ? "正在思考中..." : "")}
                         onRequestAnswers={() => {
@@ -1290,10 +1104,17 @@ D. 选项4
             </div>
           </div>
 
-          {/* 输入框 - 毛玻璃效果 */}
-          <div className="flex-none w-full glass border-t border-slate-200/50 pb-6 pt-4 px-4">
+          {/* 输入框 - 精致日式风格 */}
+          <div className="flex-none w-full pb-6 pt-4 px-4" style={{ background: 'linear-gradient(to top, rgba(251,250,245,0.95), rgba(251,250,245,0))' }}>
             <div className="max-w-3xl mx-auto w-full relative">
-              <div className="relative flex items-end gap-3 bg-white/80 border border-slate-200 rounded-2xl shadow-lg hover:shadow-xl transition-shadow input-focus p-1.5">
+              <div className="relative flex items-end gap-3 rounded-2xl transition-all duration-300"
+                style={{
+                  background: 'rgba(255,255,255,0.7)',
+                  backdropFilter: 'blur(20px)',
+                  border: '1px solid rgba(180,170,150,0.2)',
+                  boxShadow: '0 4px 30px rgba(180,170,150,0.1), inset 0 1px 0 rgba(255,255,255,0.8)'
+                }}
+              >
                 <div className="flex-1 relative">
                   <textarea
                     id="user-input"
@@ -1301,9 +1122,13 @@ D. 选项4
                     onChange={e => setInput(e.target.value)}
                     onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}
                     rows={1}
-                    className="w-full bg-transparent max-h-40 py-2.5 px-3 text-sm text-slate-900 placeholder-slate-400 focus:outline-none resize-none"
-                    placeholder="输入你想复习的考点、概念或出题要求..."
-                    style={{ minHeight: "48px" }}
+                    className="w-full bg-transparent max-h-40 py-3.5 px-4 text-sm resize-none focus:outline-none"
+                    style={{
+                      color: '#3d3d3d',
+                      fontFamily: 'Georgia, "Times New Roman", serif',
+                      minHeight: '52px'
+                    }}
+                    placeholder="在这里输入你想复习的内容..."
                     disabled={isLoading}
                   />
                 </div>
@@ -1311,19 +1136,29 @@ D. 选项4
                   id="send-btn"
                   onClick={sendMessage}
                   disabled={isLoading || !input.trim()}
-                  className="mb-1 mr-1 p-3 rounded-xl bg-gradient-to-r from-slate-900 to-slate-800 text-white hover:from-teal-600 hover:to-teal-500 transition-all btn-hover disabled:opacity-50 disabled:cursor-not-allowed shadow-md"
+                  className="mb-2 mr-2 p-3 rounded-xl transition-all duration-300 disabled:opacity-40 disabled:cursor-not-allowed"
+                  style={{
+                    background: input.trim() && !isLoading
+                      ? 'linear-gradient(135deg, #2d3436 0%, #636e72 100%)'
+                      : 'rgba(200,200,200,0.3)',
+                    boxShadow: input.trim() && !isLoading
+                      ? '0 2px 12px rgba(45,52,54,0.3)'
+                      : 'none'
+                  }}
                 >
                   {isLoading ? (
                     <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
                   ) : (
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 12h14M12 5l7 7-7 7" />
+                    <svg className="w-4 h-4" fill="none" stroke="white" viewBox="0 0 24 24" style={{ opacity: input.trim() ? 1 : 0.5 }}>
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
                     </svg>
                   )}
                 </button>
               </div>
-              <div className="flex items-center justify-center gap-4 mt-3 text-[0.65rem] text-slate-400">
-                <span className="text-[0.65rem] font-mono text-slate-400">Shift + Enter 换行 | Enter 发送</span>
+              <div className="flex items-center justify-center gap-4 mt-3" style={{ color: '#b0b0b0', fontSize: '11px' }}>
+                <span>Enter 发送</span>
+                <span style={{ opacity: 0.5 }}>·</span>
+                <span>Shift + Enter 换行</span>
               </div>
             </div>
           </div>
@@ -1343,6 +1178,7 @@ D. 选项4
             setCurrentSessionName(session.name);
             setMessages([]);
             setThoughts([]);
+            loadSessionMessages(id);  // 加载会话历史消息
           }
         }}
         onCreate={createSession}

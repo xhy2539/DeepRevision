@@ -1,14 +1,14 @@
 """
-多 Agent 出题系统 - 4 Agent 协作
-Agent 1: 出题 Agent - 生成题目和答案
-Agent 2: 验证 Agent - 验证答案正确性和题目合理性
-Agent 3: 审核 Agent - 验证题目可行性和格式规范
-Agent 4: 监督 Agent - 确保知识点与课件一致，监督整个流程
+多 Agent 出题系统 - Reflexion 架构
+Agent 1: 出题 Agent  — 生成题目 + 推理链（为什么这样出题、答案依据何处）
+Agent 2: Critic Agent — 质疑推理链，找出逻辑漏洞，输出结构化批评
+Agent 3: Revise Agent — 逐条回应批评，修订题目并给出修改说明
+循环：critique → revise → critique，最多 2 轮
 """
 import json
-from typing import TypedDict, List, Optional
+from typing import TypedDict, List
+
 from langgraph.graph import StateGraph, END
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
@@ -19,53 +19,70 @@ from utils.logger_handler import logger
 
 
 # ==================== 状态定义 ====================
+
 class QuizState(TypedDict):
-    """出题系统状态"""
-    topic: str                      # 考点
-    quiz_type: str                 # 题目类型
-    num: int                       # 题目数量
-    context: str                   # RAG 检索的资料
-    quiz: str                     # 生成的题目
-    verify_result: dict            # 验证结果
-    review_result: dict            # 审核结果
-    supervise_result: dict         # 监督结果
-    fixed_quiz: str               # 修复后的题目
-    issues: List[str]             # 发现的问题
-    final_quiz: str               # 最终题目
-    max_retries: int              # 最大重试次数
-    sample_paper_context: str      # 样卷格式（可选）
+    # 输入
+    topic: str
+    quiz_type: str
+    num: int
+    context: str
+    sample_paper_context: str
+    # Agent 1 输出
+    quiz: str               # 原始题目文本
+    reasoning: str          # 出题推理链（JSON 字符串）
+    # Agent 2 输出
+    critique: dict          # Critic 的结构化批评
+    initial_score: int      # 第一轮 Critic 评分（效果验证基准）
+    # Agent 3 输出
+    revised_quiz: str       # 修订后题目
+    revision_notes: str     # 针对批评的修改说明
+    # 控制
+    reflection_rounds: int  # 已进行的反思轮次
 
 
 class ExamPaperState(TypedDict):
-    """出卷系统状态"""
-    topics: List[str]              # 考点列表
-    quiz_types: List[str]          # 题目类型列表
-    total_questions: int           # 总题数
-    sample_paper_context: str      # 样卷内容
-    contexts: List[str]           # 各考点资料
-    exam_paper: str               # 生成的试卷
-    verify_result: dict            # 验证结果
-    review_result: dict           # 审核结果
-    supervise_result: dict         # 监督结果
-    issues: List[str]             # 发现的问题
-    final_paper: str             # 最终试卷
-    max_retries: int             # 最大重试次数
+    # 输入
+    topics: List[str]
+    quiz_types: List[str]
+    total_questions: int
+    sample_paper_context: str
+    contexts: List[str]
+    # Agent 1 输出
+    exam_paper: str
+    reasoning: str
+    # Agent 2 输出
+    critique: dict
+    initial_score: int      # 第一轮 Critic 评分（效果验证基准）
+    # Agent 3 输出
+    revised_exam: str
+    revision_notes: str
+    # 控制
+    reflection_rounds: int
 
 
 # ==================== 工具函数 ====================
+
 async def get_rag_context(topic: str) -> str:
-    """获取 RAG 资料"""
-    sid = current_session_id.get() or "default"
-    rag = RagSummarizeService()
-    return await rag.rag_summarize(topic)
+    """获取 RAG 原始检索片段（不做最终 LLM 总结，出题 Agent 自己基于原文出题）"""
+    logger.info(f"[RAG Context] 正在检索 topic={topic[:50]}...")
+    try:
+        rag = RagSummarizeService()
+        context = await rag.retrieve_context(topic)
+        logger.info(f"[RAG Context] 检索完成，返回长度={len(context)}")
+        if not context or context.strip() == "":
+            logger.warning("[RAG Context] 知识库为空，返回提示信息")
+            return "【提示】当前知识库为空，无法生成题目。请先上传课件后再请求出题。"
+        return context
+    except Exception as e:
+        logger.error(f"[RAG Context] 检索异常: {e}")
+        return f"【提示】知识库检索失败: {str(e)}"
 
 
 async def call_llm(prompt_template: str, **kwargs) -> str:
     """调用 LLM"""
     prompt = PromptTemplate.from_template(prompt_template)
     chain = prompt | chat_model | StrOutputParser()
-    result = await chain.ainvoke(kwargs)
-    return result
+    return await chain.ainvoke(kwargs)
 
 
 def _extract_json(text: str) -> dict:
@@ -78,820 +95,527 @@ def _extract_json(text: str) -> dict:
     return json.loads(text)
 
 
-# ==================== 4 Agent 提示词 (优化版) ====================
+# ==================== 提示词 ====================
 
-# ---------- Agent 1: 出题 Agent (CoT + Few-Shot 增强) ----------
-GENERATE_PROMPT = """<context>
-你是一位资深的大学期末考试命题专家，拥有10年以上出题经验。你擅长根据教材和课件设计高质量的考试题目，注重知识点的全面覆盖和难度梯度设计。
-</context>
-
-<task>
-根据以下课件资料，为大学生生成高质量的期末复习试题。
-</task>
-
-<thinking>
-1. 首先通读课件资料，识别核心知识点和重要概念
-2. 根据题型特点设计题目：
-   - 选择题：测试对概念的理解和辨析能力
-   - 填空题：测试对关键定义和数值的记忆
-   - 判断题：测试对易混淆概念的辨别
-   - 简答题：测试对知识点的综合理解
-3. 确保答案100%来源于课件，禁止编造
-4. 解析要包含考点分析和答题思路
-</thinking>
+# ---------- Agent 1: 出题 + 推理链 ----------
+GENERATE_WITH_REASONING_PROMPT = """你是一位资深大学期末考试命题专家。根据课件资料生成题目，同时给出详细推理链。
 
 【考点】{topic}
 【题型】{quiz_type}
 【题目数量】{num}
+【样卷格式参考】{sample_paper_context}
 
-【课件资料】（必须严格以此为依据，禁止超出范围）:
+【课件资料】（所有题目必须严格基于此）:
 {context}
 
-【样卷格式参考】（如有，请严格遵循）:
-{sample_paper_context}
+请生成题目，并为每道题提供推理链（说明为什么这样出题、答案依据在课件哪里）。
 
-【重要提示】
-- 如果用户没有明确要求"含答案"、"要答案"、"附答案"，则只输出题目，不输出答案和解析
-- 如果用户要求查看答案，再输出"【答案】"部分
-
-【题型格式模板】（必须按此格式输出）
-
-【注意】以下格式中"答案"和"解析"部分，只有在用户明确要求时才输出！
-
-## 选择题
-1. [题干：清晰描述考察点]
-A. [选项A]
-B. [选项B]
-C. [选项C]
-D. [选项D]
-答案：[A/B/C/D]  ← 仅用户要求答案时输出
-解析：[详细解析]  ← 仅用户要求答案时输出
-
-## 填空题
-1. [题干：在关键位置使用_____表示填空]
-答案：[答案，多个空用|分隔]  ← 仅用户要求答案时输出
-
-## 判断题
-1. [题干：描述一个判断命题]
-答案：正确/错误  ← 仅用户要求答案时输出
-
-## 简答题
-1. [问题：综合性问题]
-参考答案要点：  ← 仅用户要求答案时输出
-- 要点1
-- 要点2
-- 要点3
-
-## 名词解释
-1. [名词]
-答案：[简明定义，50字以内]  ← 仅用户要求答案时输出
-
-## 计算题
-1. [题目条件]
-解：
-步骤1：[计算过程]
-步骤2：[计算过程]
-最终答案：[结果]  ← 仅用户要求答案时输出
-
-【出题原则 - 务必遵守】
-1. ✓ 核心知识点必须来自课件（60%以上）
-2. ✓ 可以适度延申（40%以内），用常见大学课程知识补充
-3. ✗ 禁止凭空编造课件完全没有的知识点
-4. ✓ 答案必须能在课件中找到原文依据
-5. ✗ 答案不能是"以上都对/都不对"
-6. ✓ 课件内容不足时，只出能出的题，不要编造
-
-【难度分级】
-- 简单（30%）：基础概念记忆
-- 中等（50%）：理解应用
-- 困难（20%）：综合分析
-
-请直接输出题目内容。如果用户没有要求答案，就只输出题目。"""
-
-
-# ---------- Agent 2: 验证 Agent ----------
-VERIFY_PROMPT = """<context>
-你是一位试题审核员。检查试题是否合理。
-</context>
-
-【考点】{topic}
-【课件资料】: {context}
-
-【待验证试题】: {quiz}
-
-请逐项检查：
-1. 答案是否来自课件？
-2. 知识点是否在课件范围内？（可以适度延申但不能偏离太远）
-3. 题目是否有明显错误？
-4. 格式是否符合模板要求？
-5. 难度是否适合期末考试水平？
-
-【错误类型定义】
-- correctness: 答案错误或与课件不符
-- clarity: 题目表述有歧义
-- format: 格式不符合要求
-- difficulty: 难度不合理
-
-请按以下JSON格式返回验证结果（只返回JSON，不要其他内容）：
+返回如下 JSON（只返回 JSON，不要其他内容）：
 ```json
 {{
-    "valid": true,
-    "score": 85,
-    "issues": [
-        {{"type": "correctness|clarity|format|difficulty", "location": "第X题", "desc": "问题描述", "fix": "修复建议"}}
+    "quiz": "完整题目文本（包含题干、选项、答案、解析）",
+    "reasoning": {{
+        "knowledge_points": ["第1题考察知识点X，来源：课件原文'...'", "第2题考察..."],
+        "answer_evidence": ["第1题答案A的依据：课件原文'...'", "第2题..."],
+        "distractor_design": ["第1题干扰项B的设计逻辑：容易与X混淆，因为...", "第2题..."]
+    }}
+}}
+```
+
+【出题原则】
+- 答案必须有课件原文依据，禁止凭空编造
+- 干扰项要有区分度，不能用"以上都是/都不是"
+- 难度分布：简单30%、中等50%、困难20%"""
+
+
+# ---------- Agent 2: Critic — 质疑推理链 ----------
+CRITIQUE_PROMPT = """你是一位严格的考试命题评审专家。你的职责不是简单检查题目，
+而是深入质疑出题者的推理链，找出逻辑漏洞和错误声明。
+
+【考点】{topic}
+【题型】{quiz_type}
+【课件资料】（唯一权威依据）:
+{context}
+
+【待评审题目】:
+{quiz}
+
+【出题者的推理链】（出题者对自己决策的解释）:
+{reasoning}
+
+请逐一审查推理链中的每个声明：
+1. 课件原文引用是否准确？（对照课件资料逐字核实）
+2. 答案依据是否充分？（能否在课件中找到明确支持）
+3. 干扰项设计逻辑是否合理？（是否真的具有迷惑性但又有明确错误原因）
+4. 是否有超出课件范围的知识点？
+
+返回如下 JSON（只返回 JSON）：
+```json
+{{
+    "approved": false,
+    "overall_score": 75,
+    "critique": "总体评价：出题者的推理链在第X题出现了...",
+    "reasoning_flaws": [
+        {{
+            "question": "第1题",
+            "flaw": "推理链称答案依据是课件'...'，但实际课件原文是'...'，两者不符",
+            "severity": "high"
+        }}
     ],
-    "summary": "总体评价",
-    "fix_needed": false
+    "specific_issues": [
+        {{
+            "question": "第2题",
+            "issue": "干扰项C与正确答案区分度不够",
+            "suggestion": "将C改为...，因为这样能更有效地区分掌握程度"
+        }}
+    ]
+}}
+```
+
+判断标准：
+- approved=false 当且仅当存在 high severity 问题，或 overall_score < 70
+- 格式小问题、轻微难度偏差不影响 approved"""
+
+
+# ---------- Agent 3: Revise — 针对批评逐条修订 ----------
+REVISE_WITH_REFLECTION_PROMPT = """你是一位考试命题专家，你刚刚收到了评审专家对你题目的批评。
+请认真对待每一条批评，进行有针对性的修订，不能敷衍了事。
+
+【考点】{topic}
+【题型】{quiz_type}
+【课件资料】（修订必须基于此）:
+{context}
+
+【原始题目】:
+{quiz}
+
+【你的原始推理链】:
+{reasoning}
+
+【评审批评】（必须逐条回应）:
+{critique}
+
+请根据批评修订题目，并详细说明你的修改依据。
+
+返回如下 JSON（只返回 JSON）：
+```json
+{{
+    "revised_quiz": "修订后的完整题目文本（包含题干、选项、答案、解析）",
+    "revision_notes": "修改说明：\\n1. 针对'第1题答案依据不准确'：将答案从B改为C，因为课件原文明确写道'...'\\n2. 针对'第2题干扰项区分度'：将选项C改为'...'，原因是...",
+    "addressed_issues": ["第1题答案错误", "第2题干扰项设计"]
 }}
 ```"""
 
 
-# ---------- Agent 3: 审核 Agent (结构化增强) ----------
-REVIEW_PROMPT = """<context>
-你是一位资深的考试命题审核专家，负责评估试题是否能用于正式考试。你需要从可行性、区分度、知识点覆盖等多个维度进行审核。
-</context>
+# ---------- 试卷版本 ----------
+EXAM_GENERATE_WITH_REASONING_PROMPT = """你是一位资深大学期末考试命题专家。根据课件资料生成完整试卷。
 
-<task>
-对以下试题进行可行性审核，评估是否能用于正式期末考试。
-</task>
+【重要】出题前必须先联网搜索该学科的典型期末试卷风格、常见考点和优秀题目作为参考。
 
-<thinking>
-1. 可行性：题目是否适合作为考试题
-2. 区分度：是否能有效区分学生水平
-3. 唯一性：答案是否确定唯一
-4. 覆盖：知识点是否全面
-</thinking>
+【考点范围】{topics}
+【题目类型】{quiz_types}
+【总题数】{total_questions}
+【总分】100分（必须正好100分，不能多也不能少）
+【样卷格式参考】{sample_paper_context}
 
-【考点】{topic}
-【题型】{quiz_type}
+【课件资料】:
+{contexts}
 
-【待审核试题】:
-{quiz}
+【硬性要求】（必须严格遵守，任何一条不遵守都判定为不合格）：
+1. 总题数：必须正好 {total_questions} 道，不能多也不能少
+2. 总分：必须正好 100分，不能多也不能少
+3. 题型分布（推荐）：选择题 10题×2分=20分，填空题 10题×2分=20分，判断题 10题×2分=20分，简答题 4题×10分=40分
+4. 选择题必须有 A、B、C、D 四个完整选项，题干描述要详细（至少30字）
+5. 题目必须全部统一编号：1、2、3... 到 {total_questions}，不能每个题型单独编号
+6. 答案优先以课件原文为依据，如果没有明确依据可标注"参考答案"
+7. 简答题/解答题必须有2-3个小问，每问5分左右
+8. 填空题和判断题题干也要详细描述
+9. 题目描述要详细，包含足够信息让考生理解题意
+10. 难度分布：简单题占30%，中等题占50%，难题占20%
+11. 【严禁重复】同一知识点、同一题型、相似问法不得出现超过1次，必须确保每道题知识点不重复
+12. 【去重检查】生成完成后必须检查所有题目，确保没有完全相同的题干、选项或考点
 
-【审核标准】（逐项检查）
+请生成完整试卷。
 
-## 1. 可行性评估
-- [ ] 题目是否适合作为正式考试题？
-- [ ] 区分度是否合理？（不能太简单或太难）
-- [ ] 是否有足够的区分度？
+【试卷格式要求】（必须严格遵守）：
+```
+## 《期末考试试卷》
 
-## 2. 答案唯一性
-- [ ] 答案是否确定唯一？
-- [ ] 是否存在多个合理答案的可能性？
-- [ ] 选择题是否避免了"以上都对"等投机选项？
+一、选择题（每题2分，共10题）
+1. [详细题干内容，描述要充分]
+   A. 选项1  B. 选项2  C. 选项3  D. 选项4
 
-## 3. 分数配重
-- [ ] 分值分配是否合理？
-- [ ] 难题和简单题分值是否匹配？
+2. [详细题干内容]
+   A. 选项1  B. 选项2  C. 选项3  D. 选项4
 
-## 4. 知识点覆盖
-- [ ] 知识点是否全面？
-- [ ] 是否有遗漏的重要考点？
-- [ ] 是否有重复考察同一知识点？
+...
 
-【错误类型定义】
-- feasibility: 可行性问题
-- uniqueness: 答案不唯一
-- weight: 分值不合理
-- coverage: 知识点覆盖不全或重复
+二、填空题（每题2分，共10题）
+11. [详细题干内容，需要填空的部位用括号表示]
 
-请按以下JSON格式返回审核结果：
+12. ...
+
+三、判断题（每题2分，共10题）
+21. [详细题干内容]
+
+22. ...
+
+四、简答题/解答题（每题10分，共4题，每题2-3问）
+31. [问题描述]（10分）
+    (1) [小问1]（5分）
+    (2) [小问2]（5分）
+
+32. [问题描述]
+    (1) ...
+    (2) ...
+```
+
+返回如下 JSON（只返回 JSON）：
 ```json
-{
-    "feasible": true/false,
-    "score": 80,
-    "issues": [
-        {"type": "feasibility|uniqueness|weight|coverage", "location": "第X题", "desc": "问题描述", "fix": "修改建议"}
-    ],
-    "suggestions": ["建议1", "建议2"],
-    "pass": true/false
-}
+{{
+    "exam_paper": "完整试卷文本（包含所有题目、答案、解析，按照上述格式）",
+    "reasoning": {{
+        "topic_coverage": ["选择题主要考察X考点，来源课件...", "填空题考察..."],
+        "answer_evidence": ["第1题答案依据：课件原文'...'", "第2题..."],
+        "difficulty_distribution": "简单题X道（第N题...），中等X道，困难X道..."
+    }}
+}}
 ```"""
 
 
-# ---------- Agent 4: 监督 Agent (Constitutional AI 增强) ----------
-SUPERVISE_PROMPT = """<context>
-你是本系统的最终监督员，负责确保整个出题流程正确进行。你需要综合验证结果和审核结果，进行最终把关。
-</context>
+EXAM_CRITIQUE_PROMPT = """你是严格的试卷评审专家。深入质疑出题者的推理链，核实每个声明是否与课件一致。
 
-<task>
-对以下信息进行最终审核，确保题目知识点与课件内容100%一致，确保最终输出的题目质量合格。
-</task>
+【考点范围】{topics}
+【课件资料】（唯一权威依据）:
+{contexts}
 
-<thinking>
-1. 知识点一致性：所有知识点必须来自课件
-2. 答案一致性：答案必须与课件内容完全一致
-3. 流程完整性：综合前序所有验证结果
-4. 质量判断：给出最终判定
-</thinking>
+【待评审试卷】:
+{exam_paper}
 
-【考点】{topic}
-【题型】{quiz_type}
+【出题推理链】:
+{reasoning}
 
-【课件资料】（以此为准，任何不一致都是严重问题）:
-{context}
+【重点审查项】你必须特别严格检查以下问题：
+1. 【重复检查】是否存在完全相同或高度相似的题目？同一知识点是否重复出题？
+2. 【总分验证】所有题目分值加起来是否正好100分？
+3. 【题数验证】题目数量是否正好{total_questions}道？
+4. 【编号验证】题目是否统一编号（1、2、3...），而非每个题型单独编号？
 
-【待审核试题】:
-{quiz}
-
-【验证结果】(Agent 2):
-{verify_result}
-
-【审核结果】(Agent 3):
-{review_result}
-
-【监督检查项】（必须逐项确认）
-
-## 1. 知识点一致性检查
-- [ ] 题目涉及的知识点是否100%来自课件？
-- [ ] 是否有任何超出课件范围的知识点？
-- [ ] 是否有凭空编造的概念？
-
-## 2. 答案一致性检查
-- [ ] 答案中的知识点是否与课件完全一致？
-- [ ] 是否存在与课件相悖的内容？
-- [ ] 解析是否准确？
-
-## 3. 流程完整性检查
-- [ ] 前序验证是否通过？
-- [ ] 前序审核是否通过？
-- [ ] 是否存在遗漏的重要问题？
-
-## 4. 格式规范性检查
-- [ ] 格式是否统一规范？
-- [ ] 是否符合出题模板要求？
-
-【质量等级】
-- A级：可直接使用
-- B级： minor issues，可接受
-- C级：需要修改
-- D级：不合格，需要重新生成
-
-请按以下JSON格式返回监督结果：
+返回如下 JSON（只返回 JSON）：
 ```json
-{
-    "consistent": true/false,
-    "issues": [
-        {"type": "knowledge|answer|process|format", "location": "第X题", "desc": "问题描述", "fix": "修改建议"}
+{{
+    "approved": false,
+    "overall_score": 75,
+    "critique": "总体评价...",
+    "reasoning_flaws": [
+        {{"question": "第X题", "flaw": "...", "severity": "high|medium|low"}}
     ],
-    "warnings": [],
-    "final_verdict": "通过/需要修改",
-    "quality_level": "A/B/C/D",
-    "action_required": true/false
-}
+    "specific_issues": [
+        {{"question": "第X题", "issue": "...", "suggestion": "..."}}
+    ],
+    "duplicate_check": {{"has_duplicates": true/false, "duplicate_questions": ["第X题与第Y题重复", ...]}}
+}}
 ```"""
 
 
-# ==================== Agent 节点函数 ====================
+EXAM_REVISE_WITH_REFLECTION_PROMPT = """你是考试命题专家，收到评审批评后进行针对性修订。
 
-async def generate_quiz_node(state: QuizState) -> QuizState:
-    """Agent 1: 出题 Agent"""
-    logger.info(f"[Agent 1-出题] 为 {state['topic']} 生成 {state['num']} 道 {state['quiz_type']}")
+【考点范围】{topics}
+【课件资料】:
+{contexts}
 
-    sample_context = state.get('sample_paper_context', '') or '无样卷参考，使用默认格式'
+【原始试卷】:
+{exam_paper}
 
-    quiz = await call_llm(
-        GENERATE_PROMPT,
+【原始推理链】:
+{reasoning}
+
+【评审批评】（必须逐条回应，包括所有问题）：
+{critique}
+
+【关键提醒】
+1. 如果评审批评指出存在重复题目，必须删除或替换重复的题目
+2. 确保修订后总分仍然是100分
+3. 确保修订后题目数量仍然是{total_questions}道
+4. 返回完整的修订后试卷，不要只返回修改的部分
+
+返回如下 JSON（只返回 JSON）：
+```json
+{{
+    "revised_exam": "【完整试卷】（包含所有题目、答案、解析，不是只输出修订的部分）",
+    "revision_notes": "修改说明：\\n1. 针对'...'：...",
+    "addressed_issues": ["问题1", "问题2"]
+}}
+```"""
+
+
+# ==================== 节点函数（单题）====================
+
+async def generate_with_reasoning_node(state: QuizState) -> QuizState:
+    """Agent 1: 出题 + 推理链"""
+    logger.info(f"[Agent1-出题] {state['topic']} / {state['quiz_type']} / {state['num']}道")
+    sample = state.get('sample_paper_context', '') or '无样卷参考，使用默认格式'
+
+    result = await call_llm(
+        GENERATE_WITH_REASONING_PROMPT,
         topic=state['topic'],
         quiz_type=state['quiz_type'],
         num=state['num'],
         context=state['context'],
-        sample_paper_context=sample_context
+        sample_paper_context=sample,
     )
+    try:
+        parsed = _extract_json(result)
+        quiz = parsed.get('quiz', '')
+        reasoning = json.dumps(parsed.get('reasoning', {}), ensure_ascii=False)
+    except Exception:
+        quiz = result
+        reasoning = '{}'
 
-    return {"quiz": quiz}
+    return {"quiz": quiz, "reasoning": reasoning}
 
 
-async def verify_quiz_node(state: QuizState) -> QuizState:
-    """Agent 2: 验证 Agent"""
-    logger.info("[Agent 2-验证] 验证答案正确性...")
+async def critique_quiz_node(state: QuizState) -> QuizState:
+    """Agent 2: Critic — 质疑推理链，输出结构化批评"""
+    quiz = state.get('revised_quiz') or state.get('quiz', '')
+    logger.info("[Agent2-Critic] 质疑出题推理链...")
 
     result = await call_llm(
-        VERIFY_PROMPT,
+        CRITIQUE_PROMPT,
         topic=state['topic'],
         quiz_type=state['quiz_type'],
         context=state['context'],
-        quiz=state['quiz']
+        quiz=quiz,
+        reasoning=state.get('reasoning', '{}'),
     )
-
     try:
-        verify_result = _extract_json(result)
+        critique = _extract_json(result)
     except Exception:
-        verify_result = {"valid": True, "score": 100, "issues": [], "fix_needed": False}
+        critique = {"approved": True, "overall_score": 80, "reasoning_flaws": [], "specific_issues": []}
+
+    score = critique.get('overall_score', 80)
+    logger.info(f"[Agent2-Critic] approved={critique.get('approved')}, score={score}")
+
+    update: dict = {"critique": critique}
+    # 首轮评审时记录基准分，用于事后对比 Reflexion 提升幅度
+    if state.get('reflection_rounds', 0) == 0 and not state.get('initial_score'):
+        update["initial_score"] = score
+    return update
+
+
+async def revise_with_reflection_node(state: QuizState) -> QuizState:
+    """Agent 3: Revise — 针对批评逐条修订，输出修改说明"""
+    round_n = state.get('reflection_rounds', 0) + 1
+    logger.info(f"[Agent3-Revise] 第 {round_n} 轮反思修订...")
+
+    result = await call_llm(
+        REVISE_WITH_REFLECTION_PROMPT,
+        topic=state['topic'],
+        quiz_type=state['quiz_type'],
+        context=state['context'],
+        quiz=state.get('quiz', ''),
+        reasoning=state.get('reasoning', '{}'),
+        critique=json.dumps(state.get('critique', {}), ensure_ascii=False),
+    )
+    try:
+        parsed = _extract_json(result)
+        revised = parsed.get('revised_quiz', state.get('quiz', ''))
+        notes = parsed.get('revision_notes', '')
+    except Exception:
+        revised = state.get('quiz', '')
+        notes = ''
 
     return {
-        "verify_result": verify_result,
-        "issues": [i.get("desc", "") for i in verify_result.get("issues", [])]
+        "revised_quiz": revised,
+        "revision_notes": notes,
+        "reflection_rounds": round_n,
     }
 
 
-async def review_quiz_node(state: QuizState) -> QuizState:
-    """Agent 3: 审核 Agent"""
-    logger.info("[Agent 3-审核] 审核题目可行性...")
+# ==================== 节点函数（试卷）====================
 
-    result = await call_llm(
-        REVIEW_PROMPT,
-        topic=state['topic'],
-        quiz_type=state['quiz_type'],
-        quiz=state['quiz']
-    )
-
-    try:
-        review_result = _extract_json(result)
-    except Exception:
-        review_result = {"feasible": True, "score": 100, "issues": [], "pass": True}
-
-    return {"review_result": review_result}
-
-
-async def supervise_quiz_node(state: QuizState) -> QuizState:
-    """Agent 4: 监督 Agent"""
-    logger.info("[Agent 4-监督] 最终审核...")
-
-    verify_str = json.dumps(state.get('verify_result', {}), ensure_ascii=False, indent=2)
-    review_str = json.dumps(state.get('review_result', {}), ensure_ascii=False, indent=2)
-
-    result = await call_llm(
-        SUPERVISE_PROMPT,
-        topic=state['topic'],
-        quiz_type=state['quiz_type'],
-        context=state['context'],
-        quiz=state['quiz'],
-        verify_result=verify_str,
-        review_result=review_str
-    )
-
-    try:
-        supervise_result = _extract_json(result)
-    except Exception:
-        supervise_result = {"consistent": True, "final_verdict": "通过", "action_required": False}
-
-    return {"supervise_result": supervise_result}
-
-
-async def fix_quiz_node(state: QuizState) -> QuizState:
-    """修复 Agent: 根据问题修复题目"""
-    logger.info(f"[修复Agent] 修复 {len(state['issues'])} 个问题")
-
-    all_issues = []
-
-    # 合并所有问题
-    if state.get('verify_result', {}).get('issues'):
-        all_issues.extend(state['verify_result']['issues'])
-    if state.get('review_result', {}).get('issues'):
-        all_issues.extend(state['review_result']['issues'])
-    if state.get('supervise_result', {}).get('issues'):
-        all_issues.extend(state['supervise_result']['issues'])
-
-    issues_text = "\n".join([
-        f"- {i.get('fix', i.get('desc', ''))}"
-        for i in all_issues[:5]  # 最多5个问题
+async def generate_exam_with_reasoning_node(state: ExamPaperState) -> ExamPaperState:
+    """Agent 1: 出卷 + 推理链"""
+    logger.info(f"[Agent1-出卷] {state['total_questions']}道，考点: {state['topics']}")
+    contexts_combined = "\n\n".join([
+        f"【{topic}】\n{ctx}"
+        for topic, ctx in zip(state['topics'], state['contexts'])
     ])
+    sample = state.get('sample_paper_context', '') or '无样卷参考'
 
-    fixed = await call_llm(
-        """你是试题修改专家。请根据审核反馈修复以下试题。
-
-考点：{topic}
-题型：{quiz_type}
-
-课件资料（必须严格以此为准）：
-{context}
-
-审核发现的问题：
-{issues}
-
-原试题：
-{quiz}
-
-【修复要求】
-1. 严格按照审核意见修改
-2. 保持其他正确的部分不变
-3. 修复后确保答案100%正确
-4. 保持格式规范
-
-请输出修复后的完整试题，包含答案和解析。""",
-        topic=state['topic'],
-        quiz_type=state['quiz_type'],
-        context=state['context'],
-        issues=issues_text,
-        quiz=state['quiz']
+    result = await call_llm(
+        EXAM_GENERATE_WITH_REASONING_PROMPT,
+        topics=", ".join(state['topics']),
+        quiz_types=", ".join(state['quiz_types']),
+        total_questions=state['total_questions'],
+        sample_paper_context=sample,
+        contexts=contexts_combined,
     )
+    try:
+        parsed = _extract_json(result)
+        exam_paper = parsed.get('exam_paper', '')
+        reasoning = json.dumps(parsed.get('reasoning', {}), ensure_ascii=False)
+    except Exception:
+        exam_paper = result
+        reasoning = '{}'
 
-    return {"fixed_quiz": fixed, "max_retries": state.get('max_retries', 0) + 1}
+    return {"exam_paper": exam_paper, "reasoning": reasoning}
 
-def should_fix_quiz(state: QuizState) -> str:
-    """判断是否需要修复"""
-    max_retries = state.get('max_retries', 0)
 
-    # 减少重试次数，加快速度（只重试1次）
-    if max_retries >= 1:
-        logger.warning("[出题系统] 达到最大重试次数，直接返回")
+async def critique_exam_node(state: ExamPaperState) -> ExamPaperState:
+    """Agent 2: Critic — 评审试卷推理链"""
+    exam_paper = state.get('revised_exam') or state.get('exam_paper', '')
+    contexts_combined = "\n\n".join(state['contexts'])[:2000]
+    logger.info("[Agent2-Critic-试卷] 质疑出卷推理链...")
+
+    result = await call_llm(
+        EXAM_CRITIQUE_PROMPT,
+        topics=", ".join(state['topics']),
+        contexts=contexts_combined,
+        exam_paper=exam_paper,
+        reasoning=state.get('reasoning', '{}'),
+        total_questions=state.get('total_questions', 10),
+    )
+    try:
+        critique = _extract_json(result)
+    except Exception:
+        critique = {"approved": True, "overall_score": 80, "reasoning_flaws": [], "specific_issues": []}
+
+    score = critique.get('overall_score', 80)
+    logger.info(f"[Agent2-Critic-试卷] approved={critique.get('approved')}, score={score}")
+
+    update: dict = {"critique": critique}
+    if state.get('reflection_rounds', 0) == 0 and not state.get('initial_score'):
+        update["initial_score"] = score
+    return update
+
+
+async def revise_exam_with_reflection_node(state: ExamPaperState) -> ExamPaperState:
+    """Agent 3: Revise — 针对批评修订试卷"""
+    round_n = state.get('reflection_rounds', 0) + 1
+    logger.info(f"[Agent3-Revise-试卷] 第 {round_n} 轮反思修订...")
+    contexts_combined = "\n\n".join(state['contexts'])[:2000]
+
+    result = await call_llm(
+        EXAM_REVISE_WITH_REFLECTION_PROMPT,
+        topics=", ".join(state['topics']),
+        contexts=contexts_combined,
+        exam_paper=state.get('exam_paper', ''),
+        reasoning=state.get('reasoning', '{}'),
+        critique=json.dumps(state.get('critique', {}), ensure_ascii=False),
+        total_questions=state.get('total_questions', 10),
+    )
+    try:
+        parsed = _extract_json(result)
+        revised = parsed.get('revised_exam', state.get('exam_paper', ''))
+        notes = parsed.get('revision_notes', '')
+    except Exception:
+        revised = state.get('exam_paper', '')
+        notes = ''
+
+    return {
+        "revised_exam": revised,
+        "revision_notes": notes,
+        "reflection_rounds": round_n,
+    }
+
+
+# ==================== 条件判断 ====================
+
+def _critique_needs_revision(critique: dict) -> bool:
+    """
+    多条件交叉验证，避免依赖单一布尔字段导致的不稳定判断。
+    触发修订的条件（满足任一即修订）：
+      1. overall_score < 70
+      2. 存在 severity=high 的推理链问题
+      3. approved 明确为 False（作为辅助条件，而非唯一依据）
+      4. 存在重复题目（duplicate_check.has_duplicates = true）
+    全部通过才放行。
+    """
+    score = critique.get('overall_score', 80)
+    high_flaws = [
+        f for f in critique.get('reasoning_flaws', [])
+        if f.get('severity') == 'high'
+    ]
+    approved = critique.get('approved', True)
+
+    # 检查重复题目（严格禁止）
+    duplicate_check = critique.get('duplicate_check', {})
+    has_duplicates = duplicate_check.get('has_duplicates', False)
+
+    needs = (score < 70) or (len(high_flaws) > 0) or (not approved) or has_duplicates
+    logger.info(
+        f"[Critic判断] score={score}, high_flaws={len(high_flaws)}, "
+        f"approved={approved}, duplicates={has_duplicates} → {'修订' if needs else '通过'}"
+    )
+    return needs
+
+
+def should_revise_quiz(state: QuizState) -> str:
+    """最多 2 轮反思；多条件交叉验证决定是否修订"""
+    if state.get('reflection_rounds', 0) >= 2:
+        logger.info("[Reflection] 达到最大轮次（2轮），输出最终结果")
         return "end"
+    if _critique_needs_revision(state.get('critique', {})):
+        return "revise"
+    return "end"
 
-    # 检查验证、审核、监督结果
-    verify = state.get('verify_result', {})
-    review = state.get('review_result', {})
-    supervise = state.get('supervise_result', {})
 
-    needs_fix = (
-        verify.get('fix_needed', False) or
-        review.get('pass', True) == False or
-        supervise.get('action_required', False) == True
-    )
-
-    if needs_fix:
-        return "fix"
-
+def should_revise_exam(state: ExamPaperState) -> str:
+    if state.get('reflection_rounds', 0) >= 2:
+        return "end"
+    if _critique_needs_revision(state.get('critique', {})):
+        return "revise"
     return "end"
 
 
 # ==================== 构建工作流图 ====================
 
 def build_quiz_graph() -> StateGraph:
-    """构建出题工作流图（4 Agent：出题 → 验证 → 审核 → 监督 → 修复）"""
-
+    """Reflexion 架构：出题+推理链 → Critic质疑 → Revise修订（最多2轮）"""
     graph = StateGraph(QuizState)
 
-    # 添加节点
-    graph.add_node("generate", generate_quiz_node)      # Agent 1: 出题
-    graph.add_node("verify", verify_quiz_node)          # Agent 2: 验证
-    graph.add_node("review", review_quiz_node)          # Agent 3: 审核
-    graph.add_node("supervise", supervise_quiz_node)    # Agent 4: 监督
-    graph.add_node("fix", fix_quiz_node)                # 修复
+    graph.add_node("generate", generate_with_reasoning_node)
+    graph.add_node("critique", critique_quiz_node)
+    graph.add_node("revise", revise_with_reflection_node)
 
-    # 设置入口
     graph.set_entry_point("generate")
-
-    # 边：出题 → 验证 → 审核 → 监督
-    graph.add_edge("generate", "verify")
-    graph.add_edge("verify", "review")
-    graph.add_edge("review", "supervise")
-
-    # 条件边：监督通过则结束，否则修复
+    graph.add_edge("generate", "critique")
     graph.add_conditional_edges(
-        "supervise",
-        should_fix_quiz,
-        {
-            "fix": "fix",
-            "end": END
-        }
+        "critique",
+        should_revise_quiz,
+        {"revise": "revise", "end": END}
     )
-
-    # 修复后重新验证
-    graph.add_edge("fix", "verify")
+    graph.add_edge("revise", "critique")
 
     return graph.compile()
 
 
 def build_exam_graph() -> StateGraph:
-    """构建出卷工作流图（4 Agent：出题 → 验证 → 审核 → 监督 → 修复）"""
-
+    """试卷 Reflexion 架构"""
     graph = StateGraph(ExamPaperState)
 
-    # 添加节点
-    graph.add_node("generate", generate_exam_node)      # Agent 1: 出题
-    graph.add_node("verify", verify_exam_node)          # Agent 2: 验证
-    graph.add_node("review", review_exam_node)          # Agent 3: 审核
-    graph.add_node("supervise", supervise_exam_node)    # Agent 4: 监督
-    graph.add_node("fix", fix_exam_node)                # 修复
+    graph.add_node("generate", generate_exam_with_reasoning_node)
+    graph.add_node("critique", critique_exam_node)
+    graph.add_node("revise", revise_exam_with_reflection_node)
 
     graph.set_entry_point("generate")
-    graph.add_edge("generate", "verify")
-    graph.add_edge("verify", "review")
-    graph.add_edge("review", "supervise")
-
-    # 条件边：监督通过则结束，否则修复
+    graph.add_edge("generate", "critique")
     graph.add_conditional_edges(
-        "supervise",
-        should_fix_exam,
-        {
-            "fix": "fix",
-            "end": END
-        }
+        "critique",
+        should_revise_exam,
+        {"revise": "revise", "end": END}
     )
-
-    graph.add_edge("fix", "verify")
+    graph.add_edge("revise", "critique")
 
     return graph.compile()
 
 
-# ==================== 试卷生成相关节点 ====================
-
-async def generate_exam_node(state: ExamPaperState) -> ExamPaperState:
-    """生成试卷 Agent"""
-    logger.info(f"[出卷Agent] 生成 {state['total_questions']} 道题的试卷")
-
-    contexts_combined = "\n\n".join([
-        f"【{topic}】\n{ctx}"
-        for topic, ctx in zip(state['topics'], state['contexts'])
-    ])
-
-    sample = state.get('sample_paper_context', '') or '无样卷参考，使用默认格式'
-
-    prompt = f"""<context>
-你是一位资深的大学期末考试命题专家。根据给定的课件资料生成高质量试卷。
-</context>
-
-<task>
-根据以下课件资料，生成一套完整的期末考试试卷。
-</task>
-
-<考点范围>
-{', '.join(state['topics'])}
-</考点范围>
-
-<题目类型>
-{', '.join(state['quiz_types'])}
-</题目类型>
-
-<总题数>
-{state['total_questions']}
-</总题数>
-
-<样卷格式参考>
-{sample}
-</样卷格式参考>
-
-<课件资料>
-{contexts_combined}
-</课件资料>
-
-<thinking>
-1. 识别课件中的核心知识点
-2. 规划题目分布（简单30%+中等50%+困难20%）
-3. 逐题编写，确保答案有课件原文依据
-4. 检查格式规范性
-</thinking>
-
-<output_format>
-## 选择题
-1. [题干]
-A. [选项] B. [选项] C. [选项] D. [选项]
-
-## 填空题
-1. [题干，用_____填空]
-
-## 判断题
-1. [题干]
-
-## 简答题
-1. [问题]
-
-【答案】（用户要求时附加）
-## 选择题答案
-1. A
-## 填空题答案
-1. [答案]
-</output_format>
-
-<rules>
-- 默认只输出题目，不输出答案
-- 用户明确要求"含答案"才输出答案
-- 60%知识点来自课件，40%可适度延申
-- 禁止"以上都对/以上都错"类投机选项
-- 禁止凭空编造知识点
-</rules>
-
-<example>
-【错误示范】
-1. 人工智能的核心技术包括？
-A. 以上都是
-B. 以上都不是
-C. 机器学习
-D. 深度学习
-答案：A  ← 错误！使用了"以上都是"
-
-【正确示范】
-1. 人工智能的核心技术主要包括？
-A. 机器学习
-B. 自然语言处理
-C. 计算机视觉
-D. 增强现实
-答案：ABC  ← 正确！
-</example>
-
-请严格按照格式输出试卷。"""
-
-    exam_paper = await call_llm(prompt)
-    return {"exam_paper": exam_paper}
-
-
-async def verify_exam_node(state: ExamPaperState) -> ExamPaperState:
-    """验证试卷 Agent"""
-    logger.info("[验证Agent] 验证试卷...")
-
-    contexts_combined = "\n\n".join(state['contexts'])[:2000]
-
-    result = await call_llm(
-        """<context>
-你是严格的试题审核员，负责验证试卷答案是否正确。
-</context>
-
-<task>
-逐题验证试卷答案是否在课件资料中有原文依据。
-</task>
-
-<课件资料>
-{contexts}
-</课件资料>
-
-<试卷>
-{exam_paper}
-</试卷>
-
-<verification_steps>
-1. 提取试卷中每个答案
-2. 在课件资料中搜索该答案的相关内容
-3. 判断答案是否正确、是否有原文依据
-4. 标记所有问题
-</verification_steps>
-
-<output_format>
-```json
-{
-  "pass": true/false,
-  "score": 85,
-  "issues": [
-    {"题号": 1, "问题": "答案错误", "课件依据": "相关原文"},
-    {"题号": 3, "问题": "找不到依据", "课件依据": "N/A"}
-  ],
-  "fix_needed": true/false,
-  "summary": "验证总结"
-}
-```
-</output_format>""",
-        topics=", ".join(state['topics']),
-        quiz_types=", ".join(state['quiz_types']),
-        contexts=contexts_combined,
-        exam_paper=state['exam_paper']
-    )
-
-    try:
-        verify_result = _extract_json(result)
-    except Exception:
-        verify_result = {"valid": True, "issues": [], "fix_needed": False}
-
-    return {"verify_result": verify_result}
-
-
-async def review_exam_node(state: ExamPaperState) -> ExamPaperState:
-    """最终确认 Agent - 做最终质量把关"""
-    logger.info("[最终确认] 质量审核...")
-
-    result = await call_llm(
-        """请快速审核试卷质量。
-
-【考点】{topics}
-【题型】{quiz_types}
-
-【试卷】:
-{exam_paper}
-
-请检查：
-1. 知识点是否覆盖主要考点？
-2. 格式是否规范？
-3. 能否直接使用？
-
-返回JSON：
-{{
-    "pass": true/false,
-    "score": 85,
-    "issues": [],
-    "action_required": false,
-    "summary": "总结"
-}}""",
-        topics=", ".join(state['topics']),
-        quiz_types=", ".join(state['quiz_types']),
-        exam_paper=state['exam_paper']
-    )
-
-    try:
-        review_result = _extract_json(result)
-    except Exception:
-        review_result = {"feasible": True, "pass": True}
-
-    return {"review_result": review_result}
-
-
-async def supervise_exam_node(state: ExamPaperState) -> ExamPaperState:
-    """监督试卷 Agent"""
-    logger.info("[监督Agent] 最终审核...")
-
-    verify_str = json.dumps(state.get('verify_result', {}), ensure_ascii=False)
-    review_str = json.dumps(state.get('review_result', {}), ensure_ascii=False)
-
-    contexts_combined = "\n\n".join(state['contexts'])[:1500]
-
-    result = await call_llm(
-        """请对试卷进行最终监督审核。
-
-考点：{topics}
-题型：{quiz_types}
-
-课件资料：
-{contexts}
-
-试卷内容：
-{exam_paper}
-
-验证结果：{verify_result}
-审核结果：{review_result}
-
-请确保：
-1. 知识点与课件一致
-2. 无与课件相悖的内容
-3. 流程完整
-
-返回JSON格式：
-{{
-    "consistent": true/false,
-    "issues": [],
-    "final_verdict": "通过/需要修改",
-    "action_required": false
-}}""",
-        topics=", ".join(state['topics']),
-        quiz_types=", ".join(state['quiz_types']),
-        contexts=contexts_combined,
-        exam_paper=state['exam_paper'],
-        verify_result=verify_str,
-        review_result=review_str
-    )
-
-    try:
-        supervise_result = _extract_json(result)
-    except Exception:
-        supervise_result = {"consistent": True, "final_verdict": "通过", "action_required": False}
-
-    return {"supervise_result": supervise_result}
-
-
-async def fix_exam_node(state: ExamPaperState) -> ExamPaperState:
-    """修复试卷 Agent"""
-    logger.info("[修复Agent] 修复试卷...")
-
-    all_issues = []
-    if state.get('verify_result', {}).get('issues'):
-        all_issues.extend(state['verify_result']['issues'])
-    if state.get('review_result', {}).get('issues'):
-        all_issues.extend(state['review_result']['issues'])
-    if state.get('supervise_result', {}).get('issues'):
-        all_issues.extend(state['supervise_result']['issues'])
-
-    issues_text = "\n".join([f"- {i.get('fix', '')}" for i in all_issues[:5]])
-
-    contexts_combined = "\n\n".join(state['contexts'])
-
-    fixed = await call_llm(
-        """请根据审核意见修复试卷。
-
-考点：{topics}
-
-课件资料：
-{contexts}
-
-审核问题：
-{issues}
-
-原试卷：
-{exam_paper}
-
-请输出修复后的完整试卷。""",
-        topics=", ".join(state['topics']),
-        contexts=contexts_combined,
-        issues=issues_text,
-        exam_paper=state['exam_paper']
-    )
-
-    return {"final_paper": fixed, "max_retries": state.get('max_retries', 0) + 1}
-
-
-def should_fix_exam(state: ExamPaperState) -> str:
-    """判断是否需要修复试卷"""
-    # 只重试1次，加快速度
-    if state.get('max_retries', 0) >= 1:
-        return "end"
-
-    verify = state.get('verify_result', {})
-    review = state.get('review_result', {})
-
-    # 验证或审核发现问题才需要修复
-    needs_fix = (
-        verify.get('fix_needed', False) or
-        review.get('pass', True) == False or
-        review.get('action_required', False) == True
-    )
-
-    if needs_fix:
-        return "fix"
-
-    return "end"
-
-
-# ==================== 对外接口 ====================
-
 quiz_workflow = build_quiz_graph()
 exam_workflow = build_exam_graph()
 
+
+# ==================== 对外接口 ====================
 
 async def run_quiz_agent(
     topic: str,
@@ -900,43 +624,47 @@ async def run_quiz_agent(
     sample_paper_context: str = None
 ) -> str:
     """
-    运行多 Agent 出题系统（4 Agent 协作）
-    流程: 出题 -> 验证 -> 审核 -> 监督 -> (可选)修复
+    运行 Reflexion 出题系统（3 Agent 协作）
+    流程：出题+推理链 → Critic质疑推理链 → Revise针对批评修订（最多2轮）
     """
-    # 1. 获取资料
     context = await get_rag_context(topic)
 
-    # 2. 构建初始状态
     initial_state: QuizState = {
         "topic": topic,
         "quiz_type": quiz_type,
         "num": num,
         "context": context,
+        "sample_paper_context": sample_paper_context or "",
         "quiz": "",
-        "verify_result": {},
-        "review_result": {},
-        "supervise_result": {},
-        "fixed_quiz": "",
-        "issues": [],
-        "final_quiz": "",
-        "max_retries": 0,
-        "sample_paper_context": sample_paper_context or ""
+        "reasoning": "{}",
+        "critique": {},
+        "initial_score": 0,
+        "revised_quiz": "",
+        "revision_notes": "",
+        "reflection_rounds": 0,
     }
 
-    # 3. 运行工作流
     result = await quiz_workflow.ainvoke(initial_state)
 
-    # 4. 返回最终结果
-    final_quiz = result.get('fixed_quiz') or result.get('quiz') or ''
+    # ── Reflexion 效果验证日志 ──────────────────────────────────────────
+    rounds = result.get('reflection_rounds', 0)
+    initial_score = result.get('initial_score', 'N/A')
+    final_critique = result.get('critique', {})
+    final_score = final_critique.get('overall_score', 'N/A')
+    final_flaws = len([f for f in final_critique.get('reasoning_flaws', []) if f.get('severity') == 'high'])
+    used_revised = bool(result.get('revised_quiz'))
+    improvement = (
+        f"{initial_score} → {final_score} (+{final_score - initial_score})"
+        if isinstance(initial_score, int) and isinstance(final_score, int)
+        else f"{initial_score} → {final_score}"
+    )
+    logger.info(
+        f"[Reflexion统计] topic={topic} | 修订轮次={rounds} | "
+        f"评分变化={improvement} | 高危缺陷={final_flaws} | 使用修订版={used_revised}"
+    )
+    # ────────────────────────────────────────────────────────────────────
 
-    if not final_quiz:
-        supervise = result.get('supervise_result', {})
-        if supervise.get('consistent', True) == False:
-            final_quiz = result.get('quiz', '') + "\n\n⚠️ 警告：题目未通过最终审核，建议人工检查"
-        elif supervise.get('final_verdict') == '需要修改':
-            final_quiz = result.get('quiz', '') + "\n\n⚠️ 题目需要修改，请查看审核意见"
-
-    return final_quiz
+    return result.get('revised_quiz') or result.get('quiz') or ''
 
 
 async def run_exam_agent(
@@ -946,39 +674,137 @@ async def run_exam_agent(
     sample_paper_context: str = None
 ) -> str:
     """
-    运行多 Agent 出卷系统（4 Agent 协作）
+    运行 Reflexion 出卷系统（3 Agent 协作）
+    流程：出卷+推理链 → Critic质疑推理链 → Revise针对批评修订（最多2轮）
     """
-    # 1. 获取各考点资料
+    # 参数校验和修正
+    if not quiz_types or len(quiz_types) == 0:
+        quiz_types = ['选择题', '填空题', '判断题', '简答题']
+    if total_questions <= 0 or total_questions > 50:
+        total_questions = 10  # 限制题目数量范围
+
+    logger.info(f"[Exam Agent] 校验后参数: quiz_types={quiz_types}, total_questions={total_questions}")
+
+    # 如果没有样卷，联网搜索试卷格式参考
+    online_format_context = ""
+    online_knowledge_context = ""
+    if not sample_paper_context or sample_paper_context.strip() == "":
+        logger.info("[Exam Agent] 无样卷，联网搜索试卷格式和考点参考...")
+        try:
+            from langchain_community.tools import DuckDuckGoSearchRun
+            search = DuckDuckGoSearchRun()
+            # 搜索相关学科的典型试卷格式
+            search_query = f"{topics[0] if topics else '大学课程'} 期末考试试卷 题型分布 结构"
+            online_result = search.run(search_query)
+            if online_result and len(online_result) > 50:
+                online_format_context = f"\n\n【联网搜索的试卷格式参考】（无本地样卷时使用）：\n{online_result[:1500]}..."
+                logger.info("[Exam Agent] 联网搜索获取格式参考成功")
+
+            # 额外搜索常见考点
+            if topics:
+                topic_query = f"{topics[0]} 期末考试 常见考点 重点"
+                topic_result = search.run(topic_query)
+                if topic_result and len(topic_result) > 50:
+                    online_knowledge_context = f"\n\n【联网搜索的考点参考】：\n{topic_result[:800]}..."
+        except Exception as e:
+            logger.warning(f"[Exam Agent] 联网搜索失败: {e}")
+            online_format_context = "\n\n【提示】无样卷参考，请使用通用期末试卷格式：选择题、填空题、判断题、简答题四种题型均衡分布。"
+    else:
+        logger.info("[Exam Agent] 使用本地样卷格式")
+
     contexts = []
     for topic in topics:
         ctx = await get_rag_context(topic)
+        # 如果有联网搜索的考点，合并到课件资料中
+        if online_knowledge_context:
+            ctx = ctx + online_knowledge_context
         contexts.append(ctx)
 
-    # 2. 构建初始状态
+    # 合并样卷格式和联网搜索结果
+    final_sample_context = (sample_paper_context or "") + online_format_context
+
     initial_state: ExamPaperState = {
         "topics": topics,
         "quiz_types": quiz_types,
         "total_questions": total_questions,
-        "sample_paper_context": sample_paper_context or "",
+        "sample_paper_context": final_sample_context,
         "contexts": contexts,
         "exam_paper": "",
-        "verify_result": {},
-        "review_result": {},
-        "supervise_result": {},
-        "issues": [],
-        "final_paper": "",
-        "max_retries": 0
+        "reasoning": "{}",
+        "critique": {},
+        "initial_score": 0,
+        "revised_exam": "",
+        "revision_notes": "",
+        "reflection_rounds": 0,
     }
 
-    # 3. 运行工作流
     result = await exam_workflow.ainvoke(initial_state)
 
-    # 4. 返回最终结果
-    final_paper = result.get('final_paper') or result.get('exam_paper') or ''
+    rounds = result.get('reflection_rounds', 0)
+    initial_score = result.get('initial_score', 'N/A')
+    final_critique = result.get('critique', {})
+    final_score = final_critique.get('overall_score', 'N/A')
+    final_flaws = len([f for f in final_critique.get('reasoning_flaws', []) if f.get('severity') == 'high'])
+    improvement = (
+        f"{initial_score} → {final_score} (+{final_score - initial_score})"
+        if isinstance(initial_score, int) and isinstance(final_score, int)
+        else f"{initial_score} → {final_score}"
+    )
+    logger.info(
+        f"[Reflexion统计-试卷] topics={topics} | 修订轮次={rounds} | "
+        f"评分变化={improvement} | 高危缺陷={final_flaws}"
+    )
 
-    if not final_paper:
-        supervise = result.get('supervise_result', {})
-        if supervise.get('consistent', True) == False:
-            final_paper = result.get('exam_paper', '') + "\n\n⚠️ 试卷未通过最终审核，建议人工检查"
+    # 提取试卷内容（去掉答案和解析，只保留题目）
+    exam_content = result.get('revised_exam') or result.get('exam_paper') or ''
+    exam_content = _strip_answers_and_analysis(exam_content)
 
-    return final_paper
+    return exam_content
+
+
+def _strip_answers_and_analysis(exam_text: str) -> str:
+    """
+    去掉试卷中的答案和解析，只保留题目部分
+    """
+    import re
+    lines = exam_text.split('\n')
+    cleaned_lines = []
+    skip_mode = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        # 跳过空白行但保持结构
+        if not stripped:
+            cleaned_lines.append(line)
+            continue
+
+        # 遇到答案行或解析行，跳过后续内容直到遇到新题目
+        # 匹配 "答案：" 或 "答案:" 或 "【答案】" 等格式
+        if re.match(r'^(\【|\[)?答案(\】|\])?[:：]', stripped):
+            skip_mode = True
+            continue
+        # 匹配 "解析：" 或 "解析:" 或 "【解析】" 等格式
+        if re.match(r'^(\【|\[)?解析(\】|\])?[:：]', stripped):
+            skip_mode = True
+            continue
+        # 匹配 "参考答案" 等
+        if re.match(r'^(\【|\[)?参考答案', stripped):
+            skip_mode = True
+            continue
+
+        # 新题型标题，恢复正常模式
+        if re.match(r'^(#{1,3}\s*)?[一二三四五六七八九十]+[、.]\s*[\u4e00-\u9fa5]', stripped):
+            skip_mode = False
+        # 题目编号行（如 "1."、"2."），恢复显示
+        if re.match(r'^\d+[.、]\s', stripped):
+            skip_mode = False
+
+        if not skip_mode:
+            cleaned_lines.append(line)
+
+    # 移除末尾多余的空行（保留最多2个换行）
+    while len(cleaned_lines) > 2 and not cleaned_lines[-1].strip():
+        cleaned_lines.pop()
+
+    return '\n'.join(cleaned_lines)

@@ -46,15 +46,16 @@ function parseExamContent(content: string): ExamData {
   const lines = content.split('\n');
   let currentSection = null;
   let currentQuestion: Question | null = null;
+  let globalQuestionNumber = 0;  // 统一编号计数器
 
   const typePatterns: Record<string, RegExp> = {
-    '选择题': /(^##\s*选择题|^\d+[.、]\s*[\(（]?\s*选择题|^【选择题】|^一、选择题)/,
-    '填空题': /(^##\s*填空题|^\d+[.、]\s*[\(（]?\s*填空题|^【填空题】|^二、填空题)/,
-    '判断题': /(^##\s*判断题|^\d+[.、]\s*[\(（]?\s*判断题|^【判断题】|^三、判断题)/,
-    '简答题': /(^##\s*简答题|^\d+[.、]\s*[\(（]?\s*简答题|^【简答题】|^四、简答题)/,
-    '计算题': /(^##\s*计算题|^\d+[.、]\s*[\(（]?\s*计算题|^【计算题】|^五、计算题)/,
-    '名词解释': /(^##\s*名词解释|^\d+[.、]\s*[\(（]?\s*名词解释|^【名词解释】)/,
-    '论述题': /(^##\s*论述题|^\d+[.、]\s*[\(（]?\s*论述题|^【论述题】)/,
+    '选择题': /(一、选择题|选择题)/,
+    '填空题': /(二、填空题|填空题)/,
+    '判断题': /(三、判断题|判断题)/,
+    '简答题': /(四、简答题|简答题|解答题)/,
+    '计算题': /(五、计算题|计算题)/,
+    '名词解释': /(名词解释)/,
+    '论述题': /(论述题)/,
   };
 
   // 提取标题
@@ -69,39 +70,87 @@ function parseExamContent(content: string): ExamData {
     }
   }
 
+  // 用于去重的内容片段集合
+  const seenQuestionSignatures = new Set<string>();
+
   // 解析题目
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed) continue;
 
-    // 检测题型
+    // 检测题型标题
     for (const [qtype, pattern] of Object.entries(typePatterns)) {
-      if (pattern.test(trimmed)) {
+      if (pattern.test(trimmed) && trimmed.length < 20) {
         currentSection = qtype;
         currentQuestion = null;
         break;
       }
     }
 
-    // 检测题目编号
+    // 检测题目编号 - 支持统一编号如 "1." "2." 或 "(1)" 小问
     const qMatch = trimmed.match(/^(\d+)[.、]\s*(.+)/);
+    const subQMatch = trimmed.match(/^[\(（](\d+)[\)）]\s*(.+)/);
+
+    // 处理选择题选项（以 A. B. C. D. 开头的行）
+    if (/^[A-D][.、]\s*/.test(trimmed)) {
+      if (currentQuestion) {
+        currentQuestion.content += "\n" + trimmed;
+      }
+      continue;
+    }
+
+    // 处理小问 (1) (2) 等
+    if (subQMatch && currentQuestion) {
+      currentQuestion.content += "\n" + trimmed;
+      continue;
+    }
+
     if (qMatch && currentSection) {
       const qNum = parseInt(qMatch[1]);
       const qContent = qMatch[2].trim();
 
-      // 检查是否是选项
-      if (/^[A-D][.、、]/.test(qContent)) {
+      // 跳过空的题目内容
+      if (!qContent || qContent.length < 2) {
         if (currentQuestion) {
           currentQuestion.content += "\n" + trimmed;
         }
         continue;
       }
 
-      // 新题目
+      // 检查是否是选项行（不是题目）
+      if (/^[A-D][.、]/.test(qContent)) {
+        if (currentQuestion) {
+          currentQuestion.content += "\n" + trimmed;
+        }
+        continue;
+      }
+
+      // 去重：基于编号+题型+内容前20字符生成签名
+      const signature = `${qNum}-${currentSection}-${qContent.slice(0, 20)}`;
+      if (seenQuestionSignatures.has(signature)) {
+        // 跳过完全重复的题目
+        continue;
+      }
+      seenQuestionSignatures.add(signature);
+
+      // 检查是否已存在相同编号的题目（兼容旧逻辑）
+      const existingIndex = result.questions.findIndex(q => q.number === qNum);
+      if (existingIndex >= 0) {
+        // 已有相同编号题目，检查内容是否相似
+        const existing = result.questions[existingIndex];
+        if (existing.content.slice(0, 30) === qContent.slice(0, 30)) {
+          // 内容相似，跳过
+          continue;
+        }
+        // 内容不同，可能是不同题型，保持两个
+      }
+
+      // 新题目 - 使用全局编号
+      globalQuestionNumber = qNum;
       currentQuestion = {
         number: qNum,
         type: currentSection,
-        content: trimmed,
+        content: qContent,  // 只取编号后的内容，不包含编号
         answer: "",
         analysis: "",
         score: 10,
@@ -109,13 +158,40 @@ function parseExamContent(content: string): ExamData {
       };
       result.questions.push(currentQuestion);
 
-    } else if (currentQuestion && (trimmed.includes("答案") || trimmed.includes("答案："))) {
-      const answer = trimmed.replace(/^.*答案[：:]\s*/, "");
-      currentQuestion.answer = answer;
+    } else if (currentQuestion) {
+      // 如果已经有当前题目，继续添加内容（选项或小问）
+      if (trimmed.includes("答案") && !trimmed.includes("答案：") && !trimmed.includes("答案:")) {
+        // 跳过单独的"答案"文字
+      } else if (trimmed.includes("答案：") || trimmed.includes("答案:")) {
+        const answer = trimmed.replace(/^.*答案[：:]\s*/, "");
+        currentQuestion.answer = answer;
+      } else if (trimmed.includes("解析") && !trimmed.includes("解析：") && !trimmed.includes("解析:")) {
+        // 跳过单独的"解析"文字
+      } else if (trimmed.includes("解析：") || trimmed.includes("解析:") || trimmed.includes("解释")) {
+        const analysis = trimmed.replace(/^.*(?:解析|解释)[：:]\s*/, "");
+        currentQuestion.analysis = analysis;
 
-    } else if (currentQuestion && (trimmed.includes("解析") || trimmed.includes("解析：") || trimmed.includes("解释"))) {
-      const analysis = trimmed.replace(/^.*解析[：:]\s*/, "");
-      currentQuestion.analysis = analysis;
+        // 尝试从解析中提取难度信息
+        if (trimmed.includes("简单") || trimmed.includes("基础")) {
+          currentQuestion.difficulty = "简单";
+        } else if (trimmed.includes("困难") || trimmed.includes("较难") || trimmed.includes("复杂")) {
+          currentQuestion.difficulty = "较难";
+        } else if (trimmed.includes("中等") || trimmed.includes("理解") || trimmed.includes("应用")) {
+          currentQuestion.difficulty = "中等";
+        }
+      } else if (trimmed.includes("分值") || trimmed.includes("每题")) {
+        // 尝试提取分值信息，如 "每题5分"
+        const scoreMatch = trimmed.match(/(\d+)\s*分/);
+        if (scoreMatch) {
+          currentQuestion.score = parseInt(scoreMatch[1]);
+        }
+      } else if (trimmed.length > 1) {
+        // 其他内容添加到题目中（选项、小问等）
+        // 避免添加无意义内容
+        if (!/^[【\[《<].*[】\]》>]$/.test(trimmed)) {
+          currentQuestion.content += "\n" + trimmed;
+        }
+      }
     }
   }
 
@@ -123,15 +199,25 @@ function parseExamContent(content: string): ExamData {
   result.total_questions = result.questions.length;
   for (const q of result.questions) {
     const len = q.content.length;
-    if (len < 50) {
-      q.difficulty = "简单";
-      q.score = 5;
-    } else if (len < 150) {
-      q.difficulty = "中等";
-      q.score = 10;
-    } else {
-      q.difficulty = "较难";
-      q.score = 15;
+    // 如果没有从解析中提取到难度，则根据题目长度判断
+    if (!q.difficulty) {
+      if (len < 30) {
+        q.difficulty = "简单";
+      } else if (len < 80) {
+        q.difficulty = "中等";
+      } else {
+        q.difficulty = "较难";
+      }
+    }
+    // 如果没有提取到分值，根据难度默认分配
+    if (!q.score || q.score === 10) {
+      if (q.difficulty === "简单") {
+        q.score = 5;
+      } else if (q.difficulty === "中等") {
+        q.score = 10;
+      } else {
+        q.score = 15;
+      }
     }
 
     result.total_score += q.score;
@@ -165,24 +251,30 @@ export default function ExamCanvas({ examContent, courseName = "期末考试", o
 
   // 解析试卷
   useEffect(() => {
-    if (examContent) {
-      const data = parseExamContent(examContent);
-      if (data.questions.length > 0) {
-        data.title = data.title || courseName;
-        setExamData(data);
+    if (examContent && examContent.length > 50) {
+      try {
+        const data = parseExamContent(examContent);
+        // 只有解析出题目才显示
+        if (data.questions && data.questions.length > 0) {
+          data.title = data.title || courseName;
+          setExamData(data);
 
-        // 检查是否有答案
-        const hasAns = data.questions.some(q => q.answer && q.answer.trim());
-        setHasAnswers(hasAns);
+          // 检查是否有答案
+          const hasAns = data.questions.some(q => q.answer && q.answer.trim());
+          setHasAnswers(hasAns);
+        } else {
+          console.warn("[ExamCanvas] 解析失败，未找到题目:", examContent.slice(0, 200));
+          // 解析失败时设置一个标记，但不返回 null
+          setExamData(null);
+        }
+      } catch (err) {
+        console.error("[ExamCanvas] 解析异常:", err);
+        setExamData(null);
       }
     }
   }, [examContent, courseName]);
 
-  if (!examData) {
-    return null;
-  }
-
-  // 导出 Word
+  // 导出 Word（提前定义，供解析失败时使用）
   const handleExportWord = async (includeAnswers: boolean) => {
     if (!onExportWord) {
       setIsExporting(true);
@@ -238,6 +330,58 @@ export default function ExamCanvas({ examContent, courseName = "期末考试", o
       onExportAnswerSheet();
     }
   };
+
+  // 解析失败时仍然显示工具栏（支持导出原始内容）
+  if (!examData) {
+    return (
+      <div className="my-4">
+        {/* 即使解析失败也显示工具栏 */}
+        <div className="flex flex-wrap gap-2 mb-4 p-3 bg-slate-50 border border-slate-200 rounded-lg">
+          {/* 请求答案按钮 */}
+          {onRequestAnswers && (
+            <button
+              onClick={onRequestAnswers}
+              className="px-3 py-1.5 text-xs font-medium bg-amber-500 text-white rounded-md hover:bg-amber-600 transition-colors"
+            >
+              🔑 请求答案
+            </button>
+          )}
+
+          <button
+            onClick={() => handleExportWord(true)}
+            disabled={isExporting}
+            className="px-3 py-1.5 text-xs font-medium bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors disabled:opacity-50"
+          >
+            📄 导出 Word（含答案）
+          </button>
+
+          <button
+            onClick={() => handleExportWord(false)}
+            disabled={isExporting}
+            className="px-3 py-1.5 text-xs font-medium bg-white text-slate-700 border border-slate-200 rounded-md hover:bg-slate-50 transition-colors disabled:opacity-50"
+          >
+            📄 导出 Word（不含答案）
+          </button>
+
+          <button
+            onClick={handleExportAnswerSheet}
+            disabled={isExporting}
+            className="px-3 py-1.5 text-xs font-medium bg-amber-500 text-white rounded-md hover:bg-amber-600 transition-colors disabled:opacity-50"
+          >
+            📋 导出答案卷
+          </button>
+        </div>
+
+        {/* 解析失败时显示原始内容 */}
+        <div className="bg-white border border-slate-200 rounded-lg p-6">
+          <div className="text-sm text-slate-500 mb-4">⚠️ 自动解析失败，显示原始内容</div>
+          <pre className="whitespace-pre-wrap text-sm text-slate-700 overflow-x-auto max-h-[500px]">
+            {examContent}
+          </pre>
+        </div>
+      </div>
+    );
+  }
 
   // 按题型分组
   const questionsByType: Record<string, Question[]> = {};
@@ -408,17 +552,27 @@ export default function ExamCanvas({ examContent, courseName = "期末考试", o
 
 // 检测内容是否为试卷
 export function isExamContent(content: string): boolean {
-  const examPatterns = [
-    /【选择题】|一、选择题|## 选择题|^选择题/,
-    /【填空题】|二、填空题|## 填空题|^填空题/,
-    /【判断题】|三、判断题|## 判断题|^判断题/,
-    /【简答题】|四、简答题|## 简答题|^简答题/,
-    /【计算题】|五、计算题|## 计算题|^计算题/,
-    /【名词解释】|## 名词解释/,
-    /【论述题】|## 论述题/,
-    /答案[:：]/,
-    /^\d+[.、]\s*.+/m,  // 题目编号
-  ];
+  if (!content || content.length < 30) return false;
 
-  return examPatterns.some(pattern => pattern.test(content));
+  // 题型标题检测（更宽松）
+  const hasTypeTitle = /(一[、.]\s*)?选择题|(二[、.]\s*)?填空题|(三[、.]\s*)?判断题|(四[、.]\s*)?简答题|论述题|计算题|名词解释|解答题/.test(content);
+
+  // 题目编号检测（支持多种格式）
+  const hasNumberedQuestions = /^\d+[.、]\s*.{1,}/m.test(content) || /\(\d+\)\s*.{1,}/.test(content);
+
+  // 选择题选项检测
+  const hasOptions = /^[A-D][.、]\s*.{1,}/m.test(content);
+
+  // 有题型标题，或者有题目编号+选项，都可能是试卷
+  const result = hasTypeTitle || (hasNumberedQuestions && hasOptions);
+
+  // 排除明显非试卷的内容
+  if (result) {
+    // 如果是纯对话式内容，不是试卷
+    if (content.includes('请问') && content.includes('谢谢') && !content.includes('题')) return false;
+    // 如果是纯代码块且没有题目内容，不是试卷
+    if (content.includes('```') && !hasTypeTitle && !hasNumberedQuestions) return false;
+  }
+
+  return result;
 }
