@@ -344,15 +344,15 @@ export default function ExamCanvas({ examContent, courseName = "期末考试", o
       <div className="my-4">
         {/* 即使解析失败也显示工具栏 */}
         <div className="flex flex-wrap gap-2 mb-4 p-3 bg-slate-50 border border-slate-200 rounded-lg">
-          {/* 请求答案按钮 */}
-          {onRequestAnswers && (
-            <button
-              onClick={onRequestAnswers}
-              className="px-3 py-1.5 text-xs font-medium bg-amber-500 text-white rounded-md hover:bg-amber-600 transition-colors"
-            >
-              🔑 请求答案
-            </button>
-          )}
+          {/* 答案开关 - 始终显示 */}
+          <button
+            onClick={() => onRequestAnswers && onRequestAnswers()}
+            className="px-3 py-1.5 text-xs font-medium bg-white text-slate-600 border border-slate-200 hover:bg-slate-50 rounded-md transition-colors"
+          >
+            👁 请求答案
+          </button>
+
+          <div className="h-6 w-px bg-slate-300"></div>
 
           <button
             onClick={() => handleExportWord(true)}
@@ -407,31 +407,26 @@ export default function ExamCanvas({ examContent, courseName = "期末考试", o
     <div className="my-4">
       {/* 工具栏 */}
       <div className="flex flex-wrap gap-2 mb-4 p-3 bg-slate-50 border border-slate-200 rounded-lg">
-        {/* 答案显示/隐藏 */}
-        {hasAnswers && (
-          <button
-            onClick={() => setShowAnswers(!showAnswers)}
-            className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
-              showAnswers
-                ? "bg-teal-100 text-teal-700 border border-teal-200"
-                : "bg-white text-slate-600 border border-slate-200 hover:bg-slate-50"
-            }`}
-          >
-            {showAnswers ? "👁 隐藏答案" : "👁 显示答案"}
-          </button>
-        )}
+        {/* 答案显示/隐藏开关 - 始终显示 */}
+        <button
+          onClick={() => {
+            if (hasAnswers) {
+              setShowAnswers(!showAnswers);
+            } else if (onRequestAnswers) {
+              // 没有答案时，点击则请求答案
+              onRequestAnswers();
+            }
+          }}
+          className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+            showAnswers
+              ? "bg-teal-100 text-teal-700 border border-teal-200"
+              : "bg-white text-slate-600 border border-slate-200 hover:bg-slate-50"
+          }`}
+        >
+          {showAnswers ? "👁 隐藏答案" : hasAnswers ? "👁 显示答案" : "👁 请求答案"}
+        </button>
 
-        {/* 请求答案按钮（如果没有答案） */}
-        {!hasAnswers && onRequestAnswers && (
-          <button
-            onClick={onRequestAnswers}
-            className="px-3 py-1.5 text-xs font-medium bg-amber-500 text-white rounded-md hover:bg-amber-600 transition-colors"
-          >
-            🔑 请求答案
-          </button>
-        )}
-
-        {hasAnswers && <div className="h-6 w-px bg-slate-300"></div>}
+        <div className="h-6 w-px bg-slate-300"></div>
 
         <button
           onClick={() => handleExportWord(true)}
