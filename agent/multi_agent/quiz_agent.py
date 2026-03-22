@@ -241,6 +241,8 @@ EXAM_GENERATE_WITH_REASONING_PROMPT = """你是一位资深大学期末考试命
 ```
 ## 《期末考试试卷》
 
+【重要】所有题目必须统一连续编号：1、2、3... 到 {total_questions}，每个题型内部也必须接着上一题的编号！
+
 一、选择题（每题2分，共10题）
 1. [详细题干内容，描述要充分]
    A. 选项1  B. 选项2  C. 选项3  D. 选项4
@@ -251,16 +253,19 @@ EXAM_GENERATE_WITH_REASONING_PROMPT = """你是一位资深大学期末考试命
 ...
 
 二、填空题（每题2分，共10题）
+（注意：填空题从第11题开始编号！）
 11. [详细题干内容，需要填空的部位用括号表示]
 
 12. ...
 
 三、判断题（每题2分，共10题）
+（注意：判断题从第21题开始编号！）
 21. [详细题干内容]
 
 22. ...
 
 四、简答题/解答题（每题10分，共4题，每题2-3问）
+（注意：简答题从第31题开始编号！）
 31. [问题描述]（10分）
     (1) [小问1]（5分）
     (2) [小问2]（5分）
@@ -299,7 +304,7 @@ EXAM_CRITIQUE_PROMPT = """你是严格的试卷评审专家。深入质疑出题
 1. 【重复检查】是否存在完全相同或高度相似的题目？同一知识点是否重复出题？
 2. 【总分验证】所有题目分值加起来是否正好100分？
 3. 【题数验证】题目数量是否正好{total_questions}道？
-4. 【编号验证】题目是否统一编号（1、2、3...），而非每个题型单独编号？
+4. 【编号验证】题目是否统一连续编号（1→2→3→...），选择题1-10，填空题11-20，判断题21-30，简答题31-34？严禁每个题型单独从1开始编号！
 
 返回如下 JSON（只返回 JSON）：
 ```json
@@ -313,7 +318,8 @@ EXAM_CRITIQUE_PROMPT = """你是严格的试卷评审专家。深入质疑出题
     "specific_issues": [
         {{"question": "第X题", "issue": "...", "suggestion": "..."}}
     ],
-    "duplicate_check": {{"has_duplicates": true/false, "duplicate_questions": ["第X题与第Y题重复", ...]}}
+    "duplicate_check": {{"has_duplicates": true/false, "duplicate_questions": ["第X题与第Y题重复", ...]}},
+    "numbering_check": {{"is_continuous": true/false, "issues": ["问题描述", ...]}}
 }}
 ```"""
 
@@ -543,10 +549,14 @@ def _critique_needs_revision(critique: dict) -> bool:
     duplicate_check = critique.get('duplicate_check', {})
     has_duplicates = duplicate_check.get('has_duplicates', False)
 
-    needs = (score < 70) or (len(high_flaws) > 0) or (not approved) or has_duplicates
+    # 检查编号连续性（严格禁止每个题型单独编号）
+    numbering_check = critique.get('numbering_check', {})
+    has_numbering_issues = not numbering_check.get('is_continuous', True)
+
+    needs = (score < 70) or (len(high_flaws) > 0) or (not approved) or has_duplicates or has_numbering_issues
     logger.info(
         f"[Critic判断] score={score}, high_flaws={len(high_flaws)}, "
-        f"approved={approved}, duplicates={has_duplicates} → {'修订' if needs else '通过'}"
+        f"approved={approved}, duplicates={has_duplicates}, numbering={has_numbering_issues} → {'修订' if needs else '通过'}"
     )
     return needs
 
