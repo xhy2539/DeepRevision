@@ -226,14 +226,15 @@ EXAM_GENERATE_WITH_REASONING_PROMPT = """你是一位资深大学期末考试命
 2. 总分：必须正好 100分，不能多也不能少
 3. 题型分布（推荐）：选择题 10题×2分=20分，填空题 10题×2分=20分，判断题 10题×2分=20分，简答题 4题×10分=40分
 4. 选择题必须有 A、B、C、D 四个完整选项，题干描述要详细（至少30字）
-5. 题目必须全部统一编号：1、2、3... 到 {total_questions}，不能每个题型单独编号
-6. 答案优先以课件原文为依据，如果没有明确依据可标注"参考答案"
-7. 简答题/解答题必须有2-3个小问，每问5分左右
-8. 填空题和判断题题干也要详细描述
-9. 题目描述要详细，包含足够信息让考生理解题意
-10. 难度分布：简单题占30%，中等题占50%，难题占20%
-11. 【严禁重复】同一知识点、同一题型、相似问法不得出现超过1次，必须确保每道题知识点不重复
-12. 【去重检查】生成完成后必须检查所有题目，确保没有完全相同的题干、选项或考点
+5. 【题型数量强制要求】选择题必须出 EXACTLY 10 道题（编号1-10），填空题必须出 EXACTLY 10 道题（编号11-20），判断题必须出 EXACTLY 10 道题（编号21-30），简答题必须出 EXACTLY 4 道题（编号31-34）。严禁减少题目数量！
+6. 题目必须全部统一编号：1、2、3... 到 {total_questions}，不能每个题型单独编号
+7. 答案优先以课件原文为依据，如果没有明确依据可标注"参考答案"
+8. 简答题/解答题必须有2-3个小问，每问5分左右
+9. 填空题和判断题题干也要详细描述
+10. 题目描述要详细，包含足够信息让考生理解题意
+11. 难度分布：简单题占30%，中等题占50%，难题占20%
+12. 【严禁重复】同一知识点、同一题型、相似问法不得出现超过1次，必须确保每道题知识点不重复
+13. 【去重检查】生成完成后必须检查所有题目，确保没有完全相同的题干、选项或考点
 
 请生成完整试卷。
 
@@ -241,20 +242,36 @@ EXAM_GENERATE_WITH_REASONING_PROMPT = """你是一位资深大学期末考试命
 ```
 ## 《期末考试试卷》
 
-【重要】所有题目必须统一连续编号：1、2、3... 到 {total_questions}，每个题型内部也必须接着上一题的编号！
+【警告】如果不按要求出够题目数量，将被判定为不合格！
 
-一、选择题（每题2分，共10题）
-1. [详细题干内容，描述要充分]
+一、选择题（每题2分，共10题，编号1-10）
+1. [详细题干内容，描述要充分，至少30字]
    A. 选项1  B. 选项2  C. 选项3  D. 选项4
 
 2. [详细题干内容]
    A. 选项1  B. 选项2  C. 选项3  D. 选项4
 
-...
+...（必须出满10题，编号到10）
 
-二、填空题（每题2分，共10题）
+二、填空题（每题2分，共10题，编号11-20）
 （注意：填空题从第11题开始编号！）
 11. [详细题干内容，需要填空的部位用括号表示]
+
+...（必须出满10题，编号到20）
+
+三、判断题（每题2分，共10题，编号21-30）
+（注意：判断题从第21题开始编号！）
+21. [详细题干内容]
+
+...（必须出满10题，编号到30）
+
+四、简答题（每题10分，共4题，编号31-34）
+（注意：简答题从第31题开始编号！）
+31. [问题描述]（10分）
+    (1) [小问1]（5分）
+    (2) [小问2]（5分）
+
+...（必须出满4题，编号到34）
 
 12. ...
 
@@ -301,10 +318,11 @@ EXAM_CRITIQUE_PROMPT = """你是严格的试卷评审专家。深入质疑出题
 {reasoning}
 
 【重点审查项】你必须特别严格检查以下问题：
-1. 【重复检查】是否存在完全相同或高度相似的题目？同一知识点是否重复出题？
+1. 【题型数量验证】选择题必须有 EXACTLY 10 道（编号1-10），填空题必须有 EXACTLY 10 道（编号11-20），判断题必须有 EXACTLY 10 道（编号21-30），简答题必须有 EXACTLY 4 道（编号31-34）。如果任何题型数量不够，判定为不合格！
 2. 【总分验证】所有题目分值加起来是否正好100分？
-3. 【题数验证】题目数量是否正好{total_questions}道？
+3. 【题数验证】题目总数量是否正好{total_questions}道？
 4. 【编号验证】题目是否统一连续编号（1→2→3→...），选择题1-10，填空题11-20，判断题21-30，简答题31-34？严禁每个题型单独从1开始编号！
+5. 【重复检查】是否存在完全相同或高度相似的题目？
 
 返回如下 JSON（只返回 JSON）：
 ```json
@@ -319,7 +337,8 @@ EXAM_CRITIQUE_PROMPT = """你是严格的试卷评审专家。深入质疑出题
         {{"question": "第X题", "issue": "...", "suggestion": "..."}}
     ],
     "duplicate_check": {{"has_duplicates": true/false, "duplicate_questions": ["第X题与第Y题重复", ...]}},
-    "numbering_check": {{"is_continuous": true/false, "issues": ["问题描述", ...]}}
+    "numbering_check": {{"is_continuous": true/false, "issues": ["问题描述", ...]}},
+    "quantity_check": {{"choice": 10, "fill": 10, "judge": 10, "essay": 4, "actual_choice": X, "actual_fill": Y, "actual_judge": Z, "actual_essay": W, "is_valid": true/false}}
 }}
 ```"""
 
@@ -553,10 +572,14 @@ def _critique_needs_revision(critique: dict) -> bool:
     numbering_check = critique.get('numbering_check', {})
     has_numbering_issues = not numbering_check.get('is_continuous', True)
 
-    needs = (score < 70) or (len(high_flaws) > 0) or (not approved) or has_duplicates or has_numbering_issues
+    # 检查题型数量（选择题10，填空题10，判断题10，简答题4）
+    quantity_check = critique.get('quantity_check', {})
+    has_quantity_issues = not quantity_check.get('is_valid', True)
+
+    needs = (score < 70) or (len(high_flaws) > 0) or (not approved) or has_duplicates or has_numbering_issues or has_quantity_issues
     logger.info(
         f"[Critic判断] score={score}, high_flaws={len(high_flaws)}, "
-        f"approved={approved}, duplicates={has_duplicates}, numbering={has_numbering_issues} → {'修订' if needs else '通过'}"
+        f"approved={approved}, duplicates={has_duplicates}, numbering={has_numbering_issues}, quantity={has_quantity_issues} → {'修订' if needs else '通过'}"
     )
     return needs
 
