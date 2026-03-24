@@ -433,3 +433,61 @@ async def list_documents(session_id: str = Query(default="default")):
     files.sort(key=lambda x: x["modified_at"], reverse=True)
 
     return {"code": 200, "files": files, "total": len(files)}
+
+
+@router.delete("/file/{filename:path}")
+async def delete_file(
+    filename: str,
+    session_id: str = Query(default="default")
+):
+    """
+    删除指定文件名对应的知识库文件及向量。
+    filename 支持 URL 编码的中文文件名。
+    """
+    _validate_session_id(session_id)
+    current_session_id.set(session_id)
+
+    # URL 解码文件名
+    from urllib.parse import unquote
+    decoded_filename = unquote(filename)
+
+    data_root = get_abs_path(chroma_conf['data_path'])
+    session_data_dir = os.path.join(data_root, session_id)
+    md5_store_path = os.path.join(session_data_dir, chroma_conf['md5_hex_store'])
+    file_path = os.path.join(session_data_dir, decoded_filename)
+
+    # 1. 检查文件是否存在
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail=f"文件不存在: {decoded_filename}")
+
+    try:
+        # 2. 计算被删文件的 MD5（删除前必须完成）
+        with open(file_path, "rb") as f:
+            file_md5 = hashlib.md5(f.read()).hexdigest()
+
+        # 3. 删除物理文件
+        os.remove(file_path)
+        logger.info(f"[删除文件] 已删除物理文件: {file_path}")
+
+        # 4. 从向量库删除对应的向量
+        vs = VectorStoreService()
+        await vs.delete_file_vectors(decoded_filename)
+
+        # 5. 从 MD5 store 中移除该文件的 MD5
+        if os.path.exists(md5_store_path):
+            with open(md5_store_path, "r", encoding="utf-8") as f:
+                md5_lines = [line.strip() for line in f if line.strip() and line.strip() != file_md5]
+            with open(md5_store_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(md5_lines) + "\n")
+
+        # 6. 刷新 RAG 缓存
+        from agent.tools.agent_tools import _rag_cache as rag_cache_ref
+        if session_id in rag_cache_ref:
+            rag_cache_ref[session_id].refresh()
+
+        logger.info(f"[删除文件] 完成: {decoded_filename}")
+        return {"code": 200, "message": f"文件已删除: {decoded_filename}"}
+
+    except Exception as e:
+        logger.error(f"[删除文件] 失败: {e}")
+        raise HTTPException(status_code=500, detail=f"删除失败: {str(e)}")

@@ -1,7 +1,7 @@
 from langchain_core.documents import Document
 from langchain_core.runnables import Runnable
 from langchain_community.retrievers import BM25Retriever
-from model.factory import chat_model
+from model.factory import chat_model, embed_model
 from rag.vector_store import VectorStoreService
 from utils.prompt_loader import load_rag_prompts
 from utils.config_handler import chroma_conf
@@ -9,9 +9,116 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from typing import List, Dict, Any
 from utils.logger_handler import logger
+from utils.session_context import current_session_id
 import asyncio
+import sqlite3
+import os
+import json
+import hashlib
+import math
+import time
 
 # Cross-Encoder 已禁用（网络问题），使用纯 RRF 检索
+
+
+class SemanticCache:
+    """
+    RAG 语义缓存：用 embedding 相似度匹配相同/近似问题，直接返回缓存的 LLM 回复。
+    缓存失效：文件上传/删除时按 session_id 清空。
+    """
+
+    def __init__(self, similarity_threshold: float = 0.92):
+        self.sim_threshold = similarity_threshold
+        self.db_path = os.path.join(os.getcwd(), "data", "semantic_cache.db")
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self._init_db()
+
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cache (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id  TEXT    NOT NULL,
+                query_text  TEXT    NOT NULL,
+                query_hash  TEXT    NOT NULL,
+                embedding   TEXT    NOT NULL,
+                response    TEXT    NOT NULL,
+                created_at  INTEGER NOT NULL
+            );
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_session ON cache(session_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_hash ON cache(query_hash);")
+        conn.commit()
+        conn.close()
+
+    def _cosine_sim(self, a: List[float], b: List[float]) -> float:
+        dot = sum(x * y for x, y in zip(a, b))
+        norm_a = math.sqrt(sum(x * x for x in a))
+        norm_b = math.sqrt(sum(x * x for x in b))
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
+    def get(self, query: str, session_id: str) -> Optional[str]:
+        """
+        查询语义缓存。命中返回缓存的 response，未命中返回 None。
+        """
+        try:
+            emb = embed_model.embed_query(query)
+        except Exception as e:
+            logger.warning(f"[语义缓存] embedding 失败: {e}")
+            return None
+
+        q_hash = hashlib.md5(query.encode()).hexdigest()
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute(
+            "SELECT query_hash, embedding, response FROM cache WHERE session_id = ?",
+            (session_id,)
+        ).fetchall()
+        conn.close()
+
+        for row in rows:
+            cached_hash, cached_emb_str, cached_resp = row
+            if cached_hash == q_hash:
+                logger.info("[语义缓存] 精确命中")
+                return cached_resp
+            try:
+                cached_emb = json.loads(cached_emb_str)
+                sim = self._cosine_sim(emb, cached_emb)
+                if sim >= self.sim_threshold:
+                    logger.info(f"[语义缓存] 语义命中 (相似度={sim:.3f})")
+                    return cached_resp
+            except Exception:
+                continue
+        return None
+
+    def set(self, query: str, response: str, session_id: str):
+        """写入缓存"""
+        try:
+            emb = embed_model.embed_query(query)
+        except Exception as e:
+            logger.warning(f"[语义缓存] embedding 失败，跳过写入: {e}")
+            return
+
+        q_hash = hashlib.md5(query.encode()).hexdigest()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO cache (session_id, query_text, query_hash, embedding, response, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, query, q_hash, json.dumps(emb), response, int(time.time()))
+        )
+        conn.commit()
+        conn.close()
+        logger.info("[语义缓存] 已写入")
+
+    def invalidate(self, session_id: str):
+        """按 session 清空缓存（知识库变更时调用）"""
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DELETE FROM cache WHERE session_id = ?", (session_id,))
+        conn.commit()
+        conn.close()
+        logger.info(f"[语义缓存] 已失效 session={session_id}")
 
 
 class RRFRetriever(Runnable):
@@ -76,6 +183,7 @@ class RagSummarizeService:
         self.vector_store_service = VectorStoreService()
         self.vector_retriever = self.vector_store_service.get_retriever()
         self.bm25_retriever = None
+        self.semantic_cache = SemanticCache()
 
         # ============== 检索配置（从 chroma.yml 读取）==============
         self.rerank_top_k = chroma_conf.get('retrieve_top_k', 10)
@@ -91,8 +199,10 @@ class RagSummarizeService:
 
     def refresh(self):
         """
-        刷新检索器状态。当知识库（Chroma）中文档发生变化时，调用此方法重新构建 BM25 索引。
+        刷新检索器状态。当知识库（Chroma）中文档发生变化时，
+        调用此方法重新构建 BM25 索引，同时失效旧缓存。
         """
+        self.semantic_cache.invalidate(self.vector_store_service.session_id)
         # 提取当前库中所有的文档供BM25建立本地索引
         all_docs = self.vector_store_service.vector_store.get()
         if all_docs and isinstance(all_docs, dict) and "documents" in all_docs and len(all_docs["documents"]) > 0:
@@ -206,6 +316,12 @@ class RagSummarizeService:
         return context
 
     async def rag_summarize(self, query: str) -> str:
+        session_id = current_session_id.get()
+
+        cached = self.semantic_cache.get(query, session_id)
+        if cached is not None:
+            return cached
+
         # [高级流机制1] Query Rewrite
         try:
             expanded_query = await self.rewrite_chain.ainvoke({"question": query})
@@ -229,11 +345,13 @@ class RagSummarizeService:
             # 将文档的元数据合并上，这会在最后出处呈现上发挥大作用
             context += f"[参考资料{counter}]:参考资料:{doc.page_content}|参考元数据:{doc.metadata}\n"
 
-        return await self.chain.ainvoke(
+        response = await self.chain.ainvoke(
             {"input": query,
              "context": context,
              }
         )
+        self.semantic_cache.set(query, response, session_id)
+        return response
 
 if __name__ == "__main__":
     rag_service = RagSummarizeService()

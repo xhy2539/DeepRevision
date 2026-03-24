@@ -1,6 +1,8 @@
 import os.path
 import asyncio
 import hashlib
+import json
+from typing import Dict, List
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
@@ -36,9 +38,9 @@ class VectorStoreService():
                 separators=chroma_conf['separators'],
                 length_function=len,
             )
-            
             self.session_data_path = os.path.join(get_abs_path(chroma_conf['data_path']), self.session_id)
             self.session_md5_path = os.path.join(self.session_data_path, chroma_conf['md5_hex_store'])
+            self._file_vector_map_path = os.path.join(self.session_data_path, '.file_vector_map.json')
         except Exception as e:
             logger.error(f"初始化向量库失败: {e}")
             raise
@@ -84,11 +86,43 @@ class VectorStoreService():
 
         return self.vector_store.as_retriever(search_kwargs=search_kwargs)
 
+    def _load_file_vector_map(self) -> Dict[str, List[str]]:
+        if not os.path.exists(self._file_vector_map_path):
+            return {}
+        try:
+            with open(self._file_vector_map_path, "r", encoding="utf-8") as f:
+                return _json.load(f)
+        except Exception:
+            return {}
+
+    def _save_file_vector_map(self, mapping: Dict[str, List[str]]):
+        with open(self._file_vector_map_path, "w", encoding="utf-8") as f:
+            _json.dump(mapping, f, ensure_ascii=False)
+
+    async def delete_file_vectors(self, filename: str) -> bool:
+        mapping = self._load_file_vector_map()
+        if filename not in mapping:
+            logger.warning(f"[删除向量] 文件 {filename} 不在映射表中，可能未向量化或已删除")
+            return False
+
+        doc_ids = mapping[filename]
+        try:
+            self.vector_store.delete(ids=doc_ids)
+            del mapping[filename]
+            self._save_file_vector_map(mapping)
+            logger.info(f"[删除向量] 成功删除文件 {filename} 的 {len(doc_ids)} 个向量")
+            return True
+        except Exception as e:
+            logger.error(f"[删除向量] 删除文件 {filename} 失败: {e}")
+            return False
+
     async def load_document(self):
         """
         从数据文件夹读取数据转为向量存入向量库。
         图片描述通过 asyncio.gather 并发调用视觉模型，避免串行阻塞。
         """
+        import json as _json
+
         def chunk_md5_hex(md5_for_check: str):
             if not os.path.exists(self.session_md5_path):
                 return False
@@ -98,6 +132,11 @@ class VectorStoreService():
         def save_md5_hex(md5_for_check: str):
             with open(self.session_md5_path, "a", encoding="utf-8") as f:
                 f.write(md5_for_check + "\n")
+
+        def update_file_vector_map(fname: str, doc_ids: List[str]):
+            mapping = self._load_file_vector_map()
+            mapping[fname] = doc_ids
+            self._save_file_vector_map(mapping)
 
         async def get_file_document(read_path: str):
             if read_path.endswith(".txt"):
@@ -184,9 +223,18 @@ class VectorStoreService():
                     logger.info(f"[加载知识库]{path}分片内无有效内容，跳过")
                     continue
 
+                # 为每个 chunk 生成确定性ID（包含文件名），便于后续追踪删除
+                fname = os.path.basename(path)
+                for idx, doc in enumerate(split_document):
+                    doc.id = f"vec_{hashlib.md5(fname.encode()).hexdigest()[:8]}_{idx}"
+                    doc.metadata["source_filename"] = fname
+
                 self.vector_store.add_documents(split_document)
+                # 记录文件→向量ID映射
+                doc_ids = [doc.id for doc in split_document]
+                update_file_vector_map(fname, doc_ids)
                 save_md5_hex(md5_hex)
-                logger.info(f"[加载知识库]{path}加载成功")
+                logger.info(f"[加载知识库]{path}加载成功，共 {len(split_document)} 个chunk")
             except Exception as e:
                 logger.error(f"[加载知识库]{path}加载失败: {e}", exc_info=True)
 

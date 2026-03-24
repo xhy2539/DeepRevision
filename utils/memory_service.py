@@ -194,7 +194,7 @@ def _migrate_from_json(db: str, json_path: str):
 # ==================== SessionMemoryManager ====================
 
 class SessionMemoryManager:
-    def __init__(self, max_recent_turns: int = 3, trash_threshold: int = 4):
+    def __init__(self, max_recent_turns: int = 5, trash_threshold: int = 4):
         self.max_recent_turns = max_recent_turns
         self.trash_threshold = trash_threshold
         self.db = _db_path()
