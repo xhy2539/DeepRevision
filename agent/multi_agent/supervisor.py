@@ -692,6 +692,12 @@ async def exam_subagent_node(state: SupervisorState) -> SupervisorState:
 
     exam_result = await run_exam_agent(topics_with_weak, quiz_types, total, sample_ctx, quantity_dist)
     exam_text = exam_result.get("text", "") if isinstance(exam_result, dict) else exam_result
+    if not exam_text or not str(exam_text).strip():
+        exam_text = "试卷生成暂时超时，已触发降级。请稍后重试，或先减少题量后再生成。"
+        if isinstance(exam_result, dict):
+            exam_result = {**exam_result, "text": exam_text}
+        else:
+            exam_result = exam_text
     return {"subagent_result": exam_result, "final_answer": exam_text}
 
 

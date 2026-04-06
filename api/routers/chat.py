@@ -5,7 +5,7 @@ import time
 from fastapi import APIRouter, Body, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 from langchain_core.messages import HumanMessage, AIMessage
 
@@ -19,10 +19,48 @@ from rag.vector_store import VectorStoreService
 
 router = APIRouter()
 
+# 轻量运行指标（进程内）
+RUNTIME_METRICS: Dict[str, Any] = {
+    "total_requests": 0,
+    "failed_requests": 0,
+    "routes": {"rag": 0, "quiz": 0, "exam": 0, "planner": 0, "history": 0, "chitchat": 0},
+    "exam_total": 0,
+    "exam_success": 0,
+    "last_error": "",
+}
+
 
 class ChatRequest(BaseModel):
     query: str
     session_id: str = "default_session"
+
+
+class PracticeRecordItem(BaseModel):
+    question_id: Optional[str] = None
+    question_number: Optional[int] = None
+    question_content: str
+    knowledge_point: Optional[str] = None
+    user_answer: str
+    correct_answer: str
+    is_correct: bool
+    wrong_reason: Optional[str] = None
+
+
+class PracticeSubmitRequest(BaseModel):
+    session_id: str = "default"
+    records: List[PracticeRecordItem]
+
+
+class SimilarBatchItem(BaseModel):
+    question_number: int
+    question_content: str
+    knowledge_point: Optional[str] = None
+
+
+class SimilarBatchRequest(BaseModel):
+    session_id: str = "default"
+    wrong_questions: List[SimilarBatchItem]
+    limit: int = 3
 
 
 def _clean_answer(answer: str) -> str:
@@ -180,6 +218,13 @@ def _deduplicate_response(text: str) -> str:
     return '\n'.join(lines).strip()
 
 
+def _safe_inc(metric_key: str, delta: int = 1):
+    try:
+        RUNTIME_METRICS[metric_key] = int(RUNTIME_METRICS.get(metric_key, 0)) + delta
+    except Exception:
+        pass
+
+
 @router.post("/stream")
 async def chat_stream_endpoint(request: Request):
     """
@@ -212,6 +257,7 @@ async def chat_stream_endpoint(request: Request):
     graph_context = memory_manager.get_memory_context(session_id)
 
     async def event_stream():
+        _safe_inc("total_requests")
         initial_state = {
             "input": query,
             "chat_history": chat_history,
@@ -225,6 +271,7 @@ async def chat_stream_endpoint(request: Request):
         }
 
         logger.info("开始执行 Supervisor 工作流...")
+        stream_start = time.time()
         answer = ""  # 初始化 answer 变量
         message = None
         try:
@@ -248,6 +295,12 @@ async def chat_stream_endpoint(request: Request):
                 answer = structured_result.get("text", "") if structured_result else raw_subagent_result
             route = result.get("route", "chitchat")
             route_params = result.get("route_params", {}) or {}
+            route_reason = str(result.get("route_reason", "") or "")
+            fallback_used = "fallback" in route_reason.lower()
+            if route in RUNTIME_METRICS["routes"]:
+                RUNTIME_METRICS["routes"][route] += 1
+            if route == "exam":
+                _safe_inc("exam_total")
             logger.info(f"[Raw Answer] length={len(answer)}, content={answer}")
 
             # 清洗回答
@@ -268,9 +321,20 @@ async def chat_stream_endpoint(request: Request):
                         await asyncio.sleep(0.03)
 
                 yield f"data: {json.dumps({'event': 'complete', 'message': message}, ensure_ascii=False)}\n\n"
+                if route == "exam" and message.get("kind") == "exam_paper":
+                    exam_data = (message.get("payload") or {}).get("exam_data", {})
+                    exam_questions = exam_data.get("questions", []) if isinstance(exam_data, dict) else []
+                    if isinstance(exam_questions, list) and len(exam_questions) > 0:
+                        _safe_inc("exam_success")
+                logger.info(
+                    f"[Observability] session={session_id}, route={route}, reason={route_reason}, "
+                    f"fallback={fallback_used}, kind={message['kind']}, latency_ms={int((time.time()-stream_start)*1000)}"
+                )
 
         except Exception as e:
             logger.error(f"流式输出异常: {e}")
+            _safe_inc("failed_requests")
+            RUNTIME_METRICS["last_error"] = str(e)
             yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
 
         yield "data: [DONE]\n\n"
@@ -296,6 +360,126 @@ async def chat_stream_endpoint(request: Request):
             )
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@router.post("/practice/submit")
+async def submit_practice_records(req: PracticeSubmitRequest = Body(...)):
+    """
+    提交练习记录（错题追踪主入口）。
+    """
+    session_id = req.session_id or "default"
+    if not re.match(r'^[\u4e00-\u9fa5a-zA-Z0-9_\-]{1,64}$', session_id):
+        raise HTTPException(status_code=400, detail="非法 session_id")
+
+    if not req.records:
+        return {"code": 200, "message": "无记录需要提交", "saved": 0}
+
+    current_session_id.set(session_id)
+    saved = 0
+    for idx, record in enumerate(req.records):
+        qid = record.question_id or f"{session_id}_{record.question_number or idx + 1}_{int(time.time() * 1000)}"
+        memory_manager.add_practice_record(
+            session_id=session_id,
+            question_id=qid,
+            question_content=record.question_content,
+            knowledge_point=record.knowledge_point or "",
+            user_answer=record.user_answer,
+            correct_answer=record.correct_answer,
+            is_correct=record.is_correct,
+            wrong_reason=record.wrong_reason,
+        )
+        # 题库沉淀：用于相似题检索。这里全量入库，便于后续复练。
+        try:
+            memory_manager.store_question_to_bank(
+                session_id=session_id,
+                question_id=qid,
+                question_content=record.question_content,
+                knowledge_point=record.knowledge_point or "",
+                answer=record.correct_answer,
+            )
+        except Exception as e:
+            logger.warning(f"[Practice] 题库写入失败 qid={qid}: {e}")
+        saved += 1
+
+    stats = memory_manager.get_knowledge_point_stats(session_id)
+    weak_points = [kp for kp, data in stats.items() if data.get("weak")]
+    logger.info(f"[Practice] session={session_id}, saved={saved}, weak_points={weak_points}")
+    return {
+        "code": 200,
+        "message": f"已保存 {saved} 条练习记录",
+        "saved": saved,
+        "weak_points": weak_points,
+        "stats": stats,
+    }
+
+
+@router.post("/practice/similar")
+async def get_similar_questions_batch(req: SimilarBatchRequest = Body(...)):
+    """
+    根据错题批量返回相似题，供前端复练模块直接渲染。
+    """
+    session_id = req.session_id or "default"
+    if not re.match(r'^[\u4e00-\u9fa5a-zA-Z0-9_\-]{1,64}$', session_id):
+        raise HTTPException(status_code=400, detail="非法 session_id")
+
+    current_session_id.set(session_id)
+    result: Dict[int, List[Dict[str, Any]]] = {}
+    for item in req.wrong_questions:
+        sims = memory_manager.search_similar_questions(
+            question_content=item.question_content,
+            knowledge_point=item.knowledge_point or "",
+            limit=max(1, min(req.limit, 8)),
+        )
+        result[item.question_number] = sims
+
+    return {"code": 200, "similar_questions": result}
+
+
+@router.get("/practice/stats")
+async def get_practice_stats(session_id: str):
+    """
+    获取练习统计（用于错题复练率看板）。
+    """
+    if not re.match(r'^[\u4e00-\u9fa5a-zA-Z0-9_\-]{1,64}$', session_id):
+        raise HTTPException(status_code=400, detail="非法 session_id")
+
+    history = memory_manager.get_practice_history(session_id, limit=500)
+    kp_stats = memory_manager.get_knowledge_point_stats(session_id)
+    total = len(history)
+    wrong = sum(1 for h in history if not h.get("is_correct"))
+    accuracy = round(((total - wrong) / total) * 100, 2) if total > 0 else 0.0
+    retry_rate = round((wrong / total) * 100, 2) if total > 0 else 0.0
+    weak_points = [kp for kp, v in kp_stats.items() if v.get("weak")]
+
+    return {
+        "code": 200,
+        "data": {
+            "session_id": session_id,
+            "total_attempts": total,
+            "wrong_attempts": wrong,
+            "accuracy": accuracy,
+            "retry_rate": retry_rate,
+            "weak_points": weak_points,
+            "knowledge_point_stats": kp_stats,
+        },
+    }
+
+
+@router.get("/metrics")
+async def get_runtime_metrics():
+    """
+    进程内运行指标（出卷成功率、路由分布等）。
+    """
+    exam_total = int(RUNTIME_METRICS.get("exam_total", 0))
+    exam_success = int(RUNTIME_METRICS.get("exam_success", 0))
+    exam_success_rate = round((exam_success / exam_total) * 100, 2) if exam_total > 0 else 0.0
+    return {
+        "code": 200,
+        "data": {
+            **RUNTIME_METRICS,
+            "exam_success_rate": exam_success_rate,
+        },
+    }
 
 
 @router.delete("/session/{session_id}")

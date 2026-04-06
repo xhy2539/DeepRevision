@@ -28,6 +28,30 @@ interface AssistantPayload {
   exam_data?: unknown;
 }
 
+interface ExamPracticeQuestion {
+  number: number;
+  type: string;
+  content: string;
+  answer: string;
+  analysis: string;
+  score: number;
+  difficulty: string;
+  knowledge_point?: string;
+}
+
+interface PracticeRecordItem {
+  question: ExamPracticeQuestion;
+  userAnswer: string;
+  isCorrect: boolean;
+}
+
+interface SimilarQuestion {
+  question_content: string;
+  answer: string;
+  knowledge_point: string;
+  question_id: string;
+}
+
 interface Message {
   id: string;
   role: "user" | "assistant";
@@ -325,11 +349,21 @@ function MarkdownContent({
   kind,
   payload,
   onRequestAnswers,
+  similarQuestions,
+  onPracticeComplete,
 }: {
   content: string;
   kind?: MessageKind;
   payload?: AssistantPayload;
   onRequestAnswers?: () => void;
+  similarQuestions?: Record<number, SimilarQuestion[]>;
+  onPracticeComplete?: (
+    score: number,
+    total: number,
+    records: PracticeRecordItem[],
+    wrongAnswers: ExamPracticeQuestion[],
+    userAnswers: Record<number, string>
+  ) => void;
 }) {
   const parsedQuiz = parseQuizContent(content);
 
@@ -340,6 +374,8 @@ function MarkdownContent({
         examDataOverride={payload?.exam_data}
         courseName={payload?.title || "期末考试"}
         onRequestAnswers={onRequestAnswers}
+        similarQuestions={similarQuestions}
+        onPracticeComplete={onPracticeComplete}
       />
     );
   }
@@ -399,7 +435,15 @@ function MarkdownContent({
   if (isExamContent(content)) {
     // 直接使用 ExamCanvas 渲染，它内部会处理解析失败的情况
     // 解析失败时会渲染原始内容作为后备
-    return <ExamCanvas examContent={content} courseName="期末考试" onRequestAnswers={onRequestAnswers} />;
+    return (
+      <ExamCanvas
+        examContent={content}
+        courseName="期末考试"
+        onRequestAnswers={onRequestAnswers}
+        similarQuestions={similarQuestions}
+        onPracticeComplete={onPracticeComplete}
+      />
+    );
   }
 
   // 尝试用简单方式解析题目
@@ -1101,8 +1145,76 @@ export default function ChatPage() {
   const [showSessionModal, setShowSessionModal] = useState(false);
   const [showKnowledgePanel, setShowKnowledgePanel] = useState(false);
   const [isBackendConnected, setIsBackendConnected] = useState(true);
+  const [similarQuestionsByMessage, setSimilarQuestionsByMessage] = useState<Record<string, Record<number, SimilarQuestion[]>>>({});
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  const inferKnowledgePoint = (question: ExamPracticeQuestion): string => {
+    if (question.knowledge_point && question.knowledge_point.trim()) {
+      return question.knowledge_point.trim();
+    }
+    const head = (question.content || "").split("\n")[0] || "";
+    return head.slice(0, 20) || question.type || "未标注知识点";
+  };
+
+  const handlePracticeCompleteForMessage = async (
+    messageId: string,
+    score: number,
+    total: number,
+    records: PracticeRecordItem[],
+    wrongAnswers: ExamPracticeQuestion[],
+    userAnswers: Record<number, string>
+  ) => {
+    if (!currentSession) return;
+
+    try {
+      const payloadRecords = records.map((r) => ({
+        question_id: `${messageId}_${r.question.number}`,
+        question_number: r.question.number,
+        question_content: r.question.content,
+        knowledge_point: inferKnowledgePoint(r.question),
+        user_answer: r.userAnswer || userAnswers[r.question.number] || "",
+        correct_answer: r.question.answer || "",
+        is_correct: r.isCorrect,
+        wrong_reason: r.isCorrect ? "" : (r.question.analysis || ""),
+      }));
+
+      if (payloadRecords.length > 0) {
+        await fetch("/api/chat/practice/submit", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: currentSession,
+            records: payloadRecords,
+          }),
+        });
+
+        const similarRes = await fetch("/api/chat/practice/similar", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: currentSession,
+            limit: 3,
+            wrong_questions: wrongAnswers.map((q) => ({
+              question_number: q.number,
+              question_content: q.content,
+              knowledge_point: inferKnowledgePoint(q),
+            })),
+          }),
+        });
+        const similarData = await similarRes.json();
+        if (similarData?.code === 200 && similarData?.similar_questions) {
+          setSimilarQuestionsByMessage((prev) => ({
+            ...prev,
+            [messageId]: similarData.similar_questions,
+          }));
+        }
+      }
+      console.log("[Practice] 完成练习:", { score, total, totalCount: records.length, wrongCount: wrongAnswers.length });
+    } catch (error) {
+      console.error("[Practice] 保存练习记录失败:", error);
+    }
+  };
 
   // 加载会话列表和消息历史
   useEffect(() => {
@@ -1564,6 +1676,10 @@ export default function ChatPage() {
                         content={message.content || (message.role === "assistant" && isLoading ? "正在思考中..." : "")}
                         kind={message.kind}
                         payload={message.payload}
+                        similarQuestions={similarQuestionsByMessage[message.id]}
+                        onPracticeComplete={(score, total, records, wrongAnswers, userAnswers) =>
+                          handlePracticeCompleteForMessage(message.id, score, total, records, wrongAnswers, userAnswers)
+                        }
                         onRequestAnswers={() => {
                           // 发送消息请求答案
                           const input = "请给出上面试卷的答案和解析";

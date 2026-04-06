@@ -25,6 +25,12 @@ interface ExamData {
   questions: Question[];
 }
 
+interface PracticeRecord {
+  question: Question;
+  userAnswer: string;
+  isCorrect: boolean;
+}
+
 // Props
 interface ExamCanvasProps {
   examContent: string;
@@ -37,7 +43,13 @@ interface ExamCanvasProps {
   onRegenerateComplete?: (questionNumber: number) => void;
   onQuestionFeedback?: (questionNumber: number, feedback: 'up' | 'down') => void;
   onWrongAnswer?: (question: Question, userAnswer: string) => void;
-  onPracticeComplete?: (score: number, total: number, wrongAnswers: Question[], userAnswers: Record<number, string>) => void;
+  onPracticeComplete?: (
+    score: number,
+    total: number,
+    records: PracticeRecord[],
+    wrongAnswers: Question[],
+    userAnswers: Record<number, string>
+  ) => void;
   similarQuestions?: Record<number, Array<{question_content: string; answer: string; knowledge_point: string; question_id: string}>>;
 }
 
@@ -541,6 +553,7 @@ export default function ExamCanvas({ examContent, examDataOverride, courseName =
     let totalScore = 0;
     const wrongAnswers: Question[] = [];
     const wrongWithUser: Array<{ question: Question; userAnswer: string }> = [];
+    const records: PracticeRecord[] = [];
 
     for (const q of examData.questions) {
       const normalizeAnswer = (a: string) => a.trim().replace(/\s+/g, " ").toUpperCase();
@@ -555,13 +568,18 @@ export default function ExamCanvas({ examContent, examDataOverride, courseName =
         wrongWithUser.push({ question: q, userAnswer: answers[q.number] || "" });
         onWrongAnswer?.(q, answers[q.number] || "");
       }
+      records.push({
+        question: q,
+        userAnswer: answers[q.number] || "",
+        isCorrect,
+      });
     }
 
     setScore(totalScore);
     setSubmitted(true);
     setPracticeMode('view');
     setWrongAnswersWithUser(wrongWithUser);
-    onPracticeComplete?.(totalScore, examData.total_score, wrongAnswers, answers);
+    onPracticeComplete?.(totalScore, examData.total_score, records, wrongAnswers, answers);
   };
 
   const getQuestionResult = (q: Question) => {

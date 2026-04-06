@@ -13,8 +13,9 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding='utf-8')
     sys.stderr.reconfigure(encoding='utf-8')
 
-# 设置 API Key
-os.environ["MINIMAX_API_KEY"] = "sk-cp-MZK-3ZdmZ4YoWlT5mat91of7svArukPGxTbmXMnVg8OoWlYf8Rjn4Gru_RXROZs8li6kMD_hQC4ZYtkRFh1vdWT5_Oy0zLMFg8b-LlPgCKzRjwrLt9CP9Wk"
+# 设置 API Key（优先使用外部环境变量，避免硬编码泄漏）
+if not os.environ.get("MINIMAX_API_KEY"):
+    print("⚠️ 未检测到 MINIMAX_API_KEY，请先在系统环境变量或 .env 中配置。")
 
 # 设置模型缓存路径，避免下载到 C 盘
 models_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
