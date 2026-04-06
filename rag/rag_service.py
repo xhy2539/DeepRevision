@@ -1,13 +1,13 @@
 from langchain_core.documents import Document
 from langchain_core.runnables import Runnable
 from langchain_community.retrievers import BM25Retriever
-from model.factory import chat_model, embed_model
+from model.factory import chat_model, embed_model, light_chat_model
 from rag.vector_store import VectorStoreService
 from utils.prompt_loader import load_rag_prompts
 from utils.config_handler import chroma_conf
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from utils.logger_handler import logger
 from utils.session_context import current_session_id
 import asyncio
@@ -60,12 +60,13 @@ class SemanticCache:
             return 0.0
         return dot / (norm_a * norm_b)
 
-    def get(self, query: str, session_id: str) -> Optional[str]:
+    async def get(self, query: str, session_id: str) -> Optional[str]:
         """
         查询语义缓存。命中返回缓存的 response，未命中返回 None。
         """
         try:
-            emb = embed_model.embed_query(query)
+            loop = asyncio.get_event_loop()
+            emb = await loop.run_in_executor(None, lambda: embed_model.embed_query(query))
         except Exception as e:
             logger.warning(f"[语义缓存] embedding 失败: {e}")
             return None
@@ -187,7 +188,7 @@ class RagSummarizeService:
 
         # ============== 检索配置（从 chroma.yml 读取）==============
         self.rerank_top_k = chroma_conf.get('retrieve_top_k', 10)
-        self.final_top_k = chroma_conf.get('rerank_top_k', 8)
+        self.final_top_k = chroma_conf.get('rerank_final_k', 8)
         self.rrf_k = chroma_conf.get('rrf_k', 60)
         self.mmr_enabled = chroma_conf.get('mmr_enabled', False)
         self.mmr_lambda = chroma_conf.get('mmr_lambda', 0.5)
@@ -195,14 +196,15 @@ class RagSummarizeService:
         logger.info("[RAG] 初始化混合检索系统 (BM25 + 向量 RRF)")
 
         # ============== 创建混合检索器 ==============
-        self.refresh()
+        self.refresh(invalidate_cache=False)
 
-    def refresh(self):
+    def refresh(self, invalidate_cache: bool = True):
         """
         刷新检索器状态。当知识库（Chroma）中文档发生变化时，
         调用此方法重新构建 BM25 索引，同时失效旧缓存。
         """
-        self.semantic_cache.invalidate(self.vector_store_service.session_id)
+        if invalidate_cache:
+            self.semantic_cache.invalidate(self.vector_store_service.session_id)
         # 提取当前库中所有的文档供BM25建立本地索引
         all_docs = self.vector_store_service.vector_store.get()
         if all_docs and isinstance(all_docs, dict) and "documents" in all_docs and len(all_docs["documents"]) > 0:
@@ -234,7 +236,7 @@ class RagSummarizeService:
         rewrite_prompt = PromptTemplate.from_template(
             "你是一个期末考试复习助手。学生的问题通常很短或带有代词。请将下面的问题补充完整并改写为更适合在知识库(课件)中检索的关键词串，词与词之间用空格隔开。如果问题本身已经很明确，只需提取出核心名词即可。不超过50个字。\n原问题: {question}"
         )
-        self.rewrite_chain = rewrite_prompt | chat_model | StrOutputParser()
+        self.rewrite_chain = rewrite_prompt | light_chat_model | StrOutputParser()
 
         # --- 步骤三：打包装配最终总结的 Chain ---
         self.prompt_text = load_rag_prompts()
@@ -252,6 +254,7 @@ class RagSummarizeService:
     async def _rerank(self, query: str, docs: list[Document]) -> list[Document]:
         """
         使用 LLM 对检索结果重排序（fix #9：改为 async，使用 ainvoke 避免阻塞 event loop）
+        529错误时快速失败，避免长时间等待
         """
         if not docs or len(docs) <= 1:
             return docs
@@ -271,8 +274,23 @@ class RagSummarizeService:
 
 请按相关性从高到低排序，返回文档编号列表（格式：1, 2, 3... 只返回编号列表，不需要其他内容）。"""
 
-            # 异步调用 LLM（fix #9）
-            response = await chat_model.ainvoke(rerank_prompt)
+            # 用 asyncio.wait_for 加 3 秒超时（原10秒太长，10个topic浪费100秒），529 错误快速失败
+            try:
+                response = await asyncio.wait_for(
+                    light_chat_model.ainvoke(rerank_prompt),
+                    timeout=3.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[LLM Rerank] 超时（3秒），跳过重排")
+                return docs[:self.final_top_k]
+            except Exception as e:
+                # 529 等 API 错误快速失败
+                if '529' in str(e) or 'overloaded' in str(e).lower():
+                    logger.warning(f"[LLM Rerank] API 过载（529），跳过重排")
+                else:
+                    logger.warning(f"[LLM Rerank] 调用失败: {e}")
+                return docs[:self.final_top_k]
+
             ranking = response.content.strip()
 
             try:
@@ -307,8 +325,8 @@ class RagSummarizeService:
             expanded_query = query
 
         context_docs = await self.retriever_docs(expanded_query)
-        if context_docs and len(context_docs) > 1:
-            context_docs = await self._rerank(expanded_query, context_docs)
+        # 跳过 LLM rerank（rerank 每次都超时 3 秒，10 个 topic 浪费 ~30 秒，且效果不明显）
+        # RRF 检索结果已经足够好
 
         context = ""
         for i, doc in enumerate(context_docs, 1):
@@ -335,8 +353,8 @@ class RagSummarizeService:
         context_docs = await self.retriever_docs(expanded_query)
 
         # [高级流机制3] Cross-Encoder 重排序，精筛 Top 3
-        if context_docs and len(context_docs) > 1:
-            context_docs = await self._rerank(expanded_query, context_docs)
+        # 跳过 LLM rerank（rerank 每次都超时 3 秒，10 个 topic 浪费 ~30 秒，且效果不明显）
+        # RRF 检索结果已经足够好
 
         context = ""
         counter = 0

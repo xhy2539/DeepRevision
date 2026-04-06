@@ -1,14 +1,17 @@
 import json
 import asyncio
 import re
+import time
 from fastapi import APIRouter, Body, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from typing import Optional
 
 from langchain_core.messages import HumanMessage, AIMessage
 
 from agent.tools.agent_tools import clear_rag_cache
 from agent.multi_agent.supervisor import supervisor_workflow
+from api.message_protocol import build_assistant_message
 from utils.logger_handler import logger, update_token_stats, get_system_stats
 from utils.memory_service import memory_manager
 from utils.session_context import current_session_id
@@ -16,17 +19,165 @@ from rag.vector_store import VectorStoreService
 
 router = APIRouter()
 
-# Supervisor 子 Agent 进度提示语
-_NODE_LABELS = {
-    "rag_agent":     "知识库检索中...",
-    "quiz_agent":    "生成题目（Reflexion 优化中）...",
-    "exam_agent":    "生成试卷（Reflexion 优化中）...",
-    "planner_agent": "制定复习计划...",
-}
 
 class ChatRequest(BaseModel):
     query: str
     session_id: str = "default_session"
+
+
+def _clean_answer(answer: str) -> str:
+    """清洗回答，移除思考内容和重复"""
+    if not answer:
+        return ""
+
+    # 阶段0：首先用正则彻底移除所有 think 标签内容（支持嵌套）
+    # 循环移除直到没有 think 标签为止
+    while '<think>' in answer:
+        answer = re.sub(r'<think>[\s\S]*?</think>', '', answer)
+    answer = answer.strip()
+
+    if not answer:
+        return ""
+
+    # 阶段1：去除思考内容（基于行的启发式处理，作为备份）
+    lines = answer.split('\n')
+    valid_lines = []
+    skip_mode = False
+
+    # 思考内容开始的标记模式（多种变体）
+    thinking_patterns = [
+        r'^用户[说用]',
+        r'^The user',
+        r'^我认为',
+        r'^我应该',
+        r'^我需要',
+        r'^让我',
+        r'^首先',
+        r'^其次',
+        r'^然后',
+        r'^最后',
+        r'^考虑',
+        r'^分析',
+        r'^推理',
+        r'^了["""'']',
+    ]
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # 检测是否是思考内容开始
+        is_thinking = any(re.match(p, stripped) for p in thinking_patterns)
+
+        # 增强检测：以"了"开头、后面紧跟引号或括号、长度较短
+        # 例如：了"你好"，这是一个简单的问候
+        if not is_thinking and len(stripped) >= 2:
+            # 检查是否以"了"开头，后面跟引号类字符
+            if stripped.startswith('了') and len(stripped) >= 4:
+                next_char = stripped[1]
+                if next_char in '"\'""''【】（）：:':
+                    is_thinking = True
+
+        # 检测短行思考内容：包含多个逗号/分号、没有emoji、不是完整句子
+        # 但列表项（以 -、*、1. 等开头）不视为思考内容
+        if not is_thinking and 3 < len(stripped) < 100:
+            comma_count = stripped.count('，') + stripped.count('、')
+            has_emoji = any(e in stripped for e in ['👋', '😊', '👍', '😄', '🎯', '📚', '💡'])
+            ends_with_punct = any(stripped.endswith(c) for c in '。！？.!?…')
+            # 列表项格式不视为思考内容（即使有多个逗号）
+            is_list_item = stripped.startswith(('- ', '* ', '1. ', '2. ', '3. ', '• ')) or re.match(r'^\d+\.（', stripped) or re.match(r'^[A-D][.、]', stripped)
+            # 思考内容的特征：多逗号连接、没有emoji、不以标点结尾、不是列表项
+            if comma_count >= 2 and not has_emoji and not ends_with_punct and not is_list_item:
+                is_thinking = True
+
+        if is_thinking and not skip_mode:
+            # 刚开始进入思考，跳过当前行
+            skip_mode = True
+            continue
+        elif is_thinking and skip_mode:
+            # 继续跳过
+            continue
+
+        # 处于思考模式，寻找正式回答开始的信号
+        if skip_mode:
+            # 正式回答以问候语、带emoji的句子、或 Markdown 标题/列表开始
+            if len(stripped) > 2 and (
+                stripped.startswith('#') or
+                stripped.startswith('你好') or
+                stripped.startswith('嗨') or
+                stripped.startswith('Hi') or
+                stripped.startswith('很高兴') or
+                stripped.startswith('**') or  # Markdown 标题
+                stripped.startswith('- ') or   # 列表项
+                stripped.startswith('* ') or
+                stripped.startswith('1. ') or
+                stripped.startswith('2. ') or
+                stripped.startswith('3. ') or
+                stripped.startswith('• ') or
+                stripped.startswith('1.（') or  # 题目编号（新格式）
+                stripped.startswith('2.（') or
+                stripped.startswith('3.（') or
+                stripped.startswith('【') or  # 旧格式题目标题
+                stripped.startswith('### ') or
+                re.match(r'^[一二三四五六七八九十]+[、.]\s*', stripped) or
+                re.match(r'^##\s*[一二三四五六七八九十0-9]+[、.]?', stripped)
+            ):
+                skip_mode = False
+                valid_lines.append(line)
+            continue
+        else:
+            valid_lines.append(line)
+
+    result = '\n'.join(valid_lines).strip()
+
+    # 如果处理后结果太短，可能是纯思考内容
+    if not result or len(result) < 10:
+        non_empty = [l for l in lines if l.strip()]
+        if non_empty:
+            return non_empty[-1].strip()
+        return answer.strip()
+
+    # 阶段2：去除连续重复的段落
+    result = _deduplicate_response(result)
+
+    return result
+
+
+def _deduplicate_response(text: str) -> str:
+    """去除连续重复的段落"""
+    if not text or len(text) < 20:
+        return text
+
+    lines = text.split('\n')
+    paragraphs = []
+    current_para = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if current_para:
+                paragraphs.append('\n'.join(current_para))
+                current_para = []
+        else:
+            current_para.append(line)
+
+    if current_para:
+        paragraphs.append('\n'.join(current_para))
+
+    if len(paragraphs) < 2:
+        return text
+
+    # 方法1：去除完全相同的连续段落
+    result_paragraphs = []
+    for para in paragraphs:
+        if not result_paragraphs or para != result_paragraphs[-1]:
+            result_paragraphs.append(para)
+
+    if len(result_paragraphs) < len(paragraphs):
+        return '\n\n'.join(result_paragraphs)
+
+    return '\n'.join(lines).strip()
 
 
 @router.post("/stream")
@@ -41,18 +192,14 @@ async def chat_stream_endpoint(request: Request):
     query = body.get("query", "")
     logger.info(f"session_id={session_id}, query={query[:50]}...")
 
-    # 安全校验：session_id 路径穿越防护（允许中文）
+    # 安全校验
     if not re.match(r'^[\u4e00-\u9fa5a-zA-Z0-9_\-]{1,64}$', session_id):
-        logger.warning(f"非法 session_id: {session_id}")
         raise HTTPException(status_code=400, detail="非法 session_id")
 
-    # 输入校验：query 长度限制
     query = query[:2000]
-
-    # 注册当前 Session ID，保证 RAG 检索走对应集合
     current_session_id.set(session_id)
 
-    # 1. 近期滑窗记录 → LangChain 消息格式
+    # 获取历史
     memory_manager._init_session(session_id)
     recent_records = memory_manager.store[session_id]["recent"]
     chat_history = []
@@ -62,13 +209,9 @@ async def chat_stream_endpoint(request: Request):
         else:
             chat_history.append(AIMessage(content=msg["content"]))
 
-    # 2. 长期图谱记忆摘要
     graph_context = memory_manager.get_memory_context(session_id)
 
     async def event_stream():
-        full_response = ""
-        shown_nodes: set = set()  # 避免重复显示进度提示
-
         initial_state = {
             "input": query,
             "chat_history": chat_history,
@@ -82,87 +225,49 @@ async def chat_stream_endpoint(request: Request):
         }
 
         logger.info("开始执行 Supervisor 工作流...")
+        answer = ""  # 初始化 answer 变量
+        message = None
         try:
-            async for event in supervisor_workflow.astream_events(initial_state, version="v2"):
-                kind = event["event"]
-                node = event.get("metadata", {}).get("langgraph_node", "")
-                logger.debug(f"event: kind={kind}, node={node}")
+            # 先发送一个占位消息，避免长耗时任务期间前端完全空白
+            pending_start = json.dumps(
+                {'event': 'start', 'message': {'kind': 'chat', 'render_mode': 'markdown', 'meta': {'route': 'pending'}}},
+                ensure_ascii=False,
+            )
+            pending_delta = json.dumps(
+                {'event': 'delta', 'text': '正在生成内容，请稍候...\n'},
+                ensure_ascii=False,
+            )
+            yield f"data: {pending_start}\n\n"
+            yield f"data: {pending_delta}\n\n"
 
-                # Supervisor 节点的 LLM 输出是 JSON 路由决策，不暴露给用户
-                if node == "supervisor":
-                    continue
+            result = await supervisor_workflow.ainvoke(initial_state)
+            raw_subagent_result = result.get("subagent_result", "")
+            structured_result = raw_subagent_result if isinstance(raw_subagent_result, dict) else None
+            answer = result.get("final_answer", "")
+            if not answer:
+                answer = structured_result.get("text", "") if structured_result else raw_subagent_result
+            route = result.get("route", "chitchat")
+            route_params = result.get("route_params", {}) or {}
+            logger.info(f"[Raw Answer] length={len(answer)}, content={answer}")
 
-                if kind == "on_chat_model_stream":
-                    content = event["data"]["chunk"].content
-                    if content:
-                        full_response += content
-                        yield f"data: {json.dumps({'text': content}, ensure_ascii=False)}\n\n"
+            # 清洗回答
+            answer = _clean_answer(answer)
+            logger.info(f"[Final Answer] length={len(answer)}, content={answer}")
 
-                elif kind == "on_chain_start" and node and node not in shown_nodes:
-                    # 子 Agent 启动时显示一次进度提示
-                    label = _NODE_LABELS.get(node, "")
-                    if label:
-                        shown_nodes.add(node)
-                        msg = f"\n**[{label}]**\n"
-                        yield f"data: {json.dumps({'text': msg}, ensure_ascii=False)}\n\n"
+            if answer:
+                if structured_result is not None:
+                    structured_result = {**structured_result, "text": answer}
+                message = build_assistant_message(route, answer, session_id, route_params, structured_result)
+                yield f"data: {json.dumps({'event': 'start', 'message': {'kind': message['kind'], 'render_mode': message['render_mode'], 'meta': message['meta']}}, ensure_ascii=False)}\n\n"
 
-                elif kind == "on_chain_end":
-                    output = event.get("data", {}).get("output", {})
-                    # 处理 LangChain Message 对象
-                    if hasattr(output, 'content'):
-                        output = output.content
-                    logger.info(f"[Chain End] node={node}, output_type={type(output).__name__}")
-                    if node in ("quiz_agent", "exam_agent"):
-                        # Quiz/Exam 子 Agent 不逐 token 流式输出，拿到完整结果后假流式输出
-                        answer = ""
-                        if isinstance(output, dict):
-                            answer = output.get("final_answer", "") or output.get("revised_exam", "") or output.get("exam_paper", "") or output.get("subagent_result", "")
-                        elif isinstance(output, str):
-                            answer = output
-                        elif hasattr(output, 'content'):
-                            answer = str(output.content)
-                        logger.info(f"[Exam Answer] length={len(answer) if answer else 0}")
-                        # 直接输出，不管 full_response 是否已有值
-                        if answer:
-                            full_response = answer
-                            logger.info(f"[SSE] 开始流式输出试卷，共 {len(answer.splitlines())} 行")
-                            # 按行拆分逐行输出，保留 Markdown 结构
-                            for line in answer.splitlines(keepends=True):
-                                yield f"data: {json.dumps({'text': line}, ensure_ascii=False)}\n\n"
-                                await asyncio.sleep(0.03)
-                            logger.info(f"[SSE] 试卷输出完成")
+                if message["kind"] == "chat":
+                    # 普通对话维持伪流式
+                    for i, line in enumerate(answer.splitlines(keepends=True)):
+                        logger.info(f"[Stream] line{i}: {line}")
+                        yield f"data: {json.dumps({'event': 'delta', 'text': line}, ensure_ascii=False)}\n\n"
+                        await asyncio.sleep(0.03)
 
-                elif kind == "on_chat_model_end":
-                    # Token 消耗统计
-                    try:
-                        output = event["data"].get("output")
-                        usage = None
-                        if hasattr(output, "usage_metadata") and output.usage_metadata:
-                            usage = output.usage_metadata
-                        elif hasattr(output, "response_metadata"):
-                            rm = output.response_metadata
-                            if isinstance(rm, dict):
-                                usage = rm.get("token_usage") or rm.get("usage") or rm.get("prompt_tokens")
-
-                        if usage:
-                            if isinstance(usage, dict):
-                                token_info = {
-                                    "prompt_tokens":      usage.get("input_tokens")      or usage.get("prompt_tokens")     or usage.get("prompt_token_usage", 0),
-                                    "completion_tokens":  usage.get("output_tokens")     or usage.get("completion_tokens") or usage.get("completion_token_usage", 0),
-                                    "total_tokens":       usage.get("total_tokens")      or usage.get("total")             or usage.get("total_usage", 0),
-                                }
-                            elif isinstance(usage, (int, float)):
-                                token_info = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": usage}
-                            else:
-                                token_info = None
-
-                            if token_info and token_info["total_tokens"] > 0:
-                                update_token_stats(token_info)
-                                logger.info(f"【算力监控】Token 消耗: {token_info}")
-                    except Exception as e:
-                        logger.error(f"提取 Token 统计失败: {e}")
-
-                await asyncio.sleep(0.01)
+                yield f"data: {json.dumps({'event': 'complete', 'message': message}, ensure_ascii=False)}\n\n"
 
         except Exception as e:
             logger.error(f"流式输出异常: {e}")
@@ -170,93 +275,94 @@ async def chat_stream_endpoint(request: Request):
 
         yield "data: [DONE]\n\n"
 
-        # 对话结束后入库；超阈值自动触发后台图谱提纯
-        await memory_manager.add_message(session_id, "user", query)
-        await memory_manager.add_message(session_id, "ai", full_response)
+        # 保存对话历史
+        if answer:
+            now = int(time.time() * 1000)
+            await memory_manager.add_message(
+                session_id,
+                "user",
+                query,
+                timestamp=now,
+            )
+            await memory_manager.add_message(
+                session_id,
+                "ai",
+                answer,
+                kind=message["kind"] if message else "chat",
+                render_mode=message["render_mode"] if message else "markdown",
+                payload=message.get("payload") if message else None,
+                meta=message.get("meta") if message else None,
+                timestamp=now + 1,
+            )
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
+
 @router.delete("/session/{session_id}")
 async def delete_session(session_id: str):
-    """
-    手动生命周期管理：用户考完试或复习完后删除该课的记忆，同时销毁对应的矢量知识库。
-    """
-    # 绑定上下文以操作对应集合
     current_session_id.set(session_id)
-    
-    # 销毁知识库实体与物理文件
     try:
         vs = VectorStoreService()
-        await vs.destroy_knowledge_base()  # fix #5：async def 必须 await
+        await vs.destroy_knowledge_base()
     except Exception as e:
         print(f"知识库清理失败: {e}")
-
-    # 清理 RAG 缓存，防止内存泄漏
     clear_rag_cache(session_id)
-
     success = memory_manager.clear_session(session_id)
     if success:
         return {"code": 200, "message": f"科目会话 {session_id} 及其专属知识库已被永久销毁！"}
     return {"code": 404, "message": "该会话不存在"}
 
+
 class RenameRequest(BaseModel):
     new_name: str
 
+
 @router.put("/session/{session_id}")
 async def rename_session(session_id: str, req: RenameRequest = Body(...)):
-    """
-    修改展示分类的名称
-    """
     success = memory_manager.rename_session(session_id, req.new_name)
     if success:
         return {"code": 200, "message": "重命名成功"}
     return {"code": 404, "message": "该会话不存在"}
 
+
 class SessionCreateRequest(BaseModel):
     session_id: str
     name: str
+    parent_id: Optional[str] = None
+
 
 @router.post("/session")
 async def register_session(req: SessionCreateRequest = Body(...)):
-    """
-    显式创建/注册一个新会话，防止切换后因无消息而丢失
-    """
-    memory_manager.register_session(req.session_id, req.name)
+    memory_manager.register_session(req.session_id, req.name, req.parent_id)
     return {"code": 200, "message": "会话注册成功"}
+
 
 @router.get("/sessions")
 async def get_all_sessions():
-    """
-    返回当前系统中存在的所有活跃会话。
-    """
     sessions = memory_manager.get_all_sessions()
     return {"code": 200, "data": sessions}
 
 
 @router.get("/messages")
 async def get_session_messages(session_id: str):
-    """
-    获取指定会话的历史消息
-    """
     memory_manager._init_session(session_id)
     recent_records = memory_manager.store[session_id]["recent"]
-
     messages = []
     for msg in recent_records:
         messages.append({
             "id": f"{msg.get('timestamp', 0)}",
             "role": msg["role"],
             "content": msg["content"],
-            "timestamp": msg.get("timestamp", 0)
+            "timestamp": msg.get("timestamp", 0),
+            "kind": msg.get("kind"),
+            "render_mode": msg.get("render_mode"),
+            "payload": msg.get("payload"),
+            "meta": msg.get("meta"),
         })
-
     return {"code": 200, "data": messages}
 
 
 @router.get("/tokens")
 async def get_tokens():
-    """
-    获取系统算力与耗时统计监控板
-    """
     stats = get_system_stats()
     return {"code": 200, "data": stats}

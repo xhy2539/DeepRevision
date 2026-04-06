@@ -3,7 +3,8 @@ import re
 import json
 import hashlib
 import shutil
-from typing import List
+import time
+from typing import List, Dict, Any
 
 from fastapi import APIRouter, File, UploadFile, BackgroundTasks, Query, HTTPException
 from rag.vector_store import VectorStoreService
@@ -45,6 +46,63 @@ def _load_existing_md5s(md5_path: str) -> set:
         return {line.strip() for line in f if line.strip()}
 
 
+def _remove_md5(md5_path: str, target_md5: str):
+    if not os.path.exists(md5_path):
+        return
+    try:
+        with open(md5_path, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip()]
+        lines = [h for h in lines if h != target_md5]
+        with open(md5_path, "w", encoding="utf-8") as f:
+            if lines:
+                f.write("\n".join(lines) + "\n")
+    except Exception as e:
+        logger.warning(f"[上传去重] 移除旧MD5失败: {e}")
+
+
+def _load_file_vector_map(session_data_dir: str) -> Dict[str, List[str]]:
+    map_path = os.path.join(session_data_dir, ".file_vector_map.json")
+    if not os.path.exists(map_path):
+        return {}
+    try:
+        with open(map_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _load_ingest_status(status_path: str) -> Dict[str, Any]:
+    if not os.path.exists(status_path):
+        return {}
+    try:
+        with open(status_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_ingest_status(status_path: str, data: Dict[str, Any]):
+    os.makedirs(os.path.dirname(status_path), exist_ok=True)
+    with open(status_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _update_ingest_status(session_id: str, updates: Dict[str, Dict[str, Any]]):
+    data_root = get_abs_path(chroma_conf['data_path'])
+    session_data_dir = os.path.join(data_root, session_id)
+    status_path = os.path.join(session_data_dir, "ingest_status.json")
+    status_data = _load_ingest_status(status_path)
+    now = int(time.time())
+    for filename, patch in updates.items():
+        current = status_data.get(filename, {})
+        current.update(patch)
+        current["updated_at"] = now
+        status_data[filename] = current
+    _save_ingest_status(status_path, status_data)
+
+
 def process_document_task(filenames: list, session_id: str = "default"):
     """
     后台处理任务：执行向量存入操作（支持多文件批量）。
@@ -56,7 +114,22 @@ def process_document_task(filenames: list, session_id: str = "default"):
     async def _run():
         current_session_id.set(session_id)
         vs = VectorStoreService()
-        await vs.load_document()
+        # 标记为处理开始
+        _update_ingest_status(
+            session_id,
+            {name: {"status": "processing", "detail": "正在解析并向量化"} for name in filenames},
+        )
+
+        result_map = await vs.load_document(target_filenames=filenames)
+
+        status_patch = {}
+        for name in filenames:
+            info = result_map.get(name, {"status": "failed", "detail": "后台任务未返回该文件结果"})
+            status_patch[name] = {
+                "status": info.get("status", "failed"),
+                "detail": info.get("detail", ""),
+            }
+        _update_ingest_status(session_id, status_patch)
 
         # 触发 RAG 缓存刷新，确保 BM25 索引同步更新
         # fix: 即使 _rag_cache 中没有该 session，也需要刷新或创建新实例
@@ -76,6 +149,10 @@ def process_document_task(filenames: list, session_id: str = "default"):
         _asyncio.run(_run())
     except Exception as e:
         logger.error(f"[后台任务] 批次 {filenames} 知识库解析失败: {str(e)}")
+        _update_ingest_status(
+            session_id,
+            {name: {"status": "failed", "detail": f"后台任务异常: {str(e)}"} for name in filenames},
+        )
 
 
 @router.post("/upload")
@@ -102,6 +179,11 @@ async def upload_documents(
 
     md5_store_path = os.path.join(session_data_dir, chroma_conf['md5_hex_store'])
     existing_md5s = _load_existing_md5s(md5_store_path)
+    status_store_path = os.path.join(session_data_dir, "ingest_status.json")
+    ingest_status = _load_ingest_status(status_store_path)
+    file_vector_map = _load_file_vector_map(session_data_dir)
+    # 需要写入 md5_store 的新 MD5（包含重复文件的 MD5，确保前端状态准确）
+    md5s_to_persist = set()
 
     results = []
     new_files = []
@@ -122,13 +204,25 @@ async def upload_documents(
         md5_hex = _compute_bytes_md5(content)
 
         if md5_hex in existing_md5s:
-            results.append({
-                "filename": file.filename,
-                "status": "duplicate",
-                "reason": "文件内容与已有知识库重复，已跳过"
-            })
-            logger.info(f"[上传去重] {file.filename} MD5={md5_hex} 已存在，跳过")
-            continue
+            safe_name = os.path.basename(file.filename)
+            status_entry = ingest_status.get(safe_name, {})
+            is_failed_file = status_entry.get("status") == "failed"
+            has_vector_mapping = bool(file_vector_map.get(safe_name))
+
+            # 失败文件允许重试：清理旧 MD5，重新进入向量化流程
+            if is_failed_file or not has_vector_mapping:
+                logger.info(f"[上传重试] {file.filename} 命中旧MD5但允许重试（failed={is_failed_file}, mapped={has_vector_mapping}）")
+                _remove_md5(md5_store_path, md5_hex)
+                existing_md5s.discard(md5_hex)
+            else:
+                results.append({
+                    "filename": file.filename,
+                    "status": "duplicate",
+                    "reason": "文件内容与已有知识库重复，已跳过"
+                })
+                md5s_to_persist.add(md5_hex)
+                logger.info(f"[上传去重] {file.filename} MD5={md5_hex} 已存在，跳过")
+                continue
 
         # --- 保存文件 ---
         safe_name = os.path.basename(file.filename)
@@ -136,6 +230,7 @@ async def upload_documents(
         with open(file_path, "wb") as buf:
             buf.write(content)
 
+        md5s_to_persist.add(md5_hex)
         new_files.append(safe_name)
         results.append({
             "filename": file.filename,
@@ -146,7 +241,18 @@ async def upload_documents(
 
     # 只有存在新文件时才触发后台向量化
     if new_files:
+        _update_ingest_status(
+            session_id,
+            {name: {"status": "processing", "detail": "已接收，排队向量化中"} for name in new_files},
+        )
         background_tasks.add_task(process_document_task, new_files, session_id)
+    # duplicate 文件直接标记 completed（因内容已存在）
+    dup_updates = {}
+    for r in results:
+        if r.get("status") == "duplicate" and r.get("filename"):
+            dup_updates[r["filename"]] = {"status": "completed", "detail": "内容重复，复用已有向量"}
+    if dup_updates:
+        _update_ingest_status(session_id, dup_updates)
 
     accepted = sum(1 for r in results if r["status"] == "accepted")
     duplicate = sum(1 for r in results if r["status"] == "duplicate")
@@ -395,14 +501,20 @@ async def list_documents(session_id: str = Query(default="default")):
     session_data_dir = os.path.join(data_root, session_id)
     md5_store_name = chroma_conf.get('md5_hex_store', '.md5_hex_store')
     md5_store_path = os.path.join(session_data_dir, md5_store_name)
+    status_store_path = os.path.join(session_data_dir, "ingest_status.json")
 
     if not os.path.isdir(session_data_dir):
         return {"code": 200, "files": [], "total": 0}
 
     # 读取已完成向量化的 MD5 集合（用于标记状态）
     embedded_md5s = _load_existing_md5s(md5_store_path)
+    ingest_status = _load_ingest_status(status_store_path)
+    file_vector_map = _load_file_vector_map(session_data_dir)
 
     files = []
+    now = int(time.time())
+    processing_timeout_sec = 600  # 10 分钟未完成则判定为失败，避免永久“处理中”
+    status_changed = False
     for fname in os.listdir(session_data_dir):
         if fname == md5_store_name or fname.startswith('.'):
             continue
@@ -420,19 +532,89 @@ async def list_documents(session_id: str = Query(default="default")):
 
         stat = os.stat(fpath)
         # 检查是否已完成向量化
-        embedded = file_md5 in embedded_md5s
+        # 优先用文件->向量映射判断是否真正入库；旧数据回退到 md5 标记
+        # 注意：历史版本可能没有 file_vector_map，不能因此误判为失败
+        md5_embedded = file_md5 in embedded_md5s
+        embedded = bool(file_vector_map.get(fname)) or md5_embedded
+        state = ingest_status.get(fname, {})
+        status = "completed" if embedded else state.get("status", "processing")
+        detail = state.get("detail", "")
+        updated_at = int(state.get("updated_at", int(stat.st_mtime)))
+
+        # 历史数据修复：若已入库但状态仍为 failed/processing，自动回填 completed
+        if embedded and state.get("status") != "completed":
+            ingest_status[fname] = {
+                "status": "completed",
+                "detail": state.get("detail", "") if state.get("status") == "failed" else "向量化已完成",
+                "updated_at": now,
+            }
+            status = "completed"
+            status_changed = True
+
+        # 兜底：历史遗留文件无状态文件/状态长期不更新，自动从 processing 转 failed
+        if (not embedded) and status == "processing" and (now - updated_at) > processing_timeout_sec:
+            status = "failed"
+            detail = detail or "处理超时或后台任务中断，请重试上传（建议删除后重新上传）"
+            ingest_status[fname] = {
+                "status": status,
+                "detail": detail,
+                "updated_at": now,
+            }
+            status_changed = True
 
         files.append({
             "filename": fname,
             "size": stat.st_size,
             "modified_at": int(stat.st_mtime),
             "embedded": embedded,  # 标记是否已完成向量化
+            "status": status,
+            "detail": detail,
         })
 
     # 按修改时间倒序（最新在前）
     files.sort(key=lambda x: x["modified_at"], reverse=True)
 
+    if status_changed:
+        _save_ingest_status(status_store_path, ingest_status)
+
     return {"code": 200, "files": files, "total": len(files)}
+
+
+@router.post("/retry-failed")
+async def retry_failed_documents(
+    background_tasks: BackgroundTasks,
+    session_id: str = Query(default="default"),
+):
+    """重试当前 session 中标记为 failed 的文件。"""
+    _validate_session_id(session_id)
+    data_root = get_abs_path(chroma_conf['data_path'])
+    session_data_dir = os.path.join(data_root, session_id)
+    status_store_path = os.path.join(session_data_dir, "ingest_status.json")
+
+    if not os.path.isdir(session_data_dir):
+        return {"code": 404, "message": "会话目录不存在", "retry_count": 0}
+
+    status_data = _load_ingest_status(status_store_path)
+    retry_files = []
+    for fname, meta in status_data.items():
+        if meta.get("status") == "failed" and os.path.exists(os.path.join(session_data_dir, fname)):
+            retry_files.append(fname)
+
+    if not retry_files:
+        return {"code": 200, "message": "没有可重试的失败文件", "retry_count": 0}
+
+    _update_ingest_status(
+        session_id,
+        {name: {"status": "processing", "detail": "手动重试中"} for name in retry_files},
+    )
+    background_tasks.add_task(process_document_task, retry_files, session_id)
+    logger.info(f"[重试失败文件] session={session_id}, files={retry_files}")
+    return {
+        "code": 200,
+        "message": f"已提交重试任务：{len(retry_files)} 个文件",
+        "retry_count": len(retry_files),
+        "files": retry_files,
+    }
 
 
 @router.delete("/file/{filename:path}")
@@ -454,6 +636,7 @@ async def delete_file(
     data_root = get_abs_path(chroma_conf['data_path'])
     session_data_dir = os.path.join(data_root, session_id)
     md5_store_path = os.path.join(session_data_dir, chroma_conf['md5_hex_store'])
+    status_store_path = os.path.join(session_data_dir, "ingest_status.json")
     file_path = os.path.join(session_data_dir, decoded_filename)
 
     # 1. 检查文件是否存在
@@ -479,6 +662,11 @@ async def delete_file(
                 md5_lines = [line.strip() for line in f if line.strip() and line.strip() != file_md5]
             with open(md5_store_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(md5_lines) + "\n")
+        # 同步删除状态记录
+        status_data = _load_ingest_status(status_store_path)
+        if decoded_filename in status_data:
+            del status_data[decoded_filename]
+            _save_ingest_status(status_store_path, status_data)
 
         # 6. 刷新 RAG 缓存
         from agent.tools.agent_tools import _rag_cache as rag_cache_ref

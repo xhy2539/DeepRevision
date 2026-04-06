@@ -2,7 +2,7 @@ import os.path
 import asyncio
 import hashlib
 import json
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
@@ -25,7 +25,10 @@ class VectorStoreService():
         self._image_semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_IMAGES)
         _md5 = hashlib.md5(self.session_id.encode("utf-8")).hexdigest()[:16]
         safe_col_name = f"col_{_md5}"
-        
+
+        self.mmr_enabled = chroma_conf.get('mmr_enabled', False)
+        self.mmr_lambda = chroma_conf.get('mmr_lambda', 0.7)
+
         try:
             self.vector_store = Chroma(
                 collection_name=safe_col_name,
@@ -62,25 +65,26 @@ class VectorStoreService():
             except Exception as e:
                 logger.error(f"删除物理目录失败: {e}")
 
-    def get_retriever(self, k: int = None, mmr: bool = False, lambda_mult: float = 0.5):
+    def get_retriever(self, k: int = None, mmr: bool = None, lambda_mult: float = None):
         """
         获取检索器
 
         Args:
             k: 召回数量，默认从配置读取
-            mmr: 是否启用 MMR 多样性检索
-            lambda_mult: MMR 参数，0=最大多样性，1=最大相关性
+            mmr: 是否启用 MMR（默认跟随配置）
+            lambda_mult: MMR 参数（默认跟随配置）
         """
-        search_kwargs = {"k": k or chroma_conf.get('k', 8)}
+        use_mmr = mmr if mmr is not None else self.mmr_enabled
+        lambda_val = lambda_mult if lambda_mult is not None else self.mmr_lambda
+        search_kwargs = {"k": k or chroma_conf.get('retrieve_top_k', 8)}
 
-        if mmr:
-            # MMR 检索：平衡相关性和多样性
+        if use_mmr:
             return self.vector_store.as_retriever(
                 search_type="mmr",
                 search_kwargs={
                     "k": search_kwargs["k"],
-                    "fetch_k": search_kwargs["k"] * 3,  # 获取更多候选
-                    "lambda_mult": lambda_mult
+                    "fetch_k": search_kwargs["k"] * 3,
+                    "lambda_mult": lambda_val
                 }
             )
 
@@ -116,12 +120,14 @@ class VectorStoreService():
             logger.error(f"[删除向量] 删除文件 {filename} 失败: {e}")
             return False
 
-    async def load_document(self):
+    async def load_document(self, target_filenames: Optional[List[str]] = None):
         """
         从数据文件夹读取数据转为向量存入向量库。
         图片描述通过 asyncio.gather 并发调用视觉模型，避免串行阻塞。
         """
         import json as _json
+        result_map = {}
+        target_set = set(target_filenames or [])
 
         def chunk_md5_hex(md5_for_check: str):
             if not os.path.exists(self.session_md5_path):
@@ -204,15 +210,20 @@ class VectorStoreService():
         )
 
         for path in allowed_files_path:
+            fname = os.path.basename(path)
+            if target_set and fname not in target_set:
+                continue
             try:
                 md5_hex = get_file_md5_hex(path)
                 if chunk_md5_hex(md5_hex):
                     logger.info(f"[加载知识库]{path}内容已存在，跳过")
+                    result_map[fname] = {"status": "completed", "detail": "内容已存在，跳过重复向量化"}
                     continue
 
                 documents = await get_file_document(path)
                 if not documents:
                     logger.info(f"[加载知识库]{path}文件内没有有效文本，跳过")
+                    result_map[fname] = {"status": "failed", "detail": "文件内没有可解析文本内容"}
                     continue
 
                 # 并发处理图片（PPT/PDF 中的图片字节暂存在 metadata）
@@ -221,10 +232,10 @@ class VectorStoreService():
                 split_document = self.spliter.split_documents(documents)
                 if not split_document:
                     logger.info(f"[加载知识库]{path}分片内无有效内容，跳过")
+                    result_map[fname] = {"status": "failed", "detail": "文档分片后无有效内容"}
                     continue
 
                 # 为每个 chunk 生成确定性ID（包含文件名），便于后续追踪删除
-                fname = os.path.basename(path)
                 for idx, doc in enumerate(split_document):
                     doc.id = f"vec_{hashlib.md5(fname.encode()).hexdigest()[:8]}_{idx}"
                     doc.metadata["source_filename"] = fname
@@ -235,8 +246,12 @@ class VectorStoreService():
                 update_file_vector_map(fname, doc_ids)
                 save_md5_hex(md5_hex)
                 logger.info(f"[加载知识库]{path}加载成功，共 {len(split_document)} 个chunk")
+                result_map[fname] = {"status": "completed", "detail": f"向量化完成，共{len(split_document)}个片段"}
             except Exception as e:
                 logger.error(f"[加载知识库]{path}加载失败: {e}", exc_info=True)
+                result_map[fname] = {"status": "failed", "detail": f"解析失败: {str(e)}"}
+
+        return result_map
 
 
 if __name__ == '__main__':
@@ -249,4 +264,4 @@ if __name__ == '__main__':
         for doc in res:
             print(doc.page_content)
             print("-" * 20)
-    asyncio.run(test())
+    asyncio.run(test())

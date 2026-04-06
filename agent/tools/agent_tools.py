@@ -1,4 +1,5 @@
 import json
+from typing import Optional
 
 from langchain_core.tools import tool
 from rag.rag_service import RagSummarizeService
@@ -31,6 +32,11 @@ async def _get_rag() -> RagSummarizeService:
         logger.info(f"[RAG] 为 session [{sid}] 初始化新的 RagSummarizeService")
         _rag_cache[sid] = RagSummarizeService()
     return _rag_cache[sid]
+
+
+async def get_rag_service() -> RagSummarizeService:
+    """对外暴露 session 级 RAG 实例获取函数。"""
+    return await _get_rag()
 
 
 # ==================== 工具定义 ====================
@@ -126,9 +132,6 @@ async def generate_exam_paper(
     total_questions: int = 10,
     sample_paper_context: str = None,
 ) -> str:
-    """
-    试卷生成（fix #3：改为 async tool）
-    """
     topic_list = [t.strip() for t in topics.split(",")]
     quiz_type_list = [q.strip() for q in quiz_types.split(",")]
 
@@ -137,10 +140,69 @@ async def generate_exam_paper(
     return await run_exam_agent(topic_list, quiz_type_list, total_questions, sample_paper_context)
 
 
+@tool(description='查看学生的练习历史记录，包括之前的答题情况、正确答案和错因分析。用于了解学生对知识点的掌握情况。')
+@timer_and_token_logger
+async def get_practice_history(session_id: Optional[str] = None, limit: int = 20) -> str:
+    from utils.memory_service import memory_manager
+    sid = session_id or current_session_id.get() or "default"
+    history = memory_manager.get_practice_history(sid, limit)
+    if not history:
+        return "暂无练习记录"
+
+    lines = ["【练习历史】"]
+    for i, h in enumerate(history, 1):
+        status = "✓" if h["is_correct"] else "✗"
+        kp = h["knowledge_point"] or "未标注"
+        lines.append(f"{i}. {status} {kp} | 你的答案:{h['user_answer']} | 正确答案:{h['correct_answer']}")
+        if h["wrong_reason"]:
+            lines.append(f"   错因: {h['wrong_reason']}")
+    return "\n".join(lines)
+
+
+@tool(description='分析学生错题原因。需要传入题目、学生的答案和正确答案。返回错因分类和详细分析。')
+@timer_and_token_logger
+async def analyze_wrong_reason(question: str, user_answer: str, correct_answer: str) -> str:
+    from model.factory import chat_model
+    from langchain_core.messages import HumanMessage
+
+    prompt = f"""分析学生错题原因，返回JSON格式：
+{{"reason": "概念不清|计算错误|审题错误|粗心大意|完全不会", "analysis": "详细分析"}}
+
+题目：{question}
+学生答案：{user_answer}
+正确答案：{correct_answer}
+
+只返回JSON，不要其他内容。"""
+
+    response = await chat_model.ainvoke([HumanMessage(content=prompt)])
+    return response.content.strip()
+
+
+@tool(description='搜相似题目。当学生需要针对某个知识点做更多练习时，搜索题库中相似的题目。')
+@timer_and_token_logger
+async def search_similar_questions_tool(question: str, knowledge_point: str, limit: int = 3) -> str:
+    from utils.memory_service import memory_manager
+    from utils.session_context import current_session_id
+
+    sid = current_session_id.get() or "default"
+    results = memory_manager.search_similar_questions(question, knowledge_point, limit)
+
+    if not results:
+        return "题库中没有找到相似的题目"
+
+    lines = ["【相似题推荐】"]
+    for i, q in enumerate(results, 1):
+        kp = q.get("knowledge_point", "未标注")
+        lines.append(f"{i}. [{kp}] {q['question_content']}")
+        if q.get("answer"):
+            lines.append(f"   答案: {q['answer']}")
+    return "\n".join(lines)
+
+
 # 动态生成工具列表（根据配置开关）
 def _build_tools():
     """根据配置动态生成工具列表"""
-    tool_list = [search_courseware, generate_quiz, generate_exam_paper]
+    tool_list = [search_courseware, generate_quiz, generate_exam_paper, get_practice_history, analyze_wrong_reason, search_similar_questions_tool]
 
     if WEB_SEARCH_ENABLED:
         tool_list.append(web_search)

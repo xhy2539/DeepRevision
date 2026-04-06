@@ -4,7 +4,8 @@ from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 from api.routers import knowledge, chat, auth, exam_export
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+from utils.memory_service import memory_manager
 
 # 项目根目录
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -35,6 +36,34 @@ async def index_ui():
 @app.get("/app", summary="打开复习引擎主界面")
 async def app_ui():
     return FileResponse("static/index.html")
+
+
+@app.get("/health", summary="健康检查")
+async def health_check():
+    try:
+        sessions = memory_manager.get_all_sessions()
+        vector_status = "unknown"
+        vector_collections = 0
+        try:
+            chroma_path = os.path.join(os.getcwd(), "data", "chroma_db")
+            if os.path.exists(chroma_path):
+                vector_status = "ready"
+                vector_collections = len(os.listdir(chroma_path)) if os.path.isdir(chroma_path) else 0
+        except Exception:
+            vector_status = "error"
+
+        return {
+            "status": "healthy",
+            "sessions_count": len(sessions),
+            "vector_store": vector_status,
+            "vector_collections": vector_collections,
+            "model": "dashscope"
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={
+            "status": "unhealthy",
+            "error": str(e)
+        })
 
 if __name__ == "__main__":
     import uvicorn

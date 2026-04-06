@@ -8,16 +8,40 @@ import remarkGfm from "remark-gfm";
 import ExamCanvas, { isExamContent } from "@/components/ExamCanvas";
 
 // Types
+type MessageKind = "chat" | "quiz_set" | "exam_paper";
+
+interface QuizQuestion {
+  type: string;
+  question: string;
+  options?: string[];
+  answer: string;
+  explanation: string;
+  score?: string;
+  difficulty?: string;
+}
+
+interface AssistantPayload {
+  title?: string;
+  show_answers_default?: boolean;
+  show_analysis_default?: boolean;
+  questions?: QuizQuestion[];
+  exam_data?: unknown;
+}
+
 interface Message {
   id: string;
   role: "user" | "assistant";
   content: string;
   timestamp: number;
+  kind?: MessageKind;
+  render_mode?: "markdown" | "interactive_cards" | "exam_canvas";
+  payload?: AssistantPayload;
 }
 
 interface Session {
   id: string;
   name: string;
+  parent_id?: string;
 }
 
 interface KnowledgeFile {
@@ -25,6 +49,8 @@ interface KnowledgeFile {
   size: number;
   modified_at: number;
   embedded?: boolean;  // 是否已完成向量化
+  status?: "processing" | "completed" | "failed";
+  detail?: string;
 }
 
 // ============== 设计系统 ==============
@@ -54,57 +80,138 @@ function ThoughtChain({ thoughts }: { thoughts: string[] }) {
 // ============== Markdown 渲染组件 ==============
 function parseQuizContent(content: string): {
   isQuiz: boolean;
-  questions: Array<{ type: string; question: string; options?: string[]; answer: string; explanation: string }>;
+  questions: QuizQuestion[];
 } {
-  const questions: Array<{ type: string; question: string; options?: string[]; answer: string; explanation: string }> = [];
+  const questions: QuizQuestion[] = [];
 
-  const choiceMatch = content.match(/【选择题】|一、选择题|1\./g);
-  const fillMatch = content.match(/【填空题】|二、填空题/g);
-  const judgeMatch = content.match(/【判断题】|三、判断题/g);
+  const parseInlineOptions = (text: string): { question: string; options: string[] } => {
+    const match = text.match(/^(.*?)(?=\s+[A-D][.、]\s*)/);
+    if (!match) {
+      return { question: text.trim(), options: [] };
+    }
 
-  if (choiceMatch || fillMatch || judgeMatch) {
-    const lines = content.split("\n");
-    let currentType = "选择题";
-    let currentQuestion = "";
+    const question = match[1].trim();
+    const optionPart = text.slice(match[0].length).trim();
+    const optionMatches = optionPart.match(/[A-D][.、]\s*.*?(?=(?:\s+[A-D][.、]\s*)|$)/g) || [];
+    return {
+      question,
+      options: optionMatches.map(opt => opt.trim()),
+    };
+  };
+
+  // 检查是否包含题型标记（支持新旧两种格式）
+  // 新格式：1.（选择题，分值：5分，难度：中等）
+  // 旧格式：【选择题】
+  const hasNewFormat = /\（选择题，|\（填空题，|\（判断题，|\（简答题，/.test(content);
+  const hasOldFormat = /【选择题】|【填空题】|【判断题】|【简答题】/.test(content);
+  const hasInlineOptions = /[A-D][.、][\s\S]*[A-D][.、][\s\S]*/.test(content);
+
+  if (!hasNewFormat && !hasOldFormat && !hasInlineOptions) {
+    return { isQuiz: false, questions: [] };
+  }
+
+  // 分割每道题（统一按编号分段）
+  const questionBlocks = content.split(/(?=^\d+\.)/gm);
+
+  for (const block of questionBlocks) {
+    const trimmed = block.trim();
+    if (!trimmed || !/^\d+\./.test(trimmed)) continue;
+
+    const lines = trimmed.split("\n");
+    let questionText = "";
     let options: string[] = [];
     let answer = "";
     let explanation = "";
+    let score = "";
+    let difficulty = "";
+    let currentType = "选择题";  // 默认题型
+    let inExplanation = false;  // 标记是否已进入解析区域
 
     for (const line of lines) {
-      const trimmed = line.trim();
+      const trimmedLine = line.trim();
+      if (!trimmedLine) continue;
 
-      if (trimmed.includes("选择题")) {
-        currentType = "选择题";
-        continue;
-      } else if (trimmed.includes("填空题")) {
-        currentType = "填空题";
-        continue;
-      } else if (trimmed.includes("判断题")) {
-        currentType = "判断题";
+      // 解析元数据：1.（选择题，分值：5分，难度：中等）
+      const metaMatch = trimmedLine.match(/^\d+\.\s*（([^）]+)/);
+      if (metaMatch) {
+        const meta = metaMatch[1];
+        // 解析题型
+        if (meta.includes("选择题")) currentType = "选择题";
+        else if (meta.includes("填空题")) currentType = "填空题";
+        else if (meta.includes("判断题")) currentType = "判断题";
+        else if (meta.includes("简答题")) currentType = "简答题";
+        // 解析分值
+        const scoreMatch = meta.match(/分值[：:]?\s*(\d+)分/);
+        // 解析难度
+        const diffMatch = meta.match(/难度[：:]?\s*([^，,，]+)/);
+        if (scoreMatch) score = scoreMatch[1] + "分";
+        if (diffMatch) difficulty = diffMatch[1].trim();
+        inExplanation = false;
         continue;
       }
 
-      if (/^\d+[.、]/.test(trimmed)) {
-        if (currentQuestion) {
-          questions.push({ type: currentType, question: currentQuestion, options: options.length > 0 ? options : undefined, answer, explanation });
+      // 选项（A. B. C. D.）
+      if (/^[A-D][.、]/.test(trimmedLine)) {
+        options.push(trimmedLine);
+        inExplanation = false;
+      }
+      // 答案行
+      else if (trimmedLine.startsWith("答案：") || trimmedLine.startsWith("答案:")) {
+        answer = trimmedLine.replace(/^答案[：:]\s*/, "");
+        inExplanation = true;  // 答案之后的内容属于解析
+      }
+      // 解析行（单独一行）
+      else if (trimmedLine.startsWith("解析：") || trimmedLine.startsWith("解析:")) {
+        explanation = trimmedLine.replace(/^解析[：:]\s*/, "");
+        inExplanation = true;
+      }
+      // 跳过题型标题（旧格式）
+      else if (trimmedLine.includes("【") && trimmedLine.includes("】")) {
+        continue;
+      }
+      // 如果已进入解析区域，后续行追加到解析
+      else if (inExplanation && trimmedLine) {
+        explanation += (explanation ? "\n" : "") + trimmedLine;
+      }
+      // 行内选项
+      else if (/\s+[A-D][.、]\s*/.test(trimmedLine)) {
+        const parsed = parseInlineOptions(trimmedLine);
+        if (parsed.question) {
+          questionText += (questionText ? "\n" : "") + parsed.question;
         }
-        currentQuestion = trimmed.replace(/^\d+[.、]\s*/, "");
-        options = [];
-        answer = "";
-        explanation = "";
-      } else if (/^[A-D][.、、]/.test(trimmed) && currentType === "选择题") {
-        options.push(trimmed);
-      } else if (trimmed.includes("答案") || trimmed.includes("答案：")) {
-        answer = trimmed.replace(/.*答案[：:]\s*/, "");
-      } else if (trimmed.includes("解析") || trimmed.includes("解析：") || trimmed.includes("解释")) {
-        explanation = trimmed.replace(/.*解析[：:]\s*/, "");
-      } else if (currentQuestion && !trimmed.includes("【")) {
-        currentQuestion += "\n" + trimmed;
+        if (parsed.options.length > 0) {
+          options.push(...parsed.options);
+        }
+      }
+      // 其他行视为题目内容
+      else if (trimmedLine) {
+        questionText += (questionText ? "\n" : "") + trimmedLine;
       }
     }
 
-    if (currentQuestion) {
-      questions.push({ type: currentType, question: currentQuestion, options: options.length > 0 ? options : undefined, answer, explanation });
+    if (questionText) {
+      questions.push({
+        type: currentType,
+        question: questionText,
+        options: options.length > 0 ? options : undefined,
+        answer,
+        explanation,
+        score,
+        difficulty
+      });
+    }
+  }
+
+  if (questions.length === 0 && hasInlineOptions) {
+    const inlineParsed = parseInlineOptions(content.replace(/^\d+[.、]\s*/, "").trim());
+    if (inlineParsed.question && inlineParsed.options.length >= 2) {
+      questions.push({
+        type: "选择题",
+        question: inlineParsed.question,
+        options: inlineParsed.options,
+        answer: "",
+        explanation: "",
+      });
     }
   }
 
@@ -119,9 +226,27 @@ const quizTypeStyles: Record<string, { tag: string; border: string; bg: string }
   "简答题": { tag: "quiz-tag-short", border: "border-l-purple-500", bg: "bg-purple-50" },
 };
 
-function QuizCard({ questions }: { questions: Array<{ type: string; question: string; options?: string[]; answer: string; explanation: string }> }) {
+function QuizCard({
+  questions,
+  defaultShowAnswers = false,
+}: {
+  questions: QuizQuestion[];
+  defaultShowAnswers?: boolean;
+}) {
+  const [showAnswers, setShowAnswers] = useState(defaultShowAnswers);
+
   return (
     <div className="space-y-4 my-4">
+      {/* 答案显示控制按钮 */}
+      <div className="flex justify-end mb-2">
+        <button
+          onClick={() => setShowAnswers(!showAnswers)}
+          className="text-sm px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-600 transition-colors flex items-center gap-1"
+        >
+          <span>{showAnswers ? "👁 隐藏答案" : "👁 查看答案"}</span>
+        </button>
+      </div>
+
       {questions.map((q, idx) => {
         const style = quizTypeStyles[q.type] || quizTypeStyles["选择题"];
         return (
@@ -135,7 +260,19 @@ function QuizCard({ questions }: { questions: Array<{ type: string; question: st
                 <span className={`text-xs px-2.5 py-1 rounded-full font-medium border ${style.tag}`}>{q.type}</span>
                 <span className="text-sm font-medium text-slate-500">第 {idx + 1} 题</span>
               </div>
-              <div className="w-2 h-2 rounded-full bg-teal-500"></div>
+              <div className="flex items-center gap-3">
+                {q.score && (
+                  <span className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-medium">{q.score}</span>
+                )}
+                {q.difficulty && (
+                  <span className={`text-xs px-2 py-0.5 rounded font-medium ${
+                    q.difficulty === '简单' ? 'bg-green-100 text-green-700' :
+                    q.difficulty === '中等' ? 'bg-yellow-100 text-yellow-700' :
+                    ['较难', '困难'].includes(q.difficulty) ? 'bg-red-100 text-red-700' :
+                    'bg-slate-100 text-slate-600'
+                  }`}>{q.difficulty}</span>
+                )}
+              </div>
             </div>
 
             <div className="text-slate-800 mb-4 whitespace-pre-wrap text-[15px] leading-relaxed font-medium">{q.question}</div>
@@ -153,7 +290,7 @@ function QuizCard({ questions }: { questions: Array<{ type: string; question: st
               </div>
             )}
 
-            {q.answer && (
+            {showAnswers && q.answer && (
               <div className={`${style.bg} ${style.border} border-l-4 rounded-r-lg p-3 mb-3`}>
                 <div className="flex items-center gap-2 mb-1">
                   <svg className="w-4 h-4 text-teal-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -165,7 +302,7 @@ function QuizCard({ questions }: { questions: Array<{ type: string; question: st
               </div>
             )}
 
-            {q.explanation && (
+            {showAnswers && q.explanation && (
               <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
                 <div className="flex items-center gap-2 mb-1">
                   <svg className="w-4 h-4 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -183,7 +320,81 @@ function QuizCard({ questions }: { questions: Array<{ type: string; question: st
   );
 }
 
-function MarkdownContent({ content, onRequestAnswers }: { content: string; onRequestAnswers?: () => void }) {
+function MarkdownContent({
+  content,
+  kind,
+  payload,
+  onRequestAnswers,
+}: {
+  content: string;
+  kind?: MessageKind;
+  payload?: AssistantPayload;
+  onRequestAnswers?: () => void;
+}) {
+  const parsedQuiz = parseQuizContent(content);
+
+  if (kind === "exam_paper") {
+    return (
+      <ExamCanvas
+        examContent={content}
+        examDataOverride={payload?.exam_data}
+        courseName={payload?.title || "期末考试"}
+        onRequestAnswers={onRequestAnswers}
+      />
+    );
+  }
+
+  if (kind === "quiz_set") {
+    const questions = payload?.questions && payload.questions.length > 0
+      ? payload.questions
+      : parsedQuiz.questions;
+    if (questions.length > 0) {
+      return <QuizCard questions={questions} defaultShowAnswers={payload?.show_answers_default} />;
+    }
+  }
+
+  if (kind === "chat" && !parsedQuiz.isQuiz) {
+    return (
+      <div className="prose-custom">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          h1: ({ children }) => <h1 className="text-2xl font-bold my-4 text-slate-900">{children}</h1>,
+          h2: ({ children }) => <h2 className="text-xl font-bold my-3 text-slate-800">{children}</h2>,
+          h3: ({ children }) => <h3 className="text-lg font-semibold my-2 text-slate-800">{children}</h3>,
+          p: ({ children }) => <p className="my-3 leading-relaxed text-slate-700">{children}</p>,
+          ul: ({ children }) => <ul className="list-disc pl-6 my-3 space-y-1">{children}</ul>,
+          ol: ({ children }) => <ol className="list-decimal pl-6 my-3 space-y-1">{children}</ol>,
+          li: ({ children }) => <li className="text-slate-700">{children}</li>,
+          strong: ({ children }) => <strong className="font-semibold text-slate-900">{children}</strong>,
+          code: ({ children, className }) => {
+            const isInline = !className;
+            if (isInline) {
+              return <code className="bg-slate-100 px-1.5 py-0.5 rounded text-sm font-mono text-teal-700 border border-slate-200">{children}</code>;
+            }
+            return (
+              <pre className="bg-slate-900 text-slate-100 p-4 rounded-lg overflow-x-auto my-4 text-sm font-mono">
+                <code>{children}</code>
+              </pre>
+            );
+          },
+          table: ({ children }) => (
+            <div className="overflow-x-auto my-4">
+              <table className="min-w-full border-collapse border border-slate-300">{children}</table>
+            </div>
+          ),
+          th: ({ children }) => <th className="border border-slate-300 bg-slate-100 px-4 py-2 text-left text-sm font-semibold">{children}</th>,
+          td: ({ children }) => <td className="border border-slate-300 px-4 py-2 text-sm">{children}</td>,
+          blockquote: ({ children }) => <blockquote className="border-l-4 border-teal-500 pl-4 my-3 text-slate-600 italic">{children}</blockquote>,
+          hr: () => <hr className="my-6 border-slate-300" />,
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+      </div>
+    );
+  }
+
   // 检测是否为试卷格式，使用 Canvas 渲染
   if (isExamContent(content)) {
     // 直接使用 ExamCanvas 渲染，它内部会处理解析失败的情况
@@ -192,8 +403,10 @@ function MarkdownContent({ content, onRequestAnswers }: { content: string; onReq
   }
 
   // 尝试用简单方式解析题目
-  const { isQuiz, questions } = parseQuizContent(content);
-  if (isQuiz && questions.length > 0) {
+  if (parsedQuiz.isQuiz && parsedQuiz.questions.length > 0) {
+    const questions = payload?.questions && payload.questions.length > 0
+      ? payload.questions
+      : parsedQuiz.questions;
     return <QuizCard questions={questions} />;
   }
 
@@ -324,13 +537,19 @@ function KnowledgePanel({
             const listData = await listRes.json();
             console.log("[轮询] 文件列表:", listData);
             if (listData.files && listData.files.length > 0) {
-              const completedCount = listData.files.filter((f: KnowledgeFile) => f.embedded === true).length;
+              const completedCount = listData.files.filter(
+                (f: KnowledgeFile) => f.status === "completed" || f.embedded === true
+              ).length;
+              const failedCount = listData.files.filter((f: KnowledgeFile) => f.status === "failed").length;
+              const processingCount = listData.files.filter(
+                (f: KnowledgeFile) => f.status === "processing" || (f.status == null && f.embedded === false)
+              ).length;
               const totalCount = listData.files.length;
               console.log("[轮询] 完成:", completedCount, "/", totalCount);
-              if (completedCount < totalCount) {
-                setUploadStatus(`向量化中... ${completedCount}/${totalCount} 个文件已完成`);
+              if (processingCount > 0) {
+                setUploadStatus(`向量化中... 完成${completedCount}/${totalCount}，失败${failedCount}个`);
               } else {
-                setUploadStatus("向量化完成！");
+                setUploadStatus(failedCount > 0 ? `向量化结束：完成${completedCount}，失败${failedCount}` : "向量化完成！");
                 clearInterval(pollInterval);
                 setActiveTab("list");
                 setTimeout(() => setUploadStatus(""), 2000);
@@ -357,6 +576,25 @@ function KnowledgePanel({
       setUploadStatus("上传失败: " + error);
     } finally {
       setIsUploading(false);
+    }
+  };
+
+  const handleRetryFailed = async () => {
+    if (!sessionId) return;
+    setUploadStatus("正在提交失败文件重试任务...");
+    try {
+      const res = await fetch(`/api/knowledge/retry-failed?session_id=${encodeURIComponent(sessionId)}`, {
+        method: "POST",
+      });
+      const data = await res.json();
+      if (!res.ok || data.code !== 200) {
+        setUploadStatus(data.message || "重试提交失败");
+        return;
+      }
+      setUploadStatus(data.retry_count > 0 ? `已提交重试任务：${data.retry_count} 个文件` : "没有可重试的失败文件");
+      await fetchFiles();
+    } catch (error) {
+      setUploadStatus("重试提交失败: " + error);
     }
   };
 
@@ -537,7 +775,10 @@ function KnowledgePanel({
           <div className="flex flex-col max-h-80">
             <div className="px-6 pt-4 pb-2 flex items-center justify-between">
               <span className="text-xs font-mono text-slate-400">按上传时间倒序</span>
-              <button onClick={fetchFiles} className="text-xs font-mono text-teal-600 hover:underline">刷新</button>
+              <div className="flex items-center gap-3">
+                <button onClick={handleRetryFailed} className="text-xs font-mono text-amber-600 hover:underline">重试失败</button>
+                <button onClick={fetchFiles} className="text-xs font-mono text-teal-600 hover:underline">刷新</button>
+              </div>
             </div>
             <ul className="flex-1 overflow-y-auto divide-y divide-slate-100">
               {files.length === 0 ? (
@@ -562,9 +803,21 @@ function KnowledgePanel({
                         <p className="truncate text-xs font-medium text-slate-800">{file.filename}</p>
                         <p className="text-xs font-mono text-slate-400">
                           {formatBytes(file.size)} · {dateStr}
-                          {file.embedded === false && <span className="text-amber-500 ml-1">（处理中）</span>}
-                          {file.embedded === true && <span className="text-green-500 ml-1">✓</span>}
+                          {(file.status === "processing" || (file.status == null && file.embedded === false)) && (
+                            <span className="text-amber-500 ml-1">（处理中）</span>
+                          )}
+                          {(file.status === "completed" || file.embedded === true) && (
+                            <span className="text-green-500 ml-1">✓</span>
+                          )}
+                          {file.status === "failed" && (
+                            <span className="text-red-500 ml-1">（失败）</span>
+                          )}
                         </p>
+                        {file.status === "failed" && file.detail && (
+                          <p className="text-[11px] text-red-500 mt-0.5 truncate" title={file.detail}>
+                            {file.detail}
+                          </p>
+                        )}
                       </div>
                     </li>
                   );
@@ -640,23 +893,58 @@ function SessionModal({
   sessions,
   currentSession,
   onSelect,
-  onCreate
+  onCreate,
+  onDelete,
+  onRename
 }: {
   isOpen: boolean;
   onClose: () => void;
   sessions: Session[];
   currentSession: string;
   onSelect: (id: string) => void;
-  onCreate: (name: string) => void;
+  onCreate: (name: string, parentId?: string) => void;
+  onDelete: (id: string) => void;
+  onRename: (id: string, newName: string) => void;
 }) {
   const [newName, setNewName] = useState("");
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingName, setEditingName] = useState("");
+  const [isCreatingBranch, setIsCreatingBranch] = useState(false);
+  const [branchParentId, setBranchParentId] = useState<string | null>(null);
 
   if (!isOpen) return null;
 
   const handleCreate = () => {
     if (newName.trim()) {
-      onCreate(newName.trim());
+      onCreate(newName.trim(), branchParentId || undefined);
       setNewName("");
+      setIsCreatingBranch(false);
+      setBranchParentId(null);
+    }
+  };
+
+  const startCreateBranch = (parentId: string) => {
+    setIsCreatingBranch(true);
+    setBranchParentId(parentId);
+    setNewName("");
+  };
+
+  const startRename = (session: Session) => {
+    setEditingId(session.id);
+    setEditingName(session.name);
+  };
+
+  const handleRename = () => {
+    if (editingId && editingName.trim()) {
+      onRename(editingId, editingName.trim());
+      setEditingId(null);
+      setEditingName("");
+    }
+  };
+
+  const handleDelete = (id: string) => {
+    if (confirm("确定删除该会话？此操作不可恢复。")) {
+      onDelete(id);
     }
   };
 
@@ -672,36 +960,120 @@ function SessionModal({
           </button>
         </div>
         <div className="p-4">
-          <div className="flex gap-2 mb-4">
-            <input
-              type="text"
-              value={newName}
-              onChange={e => setNewName(e.target.value)}
-              onKeyDown={e => e.key === "Enter" && handleCreate()}
-              placeholder="新科目名称 (如：Math-101)"
-              className="flex-1 text-sm border border-slate-200 rounded-md px-3 py-2 focus:outline-none focus:border-teal-500 focus:ring-1 focus:ring-teal-500 font-mono"
-            />
-            <button
-              onClick={handleCreate}
-              className="px-3 py-2 bg-slate-900 text-white text-xs font-bold rounded-md hover:bg-teal-600 transition-colors"
-            >
-              创建
-            </button>
-          </div>
+          {isCreatingBranch ? (
+            <div className="mb-4 p-3 bg-teal-50 border border-teal-200 rounded-lg">
+              <p className="text-xs text-teal-600 mb-2 font-medium">正在创建分支...</p>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={newName}
+                  onChange={e => setNewName(e.target.value)}
+                  onKeyDown={e => {
+                    if (e.key === "Enter") handleCreate();
+                    if (e.key === "Escape") { setIsCreatingBranch(false); setBranchParentId(null); }
+                  }}
+                  placeholder="分支名称 (如：进程调度复习)"
+                  className="flex-1 text-sm border border-teal-400 rounded-md px-3 py-2 focus:outline-none focus:ring-1 focus:ring-teal-500 font-mono"
+                  autoFocus
+                />
+                <button
+                  onClick={handleCreate}
+                  className="px-3 py-2 bg-teal-600 text-white text-xs font-bold rounded-md hover:bg-teal-700 transition-colors"
+                >
+                  创建分支
+                </button>
+                <button
+                  onClick={() => { setIsCreatingBranch(false); setBranchParentId(null); setNewName(""); }}
+                  className="px-3 py-2 bg-slate-100 text-slate-600 text-xs font-medium rounded-md hover:bg-slate-200 transition-colors"
+                >
+                  取消
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="flex gap-2 mb-4">
+              <input
+                type="text"
+                value={newName}
+                onChange={e => setNewName(e.target.value)}
+                onKeyDown={e => e.key === "Enter" && handleCreate()}
+                placeholder="新科目名称 (如：Math-101)"
+                className="flex-1 text-sm border border-slate-200 rounded-md px-3 py-2 focus:outline-none focus:border-teal-500 focus:ring-1 focus:ring-teal-500 font-mono"
+              />
+              <button
+                onClick={handleCreate}
+                className="px-3 py-2 bg-slate-900 text-white text-xs font-bold rounded-md hover:bg-teal-600 transition-colors"
+              >
+                创建
+              </button>
+            </div>
+          )}
           <div className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-2 px-1">活跃的复习会话</div>
           <ul className="space-y-1 font-mono text-sm max-h-60 overflow-y-auto">
             {sessions.map(session => (
-              <li key={session.id}>
-                <button
-                  onClick={() => { onSelect(session.id); onClose(); }}
-                  className={`w-full text-left px-3 py-2 rounded-md transition-colors ${
+              <li key={session.id} className="group">
+                {editingId === session.id ? (
+                  <div className="flex gap-1 items-center">
+                    <input
+                      type="text"
+                      value={editingName}
+                      onChange={e => setEditingName(e.target.value)}
+                      onKeyDown={e => {
+                        if (e.key === "Enter") handleRename();
+                        if (e.key === "Escape") setEditingId(null);
+                      }}
+                      className="flex-1 text-sm border border-teal-400 rounded px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-teal-500 font-mono"
+                      autoFocus
+                    />
+                    <button onClick={handleRename} className="p-1.5 text-teal-600 hover:bg-teal-50 rounded" title="确认">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                    </button>
+                    <button onClick={() => setEditingId(null)} className="p-1.5 text-slate-400 hover:bg-slate-100 rounded" title="取消">
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                    </button>
+                  </div>
+                ) : (
+                  <div className={`flex items-center justify-between px-3 py-2 rounded-md transition-colors ${
                     currentSession === session.id
                       ? "bg-teal-50 text-teal-700 border border-teal-200"
                       : "hover:bg-slate-100 text-slate-700"
-                  }`}
-                >
-                  {session.name}
-                </button>
+                  }`}>
+                    <div className="flex items-center gap-2 flex-1 min-w-0">
+                      {session.parent_id && (
+                        <span className="text-xs text-slate-400 font-mono">↳</span>
+                      )}
+                      <button
+                        onClick={() => { onSelect(session.id); onClose(); }}
+                        className="flex-1 text-left truncate"
+                      >
+                        {session.name}
+                      </button>
+                    </div>
+                    <div className="hidden group-hover:flex items-center gap-1 ml-2">
+                      <button
+                        onClick={(e) => { e.stopPropagation(); startCreateBranch(session.id); }}
+                        className="p-1 text-slate-400 hover:text-teal-600 hover:bg-teal-50 rounded"
+                        title="创建分支"
+                      >
+                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2M8 7H6a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2v-2" /></svg>
+                      </button>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); startRename(session); }}
+                        className="p-1 text-slate-400 hover:text-teal-600 hover:bg-slate-200 rounded"
+                        title="重命名"
+                      >
+                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>
+                      </button>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); handleDelete(session.id); }}
+                        className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded"
+                        title="删除"
+                      >
+                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                      </button>
+                    </div>
+                  </div>
+                )}
               </li>
             ))}
           </ul>
@@ -796,7 +1168,9 @@ export default function ChatPage() {
       id: assistantMessageId,
       role: "assistant",
       content: "",
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      kind: "chat",
+      render_mode: "markdown",
     }]);
 
     try {
@@ -825,7 +1199,53 @@ export default function ChatPage() {
 
               try {
                 const parsed = JSON.parse(data);
+                if (parsed.error) {
+                  // 后端返回的错误，替换现有内容
+                  setMessages(prev => prev.map(m =>
+                    m.id === assistantMessageId ? { ...m, content: `[系统提示: ${parsed.error}]` } : m
+                  ));
+                  break;  // 退出流式读取
+                }
+                if (parsed.event === "start" && parsed.message) {
+                  setMessages(prev => prev.map(m =>
+                    m.id === assistantMessageId
+                      ? {
+                          ...m,
+                          kind: parsed.message.kind || "chat",
+                          render_mode: parsed.message.render_mode || "markdown",
+                        }
+                      : m
+                  ));
+                  continue;
+                }
+                if (parsed.event === "delta" && parsed.text) {
+                  fullContent += parsed.text;
+                  setMessages(prev => prev.map(m =>
+                    m.id === assistantMessageId ? { ...m, content: fullContent } : m
+                  ));
+                  continue;
+                }
+                if (parsed.event === "complete" && parsed.message) {
+                  const message = parsed.message;
+                  fullContent = message.content || fullContent;
+                  setMessages(prev => prev.map(m =>
+                    m.id === assistantMessageId
+                      ? {
+                          ...m,
+                          content: message.content || fullContent,
+                          kind: message.kind || "chat",
+                          render_mode: message.render_mode || "markdown",
+                          payload: message.payload,
+                        }
+                      : m
+                  ));
+                  continue;
+                }
                 if (parsed.text) {
+                  // 跳过 think 标签内容
+                  if (parsed.text.trim().startsWith("<think>")) {
+                    continue;
+                  }
                   // 检测系统思考
                   if (parsed.text.includes("**[系统思考")) {
                     const match = parsed.text.match(/\*\*(.*?)\*\*/);
@@ -840,7 +1260,7 @@ export default function ChatPage() {
                     ));
                   }
                 }
-              } catch {
+              } catch (e) {
                 // 忽略解析错误
               }
             }
@@ -853,8 +1273,9 @@ export default function ChatPage() {
       setTotalTokens(prev => prev + Math.ceil(fullContent.length / 4));
     } catch (error) {
       console.error("Chat error:", error);
+      const errorMessage = error instanceof Error ? error.message : String(error);
       setMessages(prev => prev.map(m =>
-        m.id === assistantMessageId ? { ...m, content: "请求失败，请稍后重试。" } : m
+        m.id === assistantMessageId ? { ...m, content: `请求失败: ${errorMessage}` } : m
       ));
     } finally {
       setIsLoading(false);
@@ -882,31 +1303,64 @@ export default function ChatPage() {
   }, [fetchTokenStats]);
 
   // 创建会话
-  const createSession = async (name: string) => {
+  const createSession = async (name: string, parentId?: string) => {
+    const sessionId = parentId ? `${parentId}_sub_${Date.now()}` : name;
     try {
       const res = await fetch("/api/chat/session", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: name, name })
+        body: JSON.stringify({ session_id: sessionId, name, parent_id: parentId })
       });
       const data = await res.json();
       if (data.code === 200) {
-        const newSession = { id: name, name };
+        const newSession = { id: sessionId, name, parent_id: parentId };
         setSessions(prev => [...prev, newSession]);
-        setCurrentSession(name);
+        setCurrentSession(sessionId);
         setCurrentSessionName(name);
         setMessages([]);
         setThoughts([]);
       }
     } catch (error) {
       console.error("Create session error:", error);
-      // 即使 API 失败也创建本地会话
-      const newSession = { id: name, name };
+      const newSession = { id: sessionId, name, parent_id: parentId };
       setSessions(prev => [...prev, newSession]);
-      setCurrentSession(name);
+      setCurrentSession(sessionId);
       setCurrentSessionName(name);
       setMessages([]);
       setThoughts([]);
+    }
+  };
+
+  // 删除会话
+  const deleteSession = async (id: string) => {
+    try {
+      await fetch(`/api/chat/session/${id}`, { method: "DELETE" });
+    } catch (error) {
+      console.error("Delete session error:", error);
+    }
+    setSessions(prev => prev.filter(s => s.id !== id));
+    if (currentSession === id) {
+      setCurrentSession("default");
+      setCurrentSessionName("默认科目");
+      setMessages([]);
+      setThoughts([]);
+    }
+  };
+
+  // 重命名会话
+  const renameSession = async (id: string, newName: string) => {
+    try {
+      await fetch(`/api/chat/session/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ new_name: newName })
+      });
+    } catch (error) {
+      console.error("Rename session error:", error);
+    }
+    setSessions(prev => prev.map(s => s.id === id ? { ...s, name: newName } : s));
+    if (currentSession === id) {
+      setCurrentSessionName(newName);
     }
   };
 
@@ -1049,7 +1503,7 @@ export default function ChatPage() {
 
               {messages.map((message, idx) => (
                 <div
-                  key={message.id}
+                  key={`${message.id}-${idx}`}
                   className={`w-full flex items-start gap-4 message-enter ${message.role === "user" ? "flex-row-reverse" : ""}`}
                   style={{ animationDelay: `${idx * 0.05}s` }}
                 >
@@ -1108,6 +1562,8 @@ export default function ChatPage() {
                     }}>
                       <MarkdownContent
                         content={message.content || (message.role === "assistant" && isLoading ? "正在思考中..." : "")}
+                        kind={message.kind}
+                        payload={message.payload}
                         onRequestAnswers={() => {
                           // 发送消息请求答案
                           const input = "请给出上面试卷的答案和解析";
@@ -1210,6 +1666,8 @@ export default function ChatPage() {
           }
         }}
         onCreate={createSession}
+        onDelete={deleteSession}
+        onRename={renameSession}
       />
 
       <KnowledgePanel

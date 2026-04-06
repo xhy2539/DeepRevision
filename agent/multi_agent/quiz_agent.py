@@ -6,7 +6,8 @@ Agent 3: Revise Agent — 逐条回应批评，修订题目并给出修改说明
 循环：critique → revise → critique，最多 2 轮
 """
 import json
-from typing import TypedDict, List, Optional
+import re
+from typing import Any, Dict, TypedDict, List, Optional
 from pydantic import BaseModel, Field
 
 from langgraph.graph import StateGraph, END
@@ -14,9 +15,10 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 from model.factory import chat_model
-from rag.rag_service import RagSummarizeService
+from agent.tools.agent_tools import get_rag_service
 from utils.session_context import current_session_id
 from utils.logger_handler import logger
+from api.routers.exam_export import parse_exam_content
 
 
 # ==================== 状态定义 ====================
@@ -31,12 +33,14 @@ class QuizState(TypedDict):
     # Agent 1 输出
     quiz: str               # 原始题目文本
     reasoning: str          # 出题推理链（JSON 字符串）
+    quiz_payload: dict      # 结构化题目数据
     # Agent 2 输出
     critique: dict          # Critic 的结构化批评
     initial_score: int      # 第一轮 Critic 评分（效果验证基准）
     # Agent 3 输出
     revised_quiz: str       # 修订后题目
     revision_notes: str     # 针对批评的修改说明
+    revised_quiz_payload: dict
     # 控制
     reflection_rounds: int  # 已进行的反思轮次
 
@@ -52,12 +56,14 @@ class ExamPaperState(TypedDict):
     # Agent 1 输出
     exam_paper: str
     reasoning: str
+    exam_payload: dict
     # Agent 2 输出
     critique: dict
     initial_score: int      # 第一轮 Critic 评分（效果验证基准）
     # Agent 3 输出
     revised_exam: str
     revision_notes: str
+    revised_exam_payload: dict
     # 控制
     reflection_rounds: int
 
@@ -76,6 +82,25 @@ class Question(BaseModel):
     difficulty: str = Field(description="难度：简单/中等/较难")
 
 
+class QuizQuestionItem(BaseModel):
+    """前端题卡结构"""
+    id: int = Field(description="题目编号")
+    type: str = Field(description="题型")
+    question: str = Field(description="题干内容")
+    options: Optional[List[str]] = Field(default=None, description="选项")
+    answer: str = Field(description="答案")
+    explanation: str = Field(description="解析")
+    score: Optional[str] = Field(default=None, description="分值，如5分")
+    difficulty: Optional[str] = Field(default=None, description="难度")
+
+
+class StructuredQuizSetResult(BaseModel):
+    """单题/题组的原生结构化输出"""
+    title: Optional[str] = Field(default="练习题", description="题组标题")
+    questions: List[QuizQuestionItem] = Field(description="题目列表")
+    reasoning: Optional[dict] = Field(default_factory=dict, description="出题推理链")
+
+
 class ExamPaper(BaseModel):
     """试卷数据结构"""
     questions: List[Question] = Field(description="题目列表")
@@ -85,6 +110,12 @@ class ExamPaper(BaseModel):
 class ExamPaperText(BaseModel):
     """试卷文本格式（用于完整试卷）"""
     exam_paper: str = Field(description="完整试卷文本")
+    reasoning: Optional[dict] = Field(default_factory=dict, description="出题推理链")
+
+
+class QuizGenerateResult(BaseModel):
+    """单题/小题集结构化输出"""
+    quiz: str = Field(description="完整题目文本")
     reasoning: Optional[dict] = Field(default_factory=dict, description="出题推理链")
 
 
@@ -120,7 +151,7 @@ async def get_rag_context(topic: str) -> str:
     """获取 RAG 原始检索片段（不做最终 LLM 总结，出题 Agent 自己基于原文出题）"""
     logger.info(f"[RAG Context] 正在检索 topic={topic[:50]}...")
     try:
-        rag = RagSummarizeService()
+        rag = await get_rag_service()
         context = await rag.retrieve_context(topic)
         logger.info(f"[RAG Context] 检索完成，返回长度={len(context)}")
         if not context or context.strip() == "":
@@ -144,16 +175,31 @@ async def call_llm_structured(prompt_template: str, schema: type[BaseModel], **k
     调用 LLM 并强制结构化输出
     注意：MiniMax API 不支持 response_format，这里使用 Prompt 约束 + 正则解析
     """
+    import asyncio
+
     prompt = PromptTemplate.from_template(prompt_template)
     chain = prompt | chat_model | StrOutputParser()
-    result = await chain.ainvoke(kwargs)
-    # 使用正则提取 JSON 并转换为 Pydantic 模型
-    try:
-        parsed = _extract_json(result)
-        return schema(**parsed)
-    except Exception as e:
-        logger.warning(f"[call_llm_structured] 解析失败: {e}")
-        raise
+
+    last_error = None
+    for attempt in range(3):
+        result = None
+        try:
+            result = await chain.ainvoke(kwargs)
+            parsed = _extract_json(result)
+            parsed = _coerce_structured_payload(parsed, schema)
+            return schema(**parsed)
+        except Exception as e:
+            last_error = e
+            raw_preview = _summarize_raw_output(result)
+            logger.warning(
+                f"[call_llm_structured] 第{attempt+1}次失败: {e}; raw='{raw_preview}...'"
+            )
+            should_retry = _should_retry_structured_error(e)
+            if attempt == 2 or not should_retry:
+                raise
+            await asyncio.sleep(2 ** attempt)
+
+    raise last_error
 
 
 # ---------- 分批生成单题型试卷的 Prompt ----------
@@ -315,6 +361,8 @@ async def generate_single_type_paper(
     """
     分批生成单种题型的试卷
     """
+    import asyncio
+
     end_num = start_num + num - 1
     total_score = num * score_per_question
     # 简答题每问的分值 = 总分 // 2（如果每题10分则每问5分，如果每题20分则每问10分）
@@ -337,22 +385,28 @@ async def generate_single_type_paper(
     logger.info(f"[分批生成] {quiz_type}: {num}题, 编号{start_num}-{end_num}")
 
     try:
-        result = await call_llm_structured(
-            EXAM_GENERATE_SINGLE_TYPE_PROMPT,
-            ExamPaperText,
-            quiz_type=quiz_type,
-            num=num,
-            start_num=start_num,
-            end_num=end_num,
-            score=score_per_question,
-            total_score=total_score,
-            topics=topics,
-            sample_paper_context=sample_paper_context,
-            context=context,
-            format_example=format_example,
+        result = await asyncio.wait_for(
+            call_llm_structured(
+                EXAM_GENERATE_SINGLE_TYPE_PROMPT,
+                ExamPaperText,
+                quiz_type=quiz_type,
+                num=num,
+                start_num=start_num,
+                end_num=end_num,
+                score=score_per_question,
+                total_score=total_score,
+                topics=topics,
+                sample_paper_context=sample_paper_context,
+                context=context,
+                format_example=format_example,
+            ),
+            timeout=120.0,
         )
         logger.info(f"[分批生成] {quiz_type} 生成成功，长度={len(result.exam_paper)}")
         return result.exam_paper
+    except asyncio.TimeoutError:
+        logger.error(f"[分批生成] {quiz_type} 超时（120s）")
+        return ""
     except Exception as e:
         logger.warning(f"[分批生成] {quiz_type} 失败: {e}")
         return ""
@@ -370,34 +424,686 @@ async def generate_single_type_paper_structured(
     生成单种题型的结构化试卷（返回 JSON 而不是文本）
     让 AI 自行决定分值和难度分配
     """
+    import asyncio
+
     logger.info(f"[结构化生成] {quiz_type}: {num}题, 起始编号{start_num}")
 
     try:
-        result = await call_llm_structured(
-            EXAM_GENERATE_STRUCTURED_PROMPT,
-            ExamPaper,
-            quiz_type=quiz_type,
-            num=num,
-            start_num=start_num,
-            topics=topics,
-            sample_paper_context=sample_paper_context,
-            context=context,
+        result = await asyncio.wait_for(
+            call_llm_structured(
+                EXAM_GENERATE_STRUCTURED_PROMPT,
+                ExamPaper,
+                quiz_type=quiz_type,
+                num=num,
+                start_num=start_num,
+                topics=topics,
+                sample_paper_context=sample_paper_context,
+                context=context,
+            ),
+            timeout=120.0,
         )
+        actual_count = len(result.questions)
+        if actual_count != num:
+            raise ValueError(f"{quiz_type} 结构化生成数量不符，期望 {num} 道，实际 {actual_count} 道")
+        for index, question in enumerate(result.questions):
+            question.id = start_num + index
+            if not question.type:
+                question.type = quiz_type
         logger.info(f"[结构化生成] {quiz_type} 成功，生成 {len(result.questions)} 道题")
         return result
+    except asyncio.TimeoutError:
+        logger.error(f"[结构化生成] {quiz_type} 超时（120s）")
+        return ExamPaper(questions=[], reasoning={})
     except Exception as e:
         logger.error(f"[结构化生成] {quiz_type} 失败: {e}")
         return ExamPaper(questions=[], reasoning={})
 
 
+def _merge_exam_questions(primary: List[dict], supplement: List[dict], quiz_type: str, start_num: int) -> List[dict]:
+    merged: List[dict] = []
+    current_num = start_num
+    for question in primary + supplement:
+        normalized = _normalize_exam_question(question, current_num)
+        normalized["number"] = current_num
+        normalized["type"] = normalized.get("type") or quiz_type
+        merged.append(normalized)
+        current_num += 1
+    return merged
+
+
+async def _ensure_single_type_questions(
+    quiz_type: str,
+    num: int,
+    start_num: int,
+    topics: str,
+    context: str,
+    sample_paper_context: str,
+    score_per_question: int,
+) -> List[dict]:
+    """可用性优先：结构化生成不足时，自动回退文本生成补齐缺题。"""
+    structured = await generate_single_type_paper_structured(
+        quiz_type=quiz_type,
+        num=num,
+        start_num=start_num,
+        topics=topics,
+        context=context,
+        sample_paper_context=sample_paper_context,
+    )
+    structured_questions = [q.model_dump() for q in structured.questions]
+    if len(structured_questions) >= num:
+        return _merge_exam_questions(structured_questions[:num], [], quiz_type, start_num)
+
+    missing = num - len(structured_questions)
+    logger.warning(f"[分批补题] {quiz_type} 结构化结果不足，缺少 {missing} 道，改用文本生成补齐")
+    merged = _merge_exam_questions(structured_questions, [], quiz_type, start_num)
+
+    batch_size = _get_text_fallback_batch_size(quiz_type)
+    while len(merged) < num:
+        remaining = num - len(merged)
+        current_batch = min(batch_size, remaining)
+        next_num = start_num + len(merged)
+        logger.info(
+            f"[分批补题] {quiz_type} 文本补题批次: 需补{remaining}道，"
+            f"本批{current_batch}道，起始编号{next_num}"
+        )
+        supplement_text = await generate_single_type_paper(
+            quiz_type=quiz_type,
+            num=current_batch,
+            start_num=next_num,
+            topics=topics,
+            context=context,
+            sample_paper_context=sample_paper_context,
+            score_per_question=score_per_question,
+        )
+        supplement_questions = parse_exam_content(supplement_text).get("questions", []) if supplement_text else []
+        if not supplement_questions:
+            logger.warning(f"[分批补题] {quiz_type} 批次补题失败，转单题兜底，起始编号 {next_num}")
+            break
+        merged = _merge_exam_questions(merged, supplement_questions[:current_batch], quiz_type, start_num)
+
+    if len(merged) < num:
+        logger.warning(f"[分批补题] {quiz_type} 首次补题后仍不足，继续单题兜底直到满足数量")
+        while len(merged) < num:
+            next_num = start_num + len(merged)
+            one_more_text = await generate_single_type_paper(
+                quiz_type=quiz_type,
+                num=1,
+                start_num=next_num,
+                topics=topics,
+                context=context,
+                sample_paper_context=sample_paper_context,
+                score_per_question=score_per_question,
+            )
+            one_more_questions = parse_exam_content(one_more_text).get("questions", []) if one_more_text else []
+            if not one_more_questions:
+                logger.error(f"[分批补题] {quiz_type} 单题兜底失败，编号 {next_num}")
+                break
+            merged = _merge_exam_questions(merged, one_more_questions[:1], quiz_type, start_num)
+
+    if len(merged) > num:
+        merged = merged[:num]
+    logger.info(f"[分批补题] {quiz_type} 最终数量={len(merged)} / 目标={num}")
+    return merged
+
+
+def _get_text_fallback_batch_size(quiz_type: str) -> int:
+    """文本补题按小批次生成，避免单次输出过大卡住。"""
+    if quiz_type == "选择题":
+        return 3
+    if quiz_type in {"填空题", "判断题"}:
+        return 2
+    return 1
+
+
 def _extract_json(text: str) -> dict:
-    """从 LLM 输出中提取 JSON，自动处理 markdown 代码块"""
-    import re
-    text = text.strip()
-    match = re.search(r'```(?:json)?\s*([\s\S]*?)```', text)
-    if match:
-        text = match.group(1).strip()
-    return json.loads(text)
+    """从 LLM 输出中提取 JSON，兼容 think 标签、markdown 代码块和前后噪音。"""
+    if not text or not str(text).strip():
+        raise ValueError("empty model output")
+
+    text = _sanitize_structured_output(text)
+
+    fenced = re.search(r'```(?:json)?\s*([\s\S]*?)```', text)
+    if fenced:
+        text = fenced.group(1).strip()
+
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    start = -1
+    stack: List[str] = []
+    opening = {'{': '}', '[': ']'}
+    closing = {'}': '{', ']': '['}
+    for i, ch in enumerate(text):
+        if ch in opening:
+            if start == -1:
+                start = i
+            stack.append(ch)
+        elif ch in closing and stack:
+            if stack[-1] == closing[ch]:
+                stack.pop()
+                if not stack and start != -1:
+                    candidate = text[start:i + 1]
+                    try:
+                        return json.loads(candidate)
+                    except Exception:
+                        start = -1
+                        continue
+
+    raise ValueError("no valid json found in model output")
+
+
+def _sanitize_structured_output(text: str) -> str:
+    """清理结构化输出中的推理标签、代码块包装和前缀噪音。"""
+    cleaned = str(text).strip()
+    cleaned = re.sub(r'<think>[\s\S]*?</think>', '', cleaned, flags=re.DOTALL).strip()
+    cleaned = re.sub(r'^result\s*=\s*', '', cleaned).strip()
+    cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
+    cleaned = re.sub(r'\s*```$', '', cleaned)
+    return cleaned.strip()
+
+
+def _summarize_raw_output(text: Any) -> str:
+    if text is None:
+        return ""
+    return _sanitize_structured_output(text)[:300]
+
+
+def _should_retry_structured_error(error: Exception) -> bool:
+    """网络波动和常见结构化污染都允许重试一次以上。"""
+    error_str = str(error).lower()
+    retryable_patterns = [
+        'connection error',
+        'timeout',
+        'timed out',
+        'temporarily unavailable',
+        'overloaded',
+        '529',
+        'server disconnected',
+        'remote protocol error',
+        'empty model output',
+        'no valid json found',
+    ]
+    return any(pattern in error_str for pattern in retryable_patterns)
+
+
+def _strip_think_tags(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.DOTALL).strip()
+    if cleaned.startswith("<think>"):
+        first_question = re.search(r'(^\d+\.\s*[（(]?\S+)|(^【选择题】)|(^【填空题】)|(^【判断题】)|(^【简答题】)', cleaned, flags=re.MULTILINE)
+        if first_question:
+            cleaned = cleaned[first_question.start():].strip()
+    return cleaned
+
+
+def _coerce_structured_payload(parsed: dict, schema: type[BaseModel]) -> dict:
+    """兼容模型把字段名答错的情况。"""
+    if not isinstance(parsed, dict):
+        return parsed
+
+    schema_name = getattr(schema, "__name__", "")
+    if schema_name == "QuizGenerateResult":
+        if "quiz" not in parsed and "exam_paper" in parsed:
+            parsed["quiz"] = parsed.get("exam_paper", "")
+        parsed["reasoning"] = _normalize_reasoning_payload(parsed.get("reasoning"))
+    elif schema_name == "StructuredQuizSetResult":
+        parsed["title"] = _normalize_text_field(parsed.get("title"), "练习题")
+        if "questions" not in parsed and "quiz" in parsed:
+            parsed["questions"] = []
+        parsed["questions"] = _normalize_questions_payload(parsed.get("questions"))
+        parsed["reasoning"] = _normalize_reasoning_payload(parsed.get("reasoning"))
+    elif schema_name == "CritiqueResult":
+        parsed["critique"] = _normalize_text_field(parsed.get("critique"), "")
+        parsed["overall_score"] = _normalize_int_field(parsed.get("overall_score"), 80)
+        parsed["reasoning_flaws"] = _normalize_list_of_dicts(parsed.get("reasoning_flaws"))
+        parsed["specific_issues"] = _normalize_list_of_dicts(parsed.get("specific_issues"))
+        parsed["duplicate_check"] = _normalize_dict_field(parsed.get("duplicate_check"))
+        parsed["numbering_check"] = _normalize_dict_field(parsed.get("numbering_check"))
+        parsed["quantity_check"] = _normalize_dict_field(parsed.get("quantity_check"))
+    elif schema_name in {"ReviseResult", "ExamReviseResult"}:
+        parsed["addressed_issues"] = _normalize_addressed_issues(parsed.get("addressed_issues"))
+        if schema_name == "ReviseResult":
+            parsed["revised_quiz"] = _normalize_text_field(parsed.get("revised_quiz"), "")
+        else:
+            parsed["revised_exam"] = _normalize_text_field(parsed.get("revised_exam"), "")
+        parsed["revision_notes"] = _normalize_text_field(parsed.get("revision_notes"), "")
+    elif schema_name == "ExamPaperText":
+        if "exam_paper" not in parsed and isinstance(parsed.get("questions"), list):
+            normalized_questions = _normalize_exam_questions_payload(parsed.get("questions"))
+            payload = _build_exam_payload_from_questions(normalized_questions, title="期末考试试卷")
+            parsed["exam_paper"] = _build_exam_text_from_payload(payload)
+        parsed["exam_paper"] = _normalize_text_field(parsed.get("exam_paper"), "")
+        parsed["reasoning"] = _normalize_reasoning_payload(parsed.get("reasoning"))
+    elif schema_name == "ExamPaper":
+        parsed["questions"] = _normalize_exam_questions_payload(parsed.get("questions"))
+        parsed["reasoning"] = _normalize_reasoning_payload(parsed.get("reasoning"))
+    return parsed
+
+
+def _normalize_text_field(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
+def _normalize_int_field(value: Any, default: int = 0) -> int:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    match = re.search(r'-?\d+', str(value))
+    return int(match.group(0)) if match else default
+
+
+def _normalize_dict_field(value: Any) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _normalize_list_of_dicts(value: Any) -> List[dict]:
+    if value is None:
+        return []
+    items = value if isinstance(value, list) else [value]
+    normalized: List[dict] = []
+    for item in items:
+        if isinstance(item, dict):
+            normalized.append(item)
+        elif isinstance(item, str) and item.strip():
+            normalized.append({"text": item.strip()})
+    return normalized
+
+
+def _normalize_reasoning_payload(value: Any) -> dict:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, list):
+        return {"items": value}
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            loaded = json.loads(text)
+            if isinstance(loaded, dict):
+                return loaded
+            if isinstance(loaded, list):
+                return {"items": loaded}
+        except Exception:
+            return {"text": text}
+    return {}
+
+
+def _normalize_options(value: Any) -> Optional[List[str]]:
+    if value in (None, "", []):
+        return None
+    items = value if isinstance(value, list) else [value]
+    normalized = [str(item).strip() for item in items if str(item).strip()]
+    return normalized or None
+
+
+def _normalize_question_item(item: Any, fallback_id: int) -> dict:
+    if not isinstance(item, dict):
+        item = {"question": str(item).strip()}
+    return {
+        "id": _normalize_int_field(item.get("id"), fallback_id),
+        "type": _normalize_text_field(item.get("type"), "选择题"),
+        "question": _normalize_text_field(item.get("question") or item.get("content"), ""),
+        "options": _normalize_options(item.get("options")),
+        "answer": _normalize_text_field(item.get("answer"), ""),
+        "explanation": _normalize_text_field(item.get("explanation") or item.get("analysis"), ""),
+        "score": _format_score(item.get("score")),
+        "difficulty": _normalize_text_field(item.get("difficulty"), "中等"),
+    }
+
+
+def _normalize_questions_payload(value: Any) -> List[dict]:
+    if value is None:
+        return []
+    items = value if isinstance(value, list) else [value]
+    return [_normalize_question_item(item, index) for index, item in enumerate(items, start=1)]
+
+
+def _normalize_exam_question_item(item: Any, fallback_id: int) -> dict:
+    if not isinstance(item, dict):
+        item = {"content": str(item).strip()}
+    return {
+        "id": _normalize_int_field(item.get("id") or item.get("number"), fallback_id),
+        "type": _normalize_text_field(item.get("type"), "选择题"),
+        "content": _normalize_text_field(item.get("content") or item.get("question"), ""),
+        "options": _normalize_options(item.get("options")),
+        "answer": _normalize_text_field(item.get("answer"), ""),
+        "analysis": _normalize_text_field(item.get("analysis") or item.get("explanation"), ""),
+        "score": _normalize_int_field(item.get("score"), 2),
+        "difficulty": _normalize_text_field(item.get("difficulty"), "中等"),
+    }
+
+
+def _normalize_exam_questions_payload(value: Any) -> List[dict]:
+    if value is None:
+        return []
+    items = value if isinstance(value, list) else [value]
+    return [_normalize_exam_question_item(item, index) for index, item in enumerate(items, start=1)]
+
+
+def _limit_context_size(text: str, max_chars: int = 12000) -> str:
+    """限制上下文长度，避免超长 context 导致生成超时。"""
+    if not text:
+        return ""
+    return text if len(text) <= max_chars else text[:max_chars]
+
+
+def _normalize_addressed_issues(value: Any) -> List[str]:
+    """兼容模型把 addressed_issues 输出成对象数组。"""
+    if value in (None, ""):
+        return []
+
+    items = value if isinstance(value, list) else [value]
+    normalized: List[str] = []
+    for item in items:
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                normalized.append(text)
+            continue
+
+        if isinstance(item, dict):
+            issue_id = str(item.get("issue_id", "")).strip()
+            fix = str(item.get("fix", "")).strip()
+            issue = str(item.get("issue", "")).strip()
+            action = str(item.get("action", "")).strip()
+            parts = [part for part in [issue_id or issue, fix or action] if part]
+            if parts:
+                normalized.append("：".join(parts))
+                continue
+
+        text = str(item).strip()
+        if text:
+            normalized.append(text)
+
+    return normalized
+
+
+def _format_score(score: Any) -> Optional[str]:
+    if score in (None, "", 0, "0"):
+        return None
+    score_str = str(score).strip()
+    return score_str if score_str.endswith("分") else f"{score_str}分"
+
+
+def _build_quiz_text_from_questions(questions: List[dict]) -> str:
+    lines: List[str] = []
+    for index, question in enumerate(questions, start=1):
+        qtype = question.get("type") or "选择题"
+        score = question.get("score") or "5分"
+        difficulty = question.get("difficulty") or "中等"
+        lines.append(f"{index}.（{qtype}，分值：{score}，难度：{difficulty}）")
+        lines.append(question.get("question", "").strip())
+        for option in question.get("options") or []:
+            lines.append(option.strip())
+        if question.get("answer"):
+            lines.append(f"答案：{question['answer']}")
+        if question.get("explanation"):
+            lines.append(f"解析：{question['explanation']}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _build_quiz_payload(topic: str, questions: List[dict]) -> dict:
+    return {
+        "title": topic or "练习题",
+        "show_answers_default": False,
+        "show_analysis_default": False,
+        "questions": questions,
+    }
+
+
+def _questions_from_quiz_text(text: str, topic: str) -> dict:
+    from api.message_protocol import _parse_quiz_content
+
+    questions = _parse_quiz_content(text)
+    return _build_quiz_payload(topic, questions)
+
+
+def _normalize_exam_question(question: dict, fallback_number: int) -> dict:
+    qtype = question.get("type") or "选择题"
+    score = int(question.get("score") or (2 if qtype in {"选择题", "填空题", "判断题"} else 10))
+    content = question.get("content") or question.get("question") or ""
+    options = question.get("options") or None
+    if qtype == "选择题":
+        stem, parsed_options = _split_stem_and_options_for_payload(content)
+        content = stem or content
+        if parsed_options:
+            options = parsed_options
+    return {
+        "number": int(question.get("number") or question.get("id") or fallback_number),
+        "type": qtype,
+        "content": content,
+        "options": options,
+        "answer": question.get("answer") or "",
+        "analysis": question.get("analysis") or question.get("explanation") or "",
+        "score": score,
+        "difficulty": question.get("difficulty") or "中等",
+        "knowledge_point": question.get("knowledge_point"),
+    }
+
+
+def _build_exam_payload_from_questions(questions: List[dict], title: str = "完整试卷", subtitle: str = "") -> dict:
+    normalized_questions: List[dict] = []
+    question_types: Dict[str, Dict[str, int]] = {}
+    total_score = 0
+
+    for index, question in enumerate(questions, start=1):
+        normalized = _normalize_exam_question(question, index)
+        normalized_questions.append(normalized)
+        total_score += normalized["score"]
+        qtype = normalized["type"]
+        if qtype not in question_types:
+            question_types[qtype] = {"count": 0, "total_score": 0}
+        question_types[qtype]["count"] += 1
+        question_types[qtype]["total_score"] += normalized["score"]
+
+    return {
+        "title": title,
+        "subtitle": subtitle,
+        "show_answers_default": False,
+        "show_analysis_default": False,
+        "exam_data": {
+            "title": title,
+            "subtitle": subtitle,
+            "total_score": total_score,
+            "total_questions": len(normalized_questions),
+            "question_types": question_types,
+            "questions": normalized_questions,
+        },
+    }
+
+
+def _split_stem_and_options_for_payload(raw_content: str) -> tuple[str, List[str]]:
+    """
+    从题干中拆出选择题选项，统一输出为 `A. xxx` 格式，便于前端稳定渲染。
+    兼容 `A.` / `A、` / `A．` 等写法。
+    """
+    content = re.sub(r'^\d+[.、]\s*', '', (raw_content or "").strip())
+    if not content:
+        return "", []
+
+    # 优先按行解析，能稳定保留题干
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    stem_lines: List[str] = []
+    options: List[str] = []
+    option_line_pattern = re.compile(r'^([A-DＡ-Ｄ])[.、．]\s*(.+)$')
+    inline_split_pattern = re.compile(r'(?=[A-DＡ-Ｄ][.、．]\s*)')
+
+    for line in lines:
+        line = line.replace('．', '.')
+        m = option_line_pattern.match(line)
+        if m:
+            letter = m.group(1).upper()
+            option_text = m.group(2).strip()
+            if option_text:
+                options.append(f"{letter}. {option_text}")
+            continue
+
+        if re.search(r'[A-DＡ-Ｄ][.、．]\s*', line):
+            parts = [p.strip() for p in inline_split_pattern.split(line) if p.strip()]
+            if parts:
+                first = parts[0]
+                if not option_line_pattern.match(first):
+                    stem_lines.append(first)
+                    parts = parts[1:]
+                for part in parts:
+                    mm = option_line_pattern.match(part.replace('．', '.'))
+                    if mm and mm.group(2).strip():
+                        options.append(f"{mm.group(1).upper()}. {mm.group(2).strip()}")
+                continue
+
+        stem_lines.append(line)
+
+    # 去重并保序，最多保留4个选项
+    seen = set()
+    normalized_options: List[str] = []
+    for opt in options:
+        key = re.sub(r'\s+', ' ', opt).strip()
+        if key and key not in seen:
+            seen.add(key)
+            normalized_options.append(opt)
+        if len(normalized_options) >= 4:
+            break
+
+    return "\n".join(stem_lines).strip(), normalized_options
+
+
+def _normalize_exam_scores_to_target(
+    questions: List[dict],
+    score_map: Dict[str, int],
+    target_total: int = 100,
+) -> List[dict]:
+    """统一按题型重算分值，并在末尾微调保证总分等于 target_total。"""
+    normalized: List[dict] = []
+    for q in questions:
+        qq = dict(q)
+        qtype = qq.get("type") or "选择题"
+        if qtype in score_map:
+            qq["score"] = int(score_map[qtype])
+        else:
+            qq["score"] = int(qq.get("score") or 2)
+        normalized.append(qq)
+
+    if not normalized:
+        return normalized
+
+    total = sum(int(q.get("score") or 0) for q in normalized)
+    diff = target_total - total
+    if diff != 0:
+        # 优先调整简答题；没有简答题时调整最后一题
+        adjusted = False
+        for q in reversed(normalized):
+            if q.get("type") == "简答题":
+                q["score"] = max(1, int(q.get("score") or 1) + diff)
+                adjusted = True
+                break
+        if not adjusted:
+            normalized[-1]["score"] = max(1, int(normalized[-1].get("score") or 1) + diff)
+
+    return normalized
+
+
+def _build_exam_text_from_payload(payload: dict) -> str:
+    exam_data = payload.get("exam_data", {})
+    title = exam_data.get("title") or payload.get("title") or "完整试卷"
+    questions = exam_data.get("questions", [])
+    type_order = ["选择题", "填空题", "判断题", "简答题", "计算题", "分析题", "论述题", "名词解释"]
+    section_labels = {
+        "选择题": "一、选择题",
+        "填空题": "二、填空题",
+        "判断题": "三、判断题",
+        "简答题": "四、简答题",
+        "计算题": "五、计算题",
+        "分析题": "六、分析题",
+        "论述题": "七、论述题",
+        "名词解释": "八、名词解释",
+    }
+    grouped: Dict[str, List[dict]] = {}
+    for question in questions:
+        grouped.setdefault(question.get("type") or "选择题", []).append(question)
+
+    lines = [f"## 《{title}》", ""]
+    ordered_types = [qtype for qtype in type_order if qtype in grouped] + [qtype for qtype in grouped if qtype not in type_order]
+    for qtype in ordered_types:
+        items = grouped[qtype]
+        total_score = sum(int(item.get("score") or 0) for item in items)
+        score_desc = f"共{len(items)}题，计{total_score}分"
+        if items and items[0].get("score"):
+            score_desc = f"共{len(items)}题，每题{items[0]['score']}分，计{total_score}分"
+        lines.append(f"{section_labels.get(qtype, qtype)}（{score_desc}）")
+        for item in items:
+            lines.append(f"{item['number']}. {item.get('content', '').strip()}")
+            for option in item.get("options") or []:
+                lines.append(f"   {option.strip()}")
+            if item.get("answer"):
+                lines.append(f"答案：{item['answer']}")
+            if item.get("analysis"):
+                lines.append(f"解析：{item['analysis']}")
+            lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _build_fast_exam_critique(state: ExamPaperState, exam_paper: str) -> Optional[dict]:
+    """可用性优先的本地试卷校验，满足条件时直接放行，避免额外 LLM 评审耗时。"""
+    quantity_dist = state.get('quantity_dist', {}) or {"choice": 10, "fill": 5, "judge": 5, "essay": 3}
+    actual = _count_questions_in_exam(exam_paper, quantity_dist)
+    quantity_valid = (
+        actual["choice"] == quantity_dist.get("choice", 0) and
+        actual["fill"] == quantity_dist.get("fill", 0) and
+        actual["judge"] == quantity_dist.get("judge", 0) and
+        actual["essay"] == quantity_dist.get("essay", 0)
+    )
+
+    payload = state.get("exam_payload") or {}
+    exam_data = payload.get("exam_data", {})
+    questions = exam_data.get("questions", [])
+    numbers = [int(q.get("number", 0)) for q in questions if q.get("number")]
+    numbering_valid = bool(numbers) and numbers == list(range(1, len(numbers) + 1))
+
+    seen = set()
+    has_duplicates = False
+    for q in questions:
+        signature = re.sub(r'\s+', ' ', str(q.get("content", "")).strip())
+        if signature and signature in seen:
+            has_duplicates = True
+            break
+        if signature:
+            seen.add(signature)
+
+    if quantity_valid and numbering_valid and not has_duplicates:
+        logger.info("[Agent2-Critic-试卷] 本地校验通过，跳过 LLM 评审以保证可用性")
+        return {
+            "approved": True,
+            "overall_score": 85,
+            "critique": "本地校验通过，题量、编号与重复检查均符合要求，直接交付。",
+            "reasoning_flaws": [],
+            "specific_issues": [],
+            "duplicate_check": {"has_duplicates": False, "duplicate_questions": []},
+            "numbering_check": {"is_continuous": True, "issues": []},
+            "quantity_check": {
+                "choice": quantity_dist.get("choice", 0),
+                "fill": quantity_dist.get("fill", 0),
+                "judge": quantity_dist.get("judge", 0),
+                "essay": quantity_dist.get("essay", 0),
+                "actual_choice": actual["choice"],
+                "actual_fill": actual["fill"],
+                "actual_judge": actual["judge"],
+                "actual_essay": actual["essay"],
+                "is_valid": True
+            }
+        }
+
+    return None
 
 
 def _count_questions_in_exam(exam_text: str, quantity_dist: dict = None) -> dict:
@@ -467,6 +1173,42 @@ def _count_questions_in_exam(exam_text: str, quantity_dist: dict = None) -> dict
 # ==================== 提示词 ====================
 
 # ---------- Agent 1: 出题 + 推理链 ----------
+GENERATE_STRUCTURED_QUIZ_PROMPT = """你是一位资深大学期末考试命题专家。请严格基于课件资料生成结构化题目。
+
+【考点】{topic}
+【题型】{quiz_type}
+【题目数量】{num}
+【样卷格式参考】{sample_paper_context}
+
+【课件资料】（所有题目必须严格基于此）:
+{context}
+
+要求：
+1. 只返回纯 JSON，不要输出思考过程、<think> 标签、Markdown 代码块。
+2. 必须生成正好 {num} 道题。
+3. 选择题必须包含 4 个完整选项。
+4. 每道题都必须包含答案和解析。
+5. score 使用“5分”这类字符串，difficulty 使用“简单/中等/较难”。
+
+返回格式：
+{{
+  "title": "练习题",
+  "questions": [
+    {{
+      "id": 1,
+      "type": "{quiz_type}",
+      "question": "题干内容",
+      "options": ["A. 选项1", "B. 选项2", "C. 选项3", "D. 选项4"],
+      "answer": "A",
+      "explanation": "解析内容",
+      "score": "5分",
+      "difficulty": "中等"
+    }}
+  ],
+  "reasoning": {{"knowledge_points": [...], "answer_evidence": [...], "distractor_design": [...]}}
+}}"""
+
+
 GENERATE_WITH_REASONING_PROMPT = """【警告-绝对禁止】绝对禁止使用'...'、'等'、'以下略'等任何占位符！你必须逐字逐句地生成所有要求的题目。任何省略行为将被判定为任务失败！
 
 你是一位资深大学期末考试命题专家。根据课件资料生成题目，同时给出详细推理链。
@@ -480,6 +1222,8 @@ GENERATE_WITH_REASONING_PROMPT = """【警告-绝对禁止】绝对禁止使用'
 {context}
 
 请生成题目，并为每道题提供推理链（说明为什么这样出题、答案依据在课件哪里）。
+
+禁止输出 <think> 标签、思考过程、分析说明。
 
 【重要】只返回纯 JSON 对象，不要用 ```json 代码块包裹！直接输出：
 {{"quiz": "...", "reasoning": {{"knowledge_points": [...], "answer_evidence": [...], "distractor_design": [...]}}}}"""
@@ -512,8 +1256,10 @@ CRITIQUE_PROMPT = """你是一位严格的考试命题评审专家。你的职�
 3. 干扰项设计逻辑是否合理？（是否真的具有迷惑性但又有明确错误原因）
 4. 是否有超出课件范围的知识点？
 
+禁止输出 <think> 标签、思考过程、分析说明。
+
 【重要】只返回纯 JSON 对象，不要用 ```json 代码块包裹！直接输出：
-{{"approved": false, "overall_score": 75, "critique": "...", "reasoning_flaws": [{{"question": "...", "flaw": "...", "severity": "high"}}], "specific_issues": [{{"question": "...", "issue": "...", "suggestion": "..."}}]}}}"""
+{{"approved": false, "overall_score": 75, "critique": "...", "reasoning_flaws": [{{"question": "...", "flaw": "...", "severity": "high"}}], "specific_issues": [{{"question": "...", "issue": "...", "suggestion": "..."}}]}}"""
 
 
 # 判断标准：
@@ -541,8 +1287,35 @@ REVISE_WITH_REFLECTION_PROMPT = """你是一位考试命题专家，你刚刚收
 
 请根据批评修订题目，并详细说明你的修改依据。
 
+禁止输出 <think> 标签、思考过程、分析说明。
+
 【重要】只返回纯 JSON 对象，不要用 ```json 代码块包裹！直接输出：
 {{"revised_quiz": "...", "revision_notes": "...", "addressed_issues": [...]}}"""
+
+
+GENERATE_TEXT_FALLBACK_PROMPT = """你是一位大学期末考试命题专家。请严格基于课件资料，生成 {num} 道{quiz_type}。
+
+【考点】{topic}
+【样卷格式参考】{sample_paper_context}
+【课件资料】
+{context}
+
+要求：
+1. 只输出题目正文，不要输出思考过程，不要输出 JSON。
+2. 每道题都必须包含题干、答案、解析。
+3. 选择题必须提供 A、B、C、D 四个选项。
+4. 如果 topic 为空，请从课件里最核心的知识点中自行选题。
+
+输出示例：
+1.（选择题，分值：5分，难度：中等）
+题干内容
+A. 选项1
+B. 选项2
+C. 选项3
+D. 选项4
+答案：A
+解析：...
+"""
 
 
 # ---------- 试卷版本 ----------
@@ -711,23 +1484,52 @@ async def generate_with_reasoning_node(state: QuizState) -> QuizState:
     logger.info(f"[Agent1-出题] {state['topic']} / {state['quiz_type']} / {state['num']}道")
     sample = state.get('sample_paper_context', '') or '无样卷参考，使用默认格式'
 
-    # 使用结构化输出，彻底杜绝 Markdown 混排
     try:
-        result = await call_llm_structured(
-            GENERATE_WITH_REASONING_PROMPT,
-            ExamPaperText,
+        structured_result = await call_llm_structured(
+            GENERATE_STRUCTURED_QUIZ_PROMPT,
+            StructuredQuizSetResult,
             topic=state['topic'],
             quiz_type=state['quiz_type'],
             num=state['num'],
             context=state['context'],
             sample_paper_context=sample,
         )
-        quiz = result.exam_paper
+        questions = []
+        for item in structured_result.questions:
+            question = item.model_dump(exclude_none=True)
+            if question.get("score") is not None:
+                question["score"] = _format_score(question["score"])
+            questions.append(question)
+        payload = _build_quiz_payload(
+            structured_result.title or state['topic'] or "练习题",
+            questions,
+        )
+        quiz = _build_quiz_text_from_questions(questions)
+        reasoning = json.dumps(structured_result.reasoning or {}, ensure_ascii=False)
+        logger.info(f"[Agent1-出题] 原生结构化输出成功，questions={len(questions)}")
+        return {"quiz": quiz, "reasoning": reasoning, "quiz_payload": payload}
+    except Exception as e:
+        logger.warning(f"[Agent1-出题] 原生结构化输出失败，回退到文本结构化链路: {e}")
+
+    # 使用结构化输出，彻底杜绝 Markdown 混排
+    try:
+        result = await call_llm_structured(
+            GENERATE_WITH_REASONING_PROMPT,
+            QuizGenerateResult,
+            topic=state['topic'],
+            quiz_type=state['quiz_type'],
+            num=state['num'],
+            context=state['context'],
+            sample_paper_context=sample,
+        )
+        quiz = result.quiz
         reasoning = json.dumps(result.reasoning, ensure_ascii=False)
         logger.info(f"[Agent1-出题] 结构化输出成功，quiz长度={len(quiz)}")
+        payload = _questions_from_quiz_text(quiz, state['topic'])
     except Exception as e:
         logger.warning(f"[Agent1-出题] 结构化输出失败，回退到正则解析: {e}")
         # 回退机制：尝试正则解析
+        result_text = ""
         try:
             result_text = await call_llm(
                 GENERATE_WITH_REASONING_PROMPT,
@@ -740,11 +1542,22 @@ async def generate_with_reasoning_node(state: QuizState) -> QuizState:
             parsed = _extract_json(result_text)
             quiz = parsed.get('quiz', '')
             reasoning = json.dumps(parsed.get('reasoning', {}), ensure_ascii=False)
-        except Exception:
-            quiz = ""
+            payload = _questions_from_quiz_text(quiz, state['topic'])
+        except Exception as e2:
+            logger.error(f"[Agent1-出题] 回退解析也失败: result_text='{result_text[:200]}...', error={e2}")
+            plain_result = await call_llm(
+                GENERATE_TEXT_FALLBACK_PROMPT,
+                topic=state['topic'],
+                quiz_type=state['quiz_type'],
+                num=state['num'],
+                context=state['context'],
+                sample_paper_context=sample,
+            )
+            quiz = _strip_think_tags(plain_result)
             reasoning = '{}'
+            payload = _questions_from_quiz_text(quiz, state['topic'])
 
-    return {"quiz": quiz, "reasoning": reasoning}
+    return {"quiz": quiz, "reasoning": reasoning, "quiz_payload": payload}
 
 
 async def critique_quiz_node(state: QuizState) -> QuizState:
@@ -834,6 +1647,7 @@ async def revise_with_reflection_node(state: QuizState) -> QuizState:
     return {
         "revised_quiz": revised,
         "revision_notes": notes,
+        "revised_quiz_payload": _questions_from_quiz_text(revised, state['topic']),
         "reflection_rounds": round_n,
     }
 
@@ -891,24 +1705,27 @@ async def generate_exam_with_reasoning_node(state: ExamPaperState) -> ExamPaperS
     current_num += judge_count
     essay_start = current_num
 
-    # 并行生成所有题型（提高速度）
+    # 限流并发生成题型，避免同时打满模型连接导致卡住
     import asyncio
+    semaphore = asyncio.Semaphore(2)
 
     async def generate_and_collect(quiz_type: str, num: int, start_num: int, score: int):
         if num <= 0:
             return None
-        paper = await generate_single_type_paper(
-            quiz_type=quiz_type,
-            num=num,
-            start_num=start_num,
-            topics=topics_str,
-            context=state['contexts'][0] if state['contexts'] else '',
-            sample_paper_context=sample,
-            score_per_question=score
-        )
-        return {"paper": paper, "type": quiz_type, "count": num}
+        async with semaphore:
+            logger.info(f"[Agent1-出卷] 开始题型任务: {quiz_type}，并发上限=2")
+            questions = await _ensure_single_type_questions(
+                quiz_type=quiz_type,
+                num=num,
+                start_num=start_num,
+                topics=topics_str,
+                context=state['contexts'][0] if state['contexts'] else '',
+                sample_paper_context=sample,
+                score_per_question=score,
+            )
+        return {"questions": questions, "type": quiz_type, "count": num}
 
-    # 并行执行所有题型生成
+    # 启动所有题型任务，由 semaphore 控制最多 2 个并发执行
     tasks = []
     task_info = []
     if choice_count > 0:
@@ -924,23 +1741,46 @@ async def generate_exam_with_reasoning_node(state: ExamPaperState) -> ExamPaperS
         tasks.append(generate_and_collect("简答题", essay_count, essay_start, essay_score))
         task_info.append({"type": "简答题", "count": essay_count, "score": essay_score})
 
-    # 并行执行
+    # 并发收集结果
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # 收集结果
-    all_papers = []
+    all_questions: List[dict] = []
     all_reasonings = task_info
-    for result in results:
-        if isinstance(result, dict) and result.get("paper"):
-            all_papers.append(result["paper"])
+    for index, result in enumerate(results):
+        info = task_info[index] if index < len(task_info) else {"type": f"task-{index}"}
+        if isinstance(result, Exception):
+            logger.error(f"[Agent1-出卷] 题型任务失败: {info.get('type')} -> {result}")
+            continue
+        if isinstance(result, dict):
+            if result.get("questions"):
+                all_questions.extend(result["questions"])
+                logger.info(
+                    f"[Agent1-出卷] 题型完成: {result.get('type')}，"
+                    f"期望{result.get('count')}道，实际{len(result.get('questions', []))}道"
+                )
+            else:
+                logger.warning(f"[Agent1-出卷] 题型结果为空: {info.get('type')}")
 
-    # 合并所有试卷
-    exam_paper = "\n\n".join(all_papers)
+    # 统一分值，避免模型输出分值漂移导致总分不为 100
+    score_map = {
+        "选择题": choice_score,
+        "填空题": fill_score,
+        "判断题": judge_score,
+        "简答题": essay_score if essay_score > 0 else 10,
+    }
+    all_questions = _normalize_exam_scores_to_target(all_questions, score_map, target_total=100)
+
+    exam_payload = _build_exam_payload_from_questions(all_questions, title="期末考试试卷")
+    exam_paper = _build_exam_text_from_payload(exam_payload) if all_questions else ""
+    if not exam_paper.strip():
+        exam_paper = "试卷生成失败：题型生成超时或未返回有效内容，请稍后重试。"
+    logger.info(f"[Agent1-出卷] exam_payload_questions={len(exam_payload.get('exam_data', {}).get('questions', []))}")
     reasoning = json.dumps({"type_distribution": all_reasonings}, ensure_ascii=False)
 
-    logger.info(f"[Agent1-出卷] 分批生成完成，总长度={len(exam_paper)}, 题型数={len(all_papers)}")
+    logger.info(f"[Agent1-出卷] 分批生成完成，总长度={len(exam_paper)}, 题目数={len(all_questions)}")
 
-    return {"exam_paper": exam_paper, "reasoning": reasoning}
+    return {"exam_paper": exam_paper, "reasoning": reasoning, "exam_payload": exam_payload}
 
 
 async def critique_exam_node(state: ExamPaperState) -> ExamPaperState:
@@ -949,34 +1789,38 @@ async def critique_exam_node(state: ExamPaperState) -> ExamPaperState:
     contexts_combined = "\n\n".join(state['contexts'])[:2000]
     logger.info("[Agent2-Critic-试卷] 质疑出卷推理链...")
 
-    # 使用结构化输出
-    try:
-        result = await call_llm_structured(
-            EXAM_CRITIQUE_PROMPT,
-            CritiqueResult,
-            topics=", ".join(state['topics']),
-            contexts=contexts_combined,
-            exam_paper=exam_paper,
-            reasoning=state.get('reasoning', '{}'),
-            total_questions=state.get('total_questions', 10),
-        )
-        critique = result.model_dump()
-        logger.info(f"[Agent2-Critic-试卷] 结构化输出成功，approved={result.approved}")
-    except Exception as e:
-        logger.warning(f"[Agent2-Critic-试卷] 结构化输出失败，回退到正则解析: {e}")
-        # 回退机制
+    fast_critique = _build_fast_exam_critique(state, exam_paper)
+    if fast_critique is not None:
+        critique = fast_critique
+    else:
+        # 使用结构化输出
         try:
-            result_text = await call_llm(
+            result = await call_llm_structured(
                 EXAM_CRITIQUE_PROMPT,
+                CritiqueResult,
                 topics=", ".join(state['topics']),
                 contexts=contexts_combined,
                 exam_paper=exam_paper,
                 reasoning=state.get('reasoning', '{}'),
                 total_questions=state.get('total_questions', 10),
             )
-            critique = _extract_json(result_text)
-        except Exception:
-            critique = {"approved": True, "overall_score": 80, "reasoning_flaws": [], "specific_issues": []}
+            critique = result.model_dump()
+            logger.info(f"[Agent2-Critic-试卷] 结构化输出成功，approved={result.approved}")
+        except Exception as e:
+            logger.warning(f"[Agent2-Critic-试卷] 结构化输出失败，回退到正则解析: {e}")
+            # 回退机制
+            try:
+                result_text = await call_llm(
+                    EXAM_CRITIQUE_PROMPT,
+                    topics=", ".join(state['topics']),
+                    contexts=contexts_combined,
+                    exam_paper=exam_paper,
+                    reasoning=state.get('reasoning', '{}'),
+                    total_questions=state.get('total_questions', 10),
+                )
+                critique = _extract_json(result_text)
+            except Exception:
+                critique = {"approved": True, "overall_score": 80, "reasoning_flaws": [], "specific_issues": []}
 
     # 【精确数量校验】- 直接解析文本统计题目数量，不依赖 LLM 的正则匹配
     quantity_dist = state.get('quantity_dist', {})
@@ -1064,6 +1908,21 @@ async def revise_exam_with_reflection_node(state: ExamPaperState) -> ExamPaperSt
     round_n = state.get('reflection_rounds', 0) + 1
     logger.info(f"[Agent3-Revise-试卷] 第 {round_n} 轮反思修订...")
     contexts_combined = "\n\n".join(state['contexts'])[:2000]
+    critique = state.get('critique', {})
+
+    if _exam_is_usable_without_revision(critique):
+        logger.info("[Agent3-Revise-试卷] 当前试卷已满足可用性交付标准，跳过整卷修订")
+        revised = state.get('revised_exam') or state.get('exam_paper', '')
+        payload = state.get('revised_exam_payload') or state.get('exam_payload') or _build_exam_payload_from_questions(
+            parse_exam_content(revised).get("questions", []),
+            title="期末考试试卷",
+        )
+        return {
+            "revised_exam": revised,
+            "revision_notes": "试卷已满足可用性交付标准，跳过整卷修订以避免超时。",
+            "revised_exam_payload": payload,
+            "reflection_rounds": round_n,
+        }
 
     # 使用结构化输出
     try:
@@ -1074,7 +1933,7 @@ async def revise_exam_with_reflection_node(state: ExamPaperState) -> ExamPaperSt
             contexts=contexts_combined,
             exam_paper=state.get('exam_paper', ''),
             reasoning=state.get('reasoning', '{}'),
-            critique=json.dumps(state.get('critique', {}), ensure_ascii=False),
+            critique=json.dumps(critique, ensure_ascii=False),
             total_questions=state.get('total_questions', 10),
         )
         revised = result.revised_exam
@@ -1090,7 +1949,7 @@ async def revise_exam_with_reflection_node(state: ExamPaperState) -> ExamPaperSt
                 contexts=contexts_combined,
                 exam_paper=state.get('exam_paper', ''),
                 reasoning=state.get('reasoning', '{}'),
-                critique=json.dumps(state.get('critique', {}), ensure_ascii=False),
+                critique=json.dumps(critique, ensure_ascii=False),
                 total_questions=state.get('total_questions', 10),
             )
             parsed = _extract_json(result_text)
@@ -1103,6 +1962,7 @@ async def revise_exam_with_reflection_node(state: ExamPaperState) -> ExamPaperSt
     return {
         "revised_exam": revised,
         "revision_notes": notes,
+        "revised_exam_payload": _build_exam_payload_from_questions(parse_exam_content(revised).get("questions", []), title="期末考试试卷"),
         "reflection_rounds": round_n,
     }
 
@@ -1146,6 +2006,32 @@ def _critique_needs_revision(critique: dict) -> bool:
     return needs
 
 
+def _exam_is_usable_without_revision(critique: dict) -> bool:
+    """可用性优先：题量、编号、去重等硬指标过关时直接交付，避免整卷修订超时。"""
+    score = critique.get('overall_score', 80)
+    duplicate_check = critique.get('duplicate_check', {})
+    numbering_check = critique.get('numbering_check', {})
+    quantity_check = critique.get('quantity_check', {})
+    has_duplicates = duplicate_check.get('has_duplicates', False)
+    numbering_ok = numbering_check.get('is_continuous', True)
+    quantity_ok = quantity_check.get('is_valid', False)
+    high_flaws = [
+        f for f in critique.get('reasoning_flaws', [])
+        if f.get('severity') == 'high'
+    ]
+    non_structural_high_flaws = [
+        flaw for flaw in high_flaws
+        if not any(keyword in str(flaw.get('flaw', '')) for keyword in ['数量', '编号', '重复'])
+    ]
+
+    usable = quantity_ok and numbering_ok and not has_duplicates and score >= 55 and len(non_structural_high_flaws) <= 1
+    logger.info(
+        f"[试卷可用性判断] score={score}, quantity_ok={quantity_ok}, numbering_ok={numbering_ok}, "
+        f"duplicates={has_duplicates}, non_structural_high_flaws={len(non_structural_high_flaws)} → {'可直接交付' if usable else '仍需修订'}"
+    )
+    return usable
+
+
 def should_revise_quiz(state: QuizState) -> str:
     """最多 2 轮反思；多条件交叉验证决定是否修订"""
     if state.get('reflection_rounds', 0) >= 2:
@@ -1159,7 +2045,10 @@ def should_revise_quiz(state: QuizState) -> str:
 def should_revise_exam(state: ExamPaperState) -> str:
     if state.get('reflection_rounds', 0) >= 2:
         return "end"
-    if _critique_needs_revision(state.get('critique', {})):
+    critique = state.get('critique', {})
+    if _exam_is_usable_without_revision(critique):
+        return "end"
+    if _critique_needs_revision(critique):
         return "revise"
     return "end"
 
@@ -1217,7 +2106,7 @@ async def run_quiz_agent(
     quiz_type: str = "选择题",
     num: int = 3,
     sample_paper_context: str = None
-) -> str:
+) -> dict:
     """
     运行 Reflexion 出题系统（3 Agent 协作）
     流程：出题+推理链 → Critic质疑推理链 → Revise针对批评修订（最多2轮）
@@ -1232,10 +2121,12 @@ async def run_quiz_agent(
         "sample_paper_context": sample_paper_context or "",
         "quiz": "",
         "reasoning": "{}",
+        "quiz_payload": {},
         "critique": {},
         "initial_score": 0,
         "revised_quiz": "",
         "revision_notes": "",
+        "revised_quiz_payload": {},
         "reflection_rounds": 0,
     }
 
@@ -1259,7 +2150,14 @@ async def run_quiz_agent(
     )
     # ────────────────────────────────────────────────────────────────────
 
-    return result.get('revised_quiz') or result.get('quiz') or ''
+    final_text = result.get('revised_quiz') or result.get('quiz') or ''
+    final_payload = result.get('revised_quiz_payload') or result.get('quiz_payload') or _questions_from_quiz_text(final_text, topic)
+    return {
+        "kind": "quiz_set",
+        "render_mode": "interactive_cards",
+        "text": final_text,
+        "payload": final_payload,
+    }
 
 
 async def run_exam_agent(
@@ -1268,7 +2166,7 @@ async def run_exam_agent(
     total_questions: int = 34,
     sample_paper_context: str = None,
     quantity_dist: dict = None
-) -> str:
+) -> dict:
     """
     运行 Reflexion 出卷系统（3 Agent 协作）
     流程：出卷+推理链 → Critic质疑推理链 → Revise针对批评修订（最多2轮）
@@ -1324,13 +2222,16 @@ async def run_exam_agent(
     else:
         logger.info("[Exam Agent] 使用本地样卷格式")
 
-    contexts = []
-    for topic in topics:
-        ctx = await get_rag_context(topic)
-        # 如果有联网搜索的考点，合并到课件资料中
-        if online_knowledge_context:
-            ctx = ctx + online_knowledge_context
-        contexts.append(ctx)
+    # 试卷生成只使用单份 context，避免多 topic 串行检索造成长时间阻塞
+    merged_topic_query = "；".join([t for t in topics if t][:6]) if topics else "期末考试重点"
+    merged_context = await get_rag_context(merged_topic_query)
+    if online_knowledge_context:
+        merged_context = merged_context + online_knowledge_context
+    merged_context = _limit_context_size(merged_context, max_chars=12000)
+    logger.info(
+        f"[Exam Agent] 聚合检索完成: topics={len(topics)} -> single_context_len={len(merged_context)}"
+    )
+    contexts = [merged_context]
 
     # 合并样卷格式和联网搜索结果
     final_sample_context = (sample_paper_context or "") + online_format_context
@@ -1348,10 +2249,12 @@ async def run_exam_agent(
         "contexts": contexts,
         "exam_paper": "",
         "reasoning": "{}",
+        "exam_payload": {},
         "critique": {},
         "initial_score": 0,
         "revised_exam": "",
         "revision_notes": "",
+        "revised_exam_payload": {},
         "reflection_rounds": 0,
     }
 
@@ -1376,7 +2279,16 @@ async def run_exam_agent(
     exam_content = result.get('revised_exam') or result.get('exam_paper') or ''
     # 注意：不再去掉答案和解析，让前端可以显示
 
-    return exam_content
+    final_payload = result.get('revised_exam_payload') or result.get('exam_payload')
+    if not final_payload:
+        final_payload = _build_exam_payload_from_questions(parse_exam_content(exam_content).get("questions", []), title="期末考试试卷")
+
+    return {
+        "kind": "exam_paper",
+        "render_mode": "exam_canvas",
+        "text": exam_content,
+        "payload": final_payload,
+    }
 
 
 def _strip_answers_and_analysis(exam_text: str) -> str:

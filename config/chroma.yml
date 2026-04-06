@@ -6,8 +6,8 @@ md5_hex_store: md5.text
 allow_knowledge_file_type: ["txt", "pdf", "docx", "ppt", "pptx", "png", "jpg", "jpeg", "webp", "gif", "bmp"]
 
 # ============== 分块配置 - 优化版 ==============
-chunk_size: 1000      # 增大，单页PPT内容较多
-chunk_overlap: 200    # 增加重叠，保持上下文连贯
+chunk_size: 1800      # 增大，保留更多上下文，减少知识碎片化
+chunk_overlap: 300    # 增加重叠，保持上下文连贯
 separators: [
   "\n\n\n",      # 大段落分隔
   "\n\n",        # 段落分隔
@@ -27,13 +27,12 @@ separators: [
 # BM25 + 向量 RRF 混合检索
 bm25_weight: 0.3      # BM25 权重 (关键词匹配)
 vector_weight: 0.7    # 向量权重 (语义匹配)
-rrf_k: 60            # RRF 公式参数
+rrf_k: 30            # RRF 公式参数（降低30，重视高排名结果）
 
-# 检索参数
-retrieve_top_k: 10    # 混合检索召回数量
-rerank_top_k: 8      # 重排候选数量
-rerank_final_k: 5    # 最终返回数量
+# 检索参数 - 扩大覆盖范围
+retrieve_top_k: 20    # 混合检索召回数量
+rerank_final_k: 12   # 最终返回数量
 
 # MMR 多样性参数 (可选)
-mmr_enabled: false    # 是否启用 MMR 多样性检索
-mmr_lambda: 0.5       # 0=多样性, 1=相关性
+mmr_enabled: true    # 是否启用 MMR 多样性检索
+mmr_lambda: 0.5       # 0=多样性, 1=相关性（降低以增加多样性）

@@ -1,6 +1,7 @@
 from datetime import datetime
 import logging
 import os
+import sys
 import threading
 import time
 import asyncio
@@ -26,19 +27,14 @@ def get_logger(name: str = "agent",
     logger.setLevel(logging.DEBUG)
     # 避免重复添加 handler
     if logger.handlers:
-        return logger
-    # 控制台 handler
-    console_handler = logging.StreamHandler()
+        for h in logger.handlers[:]:
+            logger.removeHandler(h)
+    # 禁用向上传播，避免重复输出
+    logger.propagate = False
+    console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(console_level)
     console_handler.setFormatter(DEFAULT_LOGGING_FORMAT)
     logger.addHandler(console_handler)
-    # 文件 handler
-    if not log_file:
-        log_file = os.path.join(LOG_ROOT, f"{name}_{datetime.now().strftime('%Y%m%d')}.log")
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setLevel(file_level)
-    file_handler.setFormatter(DEFAULT_LOGGING_FORMAT)
-    logger.addHandler(file_handler)
     return logger
 
 

@@ -1,5 +1,6 @@
-chat_model_name: abab6.5s-chat
+chat_model_name: MiniMax-M2.7
 embedding_model_name: text-embedding-v3
-vision_model_name: qwen-vl-max       # 千问视觉模型（支持图片）
-vision_api_key: ${DASHSCOPE_API_KEY}  # 千问 API Key
-max_tokens: 8192
+light_model_name: MiniMax-M2.7
+max_tokens: 32768
+vision_api_key: ${DASHSCOPE_API_KEY}
+vision_model_name: qwen-vl-max

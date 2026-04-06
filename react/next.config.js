@@ -4,16 +4,17 @@ const nextConfig = {
   async rewrites() {
     return [
       {
+        // 排除 /api/chat/stream，让新的 API Route 处理
         source: '/api/:path*',
-        destination: 'http://127.0.0.1:8000/api/:path*',
+        destination: 'http://127.0.0.1:8001/api/:path*',
       },
       {
         source: '/app',
-        destination: 'http://127.0.0.1:8000/app',
+        destination: 'http://127.0.0.1:8001/app',
       },
       {
         source: '/static/:path*',
-        destination: 'http://127.0.0.1:8000/static/:path*',
+        destination: 'http://127.0.0.1:8001/static/:path*',
       },
     ];
   },

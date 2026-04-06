@@ -25,7 +25,7 @@ os.environ["SENTENCE_TRANSFORMERS_HOME"] = models_path
 # 保存前端进程对象
 _frontend_process = None
 
-
+    
 def open_browser():
     """等待服务器启动后，自动打开默认浏览器访问系统"""
     time.sleep(6)
@@ -131,10 +131,11 @@ if __name__ == "__main__":
     # 启动前端服务（后台运行）
     frontend_thread = threading.Thread(target=start_frontend, daemon=True)
     frontend_thread.start()
-
+    
     # 等待前端启动后打开浏览器
     browser_thread = threading.Thread(target=open_browser, daemon=True)
     browser_thread.start()
 
     # 启动后端 Uvicorn 服务器
-    uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("api.main:app", host="0.0.0.0", port=8001, reload=False, log_level="warning")
+    

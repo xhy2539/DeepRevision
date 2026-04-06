@@ -9,14 +9,20 @@ import json
 import os
 import sqlite3
 import asyncio
+import time
+import hashlib
 from pydantic import BaseModel, Field
-from typing import List, Dict
+from typing import List, Dict, Any, Optional
 from functools import partial
 
-from model.factory import chat_model
+from model.factory import chat_model, embed_model
 from utils.logger_handler import logger
+from utils.config_handler import chroma_conf
+from langchain_core.runnables import RunnableLambda
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
+from langchain_chroma import Chroma
+from langchain_core.documents import Document
 
 
 class KnowledgeGraphNode(BaseModel):
@@ -39,14 +45,20 @@ def _create_tables(conn: sqlite3.Connection):
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT PRIMARY KEY,
-            name       TEXT NOT NULL
+            name       TEXT NOT NULL,
+            parent_id  TEXT REFERENCES sessions(session_id)
         );
         CREATE TABLE IF NOT EXISTS messages (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT    NOT NULL,
             role       TEXT    NOT NULL,
             content    TEXT    NOT NULL,
-            bucket     TEXT    NOT NULL   -- 'recent' | 'trash'
+            bucket     TEXT    NOT NULL,  -- 'recent' | 'trash'
+            timestamp  INTEGER,
+            kind       TEXT,
+            render_mode TEXT,
+            payload    TEXT,
+            meta       TEXT
         );
         CREATE TABLE IF NOT EXISTS graph_nodes (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,42 +67,160 @@ def _create_tables(conn: sqlite3.Connection):
             relation   TEXT    NOT NULL,
             object     TEXT    NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS practice_records (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id      TEXT    NOT NULL,
+            question_id     TEXT,
+            question_content TEXT    NOT NULL,
+            knowledge_point TEXT,
+            user_answer     TEXT,
+            correct_answer  TEXT,
+            is_correct      INTEGER NOT NULL,
+            wrong_reason    TEXT,
+            created_at      INTEGER NOT NULL
+        );
     """)
     # 创建索引，加速按 session_id 查询
     conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_sid ON messages(session_id);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_sid ON graph_nodes(session_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_practice_sid ON practice_records(session_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_practice_kp ON practice_records(knowledge_point);")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS question_bank (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            question_id     TEXT    UNIQUE,
+            session_id      TEXT    NOT NULL,
+            knowledge_point TEXT,
+            question_content TEXT   NOT NULL,
+            answer          TEXT,
+            chroma_id       TEXT,
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_qbank_sid ON question_bank(session_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_qbank_kp ON question_bank(knowledge_point);")
     conn.commit()
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str):
+    cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column in cols:
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+    conn.commit()
+    logger.info(f"[记忆迁移] 已为 {table} 表添加 {column} 列")
+
+
+def _migrate_add_parent_id(conn: sqlite3.Connection):
+    """迁移：为 sessions 表添加 parent_id 列（如果不存在）"""
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN parent_id TEXT")
+        conn.commit()
+        logger.info("[记忆迁移] 已为 sessions 表添加 parent_id 列")
+    except Exception as e:
+        # 列可能已存在
+        if "duplicate column name" in str(e).lower():
+            pass
+        else:
+            logger.warning(f"[记忆迁移] parent_id 列添加失败（可能已存在）: {e}")
+
+
+def _migrate_messages_schema(conn: sqlite3.Connection):
+    """迁移：为 messages 表添加结构化协议字段"""
+    try:
+        _ensure_column(conn, "messages", "timestamp", "INTEGER")
+        _ensure_column(conn, "messages", "kind", "TEXT")
+        _ensure_column(conn, "messages", "render_mode", "TEXT")
+        _ensure_column(conn, "messages", "payload", "TEXT")
+        _ensure_column(conn, "messages", "meta", "TEXT")
+    except Exception as e:
+        logger.warning(f"[记忆迁移] messages 表结构升级失败: {e}")
+
+
+def _loads_json_or_default(text: Optional[str], default: Any) -> Any:
+    if not text:
+        return default
+    try:
+        return json.loads(text)
+    except Exception:
+        return default
+
+
+def _load_session_sync(db: str, session_id: str) -> Dict:
+    """按需加载单个 session 的完整数据"""
+    conn = sqlite3.connect(db)
+    try:
+        session = {"name": session_id, "parent_id": None, "recent": [], "trash": [], "graph": []}
+
+        row = conn.execute(
+            "SELECT name, parent_id FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        if row:
+            session["name"] = row[0]
+            session["parent_id"] = row[1]
+
+        for (role, content, bucket, timestamp, kind, render_mode, payload, meta) in conn.execute(
+            "SELECT role, content, bucket, timestamp, kind, render_mode, payload, meta FROM messages WHERE session_id = ? ORDER BY id",
+            (session_id,)
+        ):
+            session[bucket].append({
+                "role": role,
+                "content": content,
+                "timestamp": timestamp or int(time.time() * 1000),
+                "kind": kind or ("chat" if role == "ai" else None),
+                "render_mode": render_mode or ("markdown" if role == "ai" else None),
+                "payload": _loads_json_or_default(payload, None),
+                "meta": _loads_json_or_default(meta, None),
+            })
+
+        for (subject, relation, obj) in conn.execute(
+            "SELECT subject, relation, object FROM graph_nodes WHERE session_id = ? ORDER BY id",
+            (session_id,)
+        ):
+            session["graph"].append({"subject": subject, "relation": relation, "object": obj})
+
+        return session
+    finally:
+        conn.close()
+
+
 def _load_all_sync(db: str) -> Dict[str, Dict]:
-    """启动时一次性把 SQLite 全部数据读入内存 store"""
+    """启动时只加载 session 索引（懒加载实际数据）"""
     conn = sqlite3.connect(db)
     _create_tables(conn)
+    _migrate_add_parent_id(conn)
+    _migrate_messages_schema(conn)
     store: Dict[str, Dict] = {}
 
-    for row in conn.execute("SELECT session_id, name FROM sessions"):
-        sid, name = row
-        store[sid] = {"name": name, "recent": [], "trash": [], "graph": []}
-
-    for row in conn.execute(
-        "SELECT session_id, role, content, bucket FROM messages ORDER BY id"
-    ):
-        sid, role, content, bucket = row
-        if sid in store:
-            store[sid][bucket].append({"role": role, "content": content})
-
-    for row in conn.execute(
-        "SELECT session_id, subject, relation, object FROM graph_nodes ORDER BY id"
-    ):
-        sid, subject, relation, obj = row
-        if sid in store:
-            store[sid]["graph"].append({"subject": subject, "relation": relation, "object": obj})
+    for row in conn.execute("SELECT session_id, name, parent_id FROM sessions"):
+        sid, name, parent_id = row
+        store[sid] = {"name": name, "parent_id": parent_id, "recent": None, "trash": None, "graph": None}
 
     conn.close()
     return store
 
 
-def _append_message_sync(db: str, session_id: str, role: str, content: str, bucket: str):
+def _ensure_session_loaded(store: Dict[str, Dict], db: str, session_id: str):
+    if session_id not in store:
+        store[session_id] = {"name": session_id, "parent_id": None, "recent": None, "trash": None, "graph": None}
+
+    if store[session_id].get("recent") is None:
+        loaded = _load_session_sync(db, session_id)
+        store[session_id] = loaded
+
+
+def _append_message_sync(
+    db: str,
+    session_id: str,
+    role: str,
+    content: str,
+    bucket: str,
+    timestamp: int,
+    kind: Optional[str],
+    render_mode: Optional[str],
+    payload: Optional[Dict[str, Any]],
+    meta: Optional[Dict[str, Any]],
+):
     """只追加一条消息，不重写整个 session"""
     conn = sqlite3.connect(db)
     try:
@@ -99,8 +229,18 @@ def _append_message_sync(db: str, session_id: str, role: str, content: str, buck
             (session_id, session_id)
         )
         conn.execute(
-            "INSERT INTO messages (session_id, role, content, bucket) VALUES (?, ?, ?, ?)",
-            (session_id, role, content, bucket)
+            "INSERT INTO messages (session_id, role, content, bucket, timestamp, kind, render_mode, payload, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                session_id,
+                role,
+                content,
+                bucket,
+                timestamp,
+                kind,
+                render_mode,
+                json.dumps(payload, ensure_ascii=False) if payload is not None else None,
+                json.dumps(meta, ensure_ascii=False) if meta is not None else None,
+            )
         )
         conn.commit()
     finally:
@@ -113,20 +253,38 @@ def _save_session_sync(db: str, session_id: str, session: Dict):
     try:
         # session 基本信息
         conn.execute(
-            "INSERT OR REPLACE INTO sessions (session_id, name) VALUES (?, ?)",
-            (session_id, session["name"])
+            "INSERT OR REPLACE INTO sessions (session_id, name, parent_id) VALUES (?, ?, ?)",
+            (session_id, session["name"], session.get("parent_id"))
         )
         # 清除旧消息、重写（消息量小，直接覆盖简单可靠）
         conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
         for msg in session["recent"]:
             conn.execute(
-                "INSERT INTO messages (session_id, role, content, bucket) VALUES (?, ?, ?, 'recent')",
-                (session_id, msg["role"], msg["content"])
+                "INSERT INTO messages (session_id, role, content, bucket, timestamp, kind, render_mode, payload, meta) VALUES (?, ?, ?, 'recent', ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    msg["role"],
+                    msg["content"],
+                    msg.get("timestamp"),
+                    msg.get("kind"),
+                    msg.get("render_mode"),
+                    json.dumps(msg.get("payload"), ensure_ascii=False) if msg.get("payload") is not None else None,
+                    json.dumps(msg.get("meta"), ensure_ascii=False) if msg.get("meta") is not None else None,
+                )
             )
         for msg in session["trash"]:
             conn.execute(
-                "INSERT INTO messages (session_id, role, content, bucket) VALUES (?, ?, ?, 'trash')",
-                (session_id, msg["role"], msg["content"])
+                "INSERT INTO messages (session_id, role, content, bucket, timestamp, kind, render_mode, payload, meta) VALUES (?, ?, ?, 'trash', ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    msg["role"],
+                    msg["content"],
+                    msg.get("timestamp"),
+                    msg.get("kind"),
+                    msg.get("render_mode"),
+                    json.dumps(msg.get("payload"), ensure_ascii=False) if msg.get("payload") is not None else None,
+                    json.dumps(msg.get("meta"), ensure_ascii=False) if msg.get("meta") is not None else None,
+                )
             )
         # graph 节点：只追加（提纯后 extend，不会重复写旧节点）
         # 策略：全量覆盖保持简单
@@ -164,20 +322,32 @@ def _migrate_from_json(db: str, json_path: str):
 
         conn = sqlite3.connect(db)
         _create_tables(conn)
+        _migrate_add_parent_id(conn)
+        _migrate_messages_schema(conn)
         existing = {row[0] for row in conn.execute("SELECT session_id FROM sessions")}
 
         for sid, session in old_store.items():
             if sid in existing:
                 continue  # 已迁移，跳过
             conn.execute(
-                "INSERT OR IGNORE INTO sessions (session_id, name) VALUES (?, ?)",
-                (sid, session.get("name", sid))
+                "INSERT OR IGNORE INTO sessions (session_id, name, parent_id) VALUES (?, ?, ?)",
+                (sid, session.get("name", sid), session.get("parent_id"))
             )
             for bucket in ("recent", "trash"):
                 for msg in session.get(bucket, []):
                     conn.execute(
-                        "INSERT INTO messages (session_id, role, content, bucket) VALUES (?, ?, ?, ?)",
-                        (sid, msg["role"], msg["content"], bucket)
+                        "INSERT INTO messages (session_id, role, content, bucket, timestamp, kind, render_mode, payload, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            sid,
+                            msg["role"],
+                            msg["content"],
+                            bucket,
+                            msg.get("timestamp", int(time.time() * 1000)),
+                            msg.get("kind"),
+                            msg.get("render_mode"),
+                            json.dumps(msg.get("payload"), ensure_ascii=False) if msg.get("payload") is not None else None,
+                            json.dumps(msg.get("meta"), ensure_ascii=False) if msg.get("meta") is not None else None,
+                        )
                     )
             for node in session.get("graph", []):
                 conn.execute(
@@ -194,10 +364,14 @@ def _migrate_from_json(db: str, json_path: str):
 # ==================== SessionMemoryManager ====================
 
 class SessionMemoryManager:
-    def __init__(self, max_recent_turns: int = 5, trash_threshold: int = 4):
+    def __init__(self, max_recent_turns: int = 5, trash_threshold: int = 4, max_graph_nodes: int = 100, max_trash_size: int = 50):
         self.max_recent_turns = max_recent_turns
         self.trash_threshold = trash_threshold
+        self.max_graph_nodes = max_graph_nodes
+        self.max_trash_size = max_trash_size
         self.db = _db_path()
+        self._distilling: set = set()
+        self._distilling_lock = asyncio.Lock()
 
         # 迁移旧 JSON 数据（仅首次）
         json_path = os.path.join(os.getcwd(), "data", "sessions.json")
@@ -218,56 +392,97 @@ class SessionMemoryManager:
             partial(_save_session_sync, self.db, session_id, session)
         )
 
-    def _init_session(self, session_id: str, name: str = None):
+    def _init_session(self, session_id: str, name: str = None, parent_id: str = None):
         if session_id not in self.store:
-            self.store[session_id] = {
-                "name": name or session_id,
-                "recent": [],
-                "trash": [],
-                "graph": [],
-            }
+            self.store[session_id] = {"name": name or session_id, "parent_id": parent_id, "recent": None, "trash": None, "graph": None}
+        _ensure_session_loaded(self.store, self.db, session_id)
+        if name:
+            self.store[session_id]["name"] = name
+        if parent_id is not None:
+            self.store[session_id]["parent_id"] = parent_id
 
     # ── 公开接口 ──────────────────────────────────────────────────────────
 
-    def register_session(self, session_id: str, name: str):
-        """显式注册/创建新会话"""
-        self._init_session(session_id, name)
+    def register_session(self, session_id: str, name: str, parent_id: str = None):
+        """显式注册/创建新会话，可指定父会话 ID（用于子会话/分支）"""
+        self._init_session(session_id, name, parent_id)
         self.store[session_id]["name"] = name
+        self.store[session_id]["parent_id"] = parent_id
         asyncio.create_task(self._persist(session_id))
 
-    async def add_message(self, session_id: str, role: str, content: str):
+    async def add_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        *,
+        kind: Optional[str] = None,
+        render_mode: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+        meta: Optional[Dict[str, Any]] = None,
+        timestamp: Optional[int] = None,
+    ):
         """添加消息；超过阈值时 fire-and-forget 触发图谱提纯"""
         self._init_session(session_id)
+        _ensure_session_loaded(self.store, self.db, session_id)
         session = self.store[session_id]
 
-        session["recent"].append({"role": role, "content": content})
+        message_timestamp = timestamp or int(time.time() * 1000)
+        session["recent"].append({
+            "role": role,
+            "content": content,
+            "timestamp": message_timestamp,
+            "kind": kind,
+            "render_mode": render_mode,
+            "payload": payload,
+            "meta": meta,
+        })
 
         max_messages = self.max_recent_turns * 2
         if len(session["recent"]) > max_messages:
-            # 滑动窗口挤出：消息状态发生结构性变化，全量覆写保证一致性
             kicked = session["recent"][:2]
             session["recent"] = session["recent"][2:]
             session["trash"].extend(kicked)
 
+            if len(session["trash"]) > self.max_trash_size:
+                session["trash"] = session["trash"][-self.max_trash_size:]
+
             if len(session["trash"]) >= self.trash_threshold * 2:
                 asyncio.create_task(self._trigger_background_distillation(session_id))
 
-            await self._persist(session_id)  # 结构变更：全量覆写
+            await self._persist(session_id)
         else:
-            # 正常追加：只写新消息这一行，不重写整个 session
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
                 None,
-                partial(_append_message_sync, self.db, session_id, role, content, "recent")
+                partial(
+                    _append_message_sync,
+                    self.db,
+                    session_id,
+                    role,
+                    content,
+                    "recent",
+                    message_timestamp,
+                    kind,
+                    render_mode,
+                    payload,
+                    meta,
+                )
             )
 
     async def _trigger_background_distillation(self, session_id: str):
+        async with self._distilling_lock:
+            if session_id in self._distilling:
+                return
+            self._distilling.add(session_id)
         trash_data = list(self.store[session_id]["trash"])
         self.store[session_id]["trash"].clear()
         try:
             await self._distill_to_graph(session_id, trash_data)
         except Exception as e:
             logger.error(f"[记忆提纯失败] {e}")
+        finally:
+            self._distilling.discard(session_id)
 
     async def _distill_to_graph(self, session_id: str, trash_data: List[Dict]):
         parser = JsonOutputParser(pydantic_object=KnowledgeGraphNode)
@@ -284,31 +499,89 @@ class SessionMemoryManager:
         )
 
         history_text = "\n".join([f"{m['role']}: {m['content']}" for m in trash_data])
-        chain = prompt | chat_model | parser
+
+        def strip_think_tags(text):
+            """去除 <think> 标签内容，避免 JSON 解析失败"""
+            import re
+            text = re.sub(r'<think>[\s\S]*?<\/think>', '', text).strip()
+            return text
+
+        strip_chain = RunnableLambda(strip_think_tags)
+        chain = prompt | chat_model | strip_chain | parser
 
         logger.info(f"[记忆提纯] 正在提纯 {session_id} 的 {len(trash_data)} 条记录...")
         result = await chain.ainvoke({"history": history_text})
 
         if result and isinstance(result, list):
-            self.store[session_id]["graph"].extend(result)
+            session = self.store[session_id]
+            current_size = len(session["graph"])
+            result_size = len(result)
+            if current_size + result_size > self.max_graph_nodes:
+                available = self.max_graph_nodes - current_size
+                if available > 0:
+                    session["graph"].extend(result[:available])
+                else:
+                    session["graph"] = result[:self.max_graph_nodes] if result else []
+                logger.info(f"[记忆提纯] {session_id} 图谱超限，保留最近 {self.max_graph_nodes} 条知识节点")
+            else:
+                session["graph"].extend(result)
+                logger.info(f"[记忆提纯] {session_id} 抽取 {len(result)} 条知识节点")
             await self._persist(session_id)
-            logger.info(f"[记忆提纯] {session_id} 抽取 {len(result)} 条知识节点")
 
     def get_memory_context(self, session_id: str) -> str:
         self._init_session(session_id)
         session = self.store[session_id]
-        if not session["graph"]:
+
+        # 获取自己的图谱
+        own_graph = session.get("graph") or []
+
+        # 获取父会话的图谱（递归向上查找）
+        parent_graph = []
+        if session.get("parent_id"):
+            parent_graph = self._get_parent_graph(session["parent_id"])
+
+        # 合并去重（基于 subject + relation 作为 key）
+        all_nodes = self._merge_graph_nodes(own_graph, parent_graph)
+
+        if not all_nodes:
             return ""
         context = "【以往复习知识点图谱备忘】\n"
-        for node in session["graph"]:
+        for node in all_nodes:
             context += (
                 f"- 概念[{node.get('subject', '')}] : "
                 f"{node.get('relation', '')} -> {node.get('object', '')}\n"
             )
         return context
 
+    def _get_parent_graph(self, parent_id: str, _visited: set = None) -> List[Dict]:
+        """递归获取父会话及其祖先的图谱节点（带环检测）"""
+        if _visited is None:
+            _visited = set()
+        if not parent_id or parent_id in _visited:
+            return []
+        _visited.add(parent_id)
+        self._init_session(parent_id)
+        parent_session = self.store.get(parent_id, {})
+        parent_graph = parent_session.get("graph") or []
+        # 递归向上获取祖先图谱
+        grandparent_id = parent_session.get("parent_id")
+        if grandparent_id:
+            parent_graph = parent_graph + self._get_parent_graph(grandparent_id, _visited)
+        return parent_graph
+
+    def _merge_graph_nodes(self, own_graph: List[Dict], parent_graph: List[Dict]) -> List[Dict]:
+        """合并去重图谱节点，基于 subject+relation 作为唯一键"""
+        seen = set()
+        merged = []
+        for node in own_graph + parent_graph:
+            key = (node.get('subject', ''), node.get('relation', ''))
+            if key not in seen:
+                seen.add(key)
+                merged.append(node)
+        return merged
+
     def get_all_sessions(self) -> List[Dict[str, str]]:
-        return [{"id": k, "name": v["name"]} for k, v in self.store.items()]
+        return [{"id": k, "name": v["name"], "parent_id": v.get("parent_id")} for k, v in self.store.items()]
 
     def rename_session(self, session_id: str, new_name: str) -> bool:
         if session_id not in self.store:
@@ -327,6 +600,218 @@ class SessionMemoryManager:
         else:
             _delete_session_sync(self.db, session_id)
         return True
+
+    def add_practice_record(self, session_id: str, question_id: str, question_content: str,
+                           knowledge_point: str, user_answer: str, correct_answer: str,
+                           is_correct: bool, wrong_reason: str = None):
+        """记录一次练习答题"""
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, partial(
+            _add_practice_record_sync,
+            self.db, session_id, question_id, question_content,
+            knowledge_point, user_answer, correct_answer, is_correct, wrong_reason
+        ))
+
+    def get_practice_history(self, session_id: str, limit: int = 20) -> List[Dict]:
+        """获取练习历史"""
+        conn = sqlite3.connect(self.db)
+        try:
+            rows = conn.execute("""
+                SELECT question_content, knowledge_point, user_answer, correct_answer, is_correct, wrong_reason, created_at
+                FROM practice_records
+                WHERE session_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (session_id, limit)).fetchall()
+            return [
+                {
+                    "question_content": row[0],
+                    "knowledge_point": row[1],
+                    "user_answer": row[2],
+                    "correct_answer": row[3],
+                    "is_correct": bool(row[4]),
+                    "wrong_reason": row[5],
+                    "created_at": row[6]
+                }
+                for row in rows
+            ]
+        finally:
+            conn.close()
+
+    def get_knowledge_point_stats(self, session_id: str) -> Dict[str, Dict]:
+        """获取知识点统计：每个知识点的练习次数、正确率"""
+        conn = sqlite3.connect(self.db)
+        try:
+            rows = conn.execute("""
+                SELECT knowledge_point,
+                       COUNT(*) as total,
+                       SUM(CASE WHEN is_correct = 1 THEN 1 ELSE 0 END) as correct
+                FROM practice_records
+                WHERE session_id = ? AND knowledge_point IS NOT NULL
+                GROUP BY knowledge_point
+            """, (session_id,)).fetchall()
+            stats = {}
+            for row in rows:
+                total = row[1]
+                correct = row[2]
+                stats[row[0]] = {
+                    "total": total,
+                    "correct": correct,
+                    "accuracy": round(correct / total * 100, 1) if total > 0 else 0,
+                    "weak": (correct / total < 0.6) if total > 0 else False
+                }
+            return stats
+        finally:
+            conn.close()
+
+    def _get_question_bank_chroma(self) -> Chroma:
+        """获取题库 ChromaDB 实例（复用单例）"""
+        if not hasattr(self, '_question_bank_chroma'):
+            self._question_bank_chroma = Chroma(
+                collection_name="question_bank",
+                embedding_function=embed_model,
+                persist_directory=chroma_conf['persist_directory'],
+            )
+        return self._question_bank_chroma
+
+    def store_question_to_bank(self, session_id: str, question_id: str, question_content: str,
+                                knowledge_point: str, answer: str) -> str:
+        """存储题目到题库（用于相似题检索）"""
+        # 计算确定性 ID
+        q_hash = hashlib.md5(f"{session_id}:{question_id}".encode()).hexdigest()[:16]
+        chroma_id = f"qbank_{q_hash}"
+
+        # 构建文档
+        doc = Document(
+            page_content=question_content,
+            metadata={
+                "question_id": question_id,
+                "session_id": session_id,
+                "knowledge_point": knowledge_point or "",
+                "answer": answer or "",
+                "chroma_id": chroma_id,
+            }
+        )
+
+        # 存入 ChromaDB
+        chroma = self._get_question_bank_chroma()
+        chroma.add_documents([doc], ids=[chroma_id])
+
+        # 同时记录到 SQLite（直接调用同步函数，store_question_to_bank 本身是同步方法）
+        try:
+            _store_question_bank_sync(
+                self.db, question_id, session_id, knowledge_point, question_content, answer, chroma_id
+            )
+        except Exception as e:
+            logger.error(f"[题库] SQLite 存储失败: {e}")
+
+        logger.info(f"[题库] 已存储题目 {question_id} 到题库")
+        return chroma_id
+
+    def search_similar_questions(self, question_content: str, knowledge_point: str = None,
+                                  limit: int = 5) -> List[Dict]:
+        """搜索相似题目（基于向量相似度）"""
+        try:
+            # 嵌入查询内容
+            query_embedding = embed_model.embed_query(question_content)
+
+            # 搜索 ChromaDB
+            chroma = self._get_question_bank_chroma()
+            results = chroma.similarity_search_by_vector(
+                embedding=query_embedding,
+                k=limit * 2,  # 多取一些，后面过滤
+            )
+
+            similar_questions = []
+            seen_content = set()
+
+            for doc in results:
+                content = doc.page_content
+                # 去重（相似内容可能重复）
+                content_key = content[:50]
+                if content_key in seen_content:
+                    continue
+
+                kp = doc.metadata.get("knowledge_point", "")
+                # 如果指定了知识点，优先返回同知识点的
+                if knowledge_point and kp != knowledge_point and len(similar_questions) >= limit:
+                    continue
+
+                similar_questions.append({
+                    "question_content": content,
+                    "answer": doc.metadata.get("answer", ""),
+                    "knowledge_point": kp,
+                    "question_id": doc.metadata.get("question_id", ""),
+                })
+                seen_content.add(content_key)
+
+                if len(similar_questions) >= limit:
+                    break
+
+            # 如果不够，回退到只看知识点匹配
+            if len(similar_questions) < limit:
+                conn = sqlite3.connect(self.db)
+                try:
+                    rows = conn.execute("""
+                        SELECT question_content, answer, knowledge_point, question_id
+                        FROM question_bank
+                        WHERE knowledge_point = ?
+                        ORDER BY RANDOM()
+                        LIMIT ?
+                    """, (knowledge_point, limit - len(similar_questions))).fetchall()
+
+                    for row in rows:
+                        content = row[0]
+                        content_key = content[:50]
+                        if content_key in seen_content:
+                            continue
+                        similar_questions.append({
+                            "question_content": row[0],
+                            "answer": row[1],
+                            "knowledge_point": row[2],
+                            "question_id": row[3],
+                        })
+                        seen_content.add(content_key)
+                finally:
+                    conn.close()
+
+            return similar_questions[:limit]
+        except Exception as e:
+            logger.error(f"[题库] 搜索相似题目失败: {e}")
+            return []
+
+
+def _store_question_bank_sync(db: str, question_id: str, session_id: str,
+                               knowledge_point: str, question_content: str,
+                               answer: str, chroma_id: str):
+    """同步写入题目到 SQLite"""
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("""
+            INSERT OR REPLACE INTO question_bank
+            (question_id, session_id, knowledge_point, question_content, answer, chroma_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (question_id, session_id, knowledge_point, question_content, answer, chroma_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _add_practice_record_sync(db: str, session_id: str, question_id: str, question_content: str,
+                              knowledge_point: str, user_answer: str, correct_answer: str,
+                              is_correct: bool, wrong_reason: str):
+    """同步写入一条练习记录"""
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("""
+            INSERT INTO practice_records (session_id, question_id, question_content, knowledge_point,
+                                         user_answer, correct_answer, is_correct, wrong_reason, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (session_id, question_id, question_content, knowledge_point,
+              user_answer, correct_answer, int(is_correct), wrong_reason, int(time.time())))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # 全局单例

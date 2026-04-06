@@ -10,6 +10,9 @@ langchain-openai>=0.2.0
 langchain-community>=0.3.0
 langchain-text-splitters>=0.3.0
 
+# LangGraph (required for supervisor workflow)
+langgraph>=0.4.0
+
 # Vector Store
 langchain-chroma>=0.1.0
 chromadb>=0.4.0

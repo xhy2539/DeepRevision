@@ -28,6 +28,13 @@
 | 🗂️ 多科目隔离 | ContextVar + ChromaDB Collection，每科目独立知识库 |
 | 📊 算力监控 | AOP 装饰器实时统计 Token 消耗与调用延迟 |
 
+### 当前实现补充（2026-04）
+
+- 对话流式协议已升级为 `start / delta / complete` 事件，支持后端携带 `kind/render_mode/payload`，前端可稳定渲染 `quiz_set` 与 `exam_paper`。
+- 出卷链路默认并发上限为 2，并加入结构化失败时的分批文本补题兜底，避免单批超时导致整卷空白。
+- 知识库上传状态改为持久化 `ingest_status.json`（`processing/completed/failed`），并支持失败文件一键重试。
+- 新增健康检查接口：`GET /health`。
+
 ---
 
 ## 二、技术栈
@@ -371,7 +378,8 @@ async def add_message(self, session_id, role, content):
 | 方法 | 路径 | 描述 |
 |------|------|------|
 | POST | `/api/knowledge/upload` | 上传课件（最多5个，后台向量化） |
-| GET | `/api/knowledge/list` | 已向量化文件列表 |
+| GET | `/api/knowledge/list` | 已上传文件列表（含 processing/completed/failed 状态） |
+| POST | `/api/knowledge/retry-failed` | 重试当前会话中失败文件 |
 | POST | `/api/knowledge/sample/upload` | 上传样卷（学习试卷风格） |
 | GET | `/api/knowledge/sample` | 获取样卷格式 |
 | DELETE | `/api/knowledge/sample` | 删除样卷 |
@@ -384,6 +392,7 @@ async def add_message(self, session_id, role, content):
 | POST | `/api/exam/export/docx` | 导出试卷为 Word |
 | POST | `/api/exam/answersheet` | 生成答案卷 Word |
 | GET | `/api/exam/download/{filename}` | 下载导出文件 |
+| GET | `/health` | 服务健康检查 |
 
 ### 用户认证
 
@@ -451,7 +460,7 @@ MINIMAX_API_KEY=your_minimax_api_key
 # 后端
 python run.py
 # 或
-uvicorn api.main:app --reload --port 8000
+uvicorn api.main:app --reload --port 8001
 
 # 前端
 cd react && npm install && npm run dev

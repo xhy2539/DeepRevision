@@ -12,7 +12,7 @@
     --brand-dark: 15 118 110;   /* 深青绿 #0F766E */
     --accent: 245 158 11;       /* 琥珀色 #F59E0B */
 
-    --background: 250 250 250;  /* 浅灰白 */
+    --background: 251 250 245;  /* 米白 - 纸张质感 */
     --foreground: 24 24 27;     /* 近黑色 */
 
     --card: 255 255 255;
@@ -27,7 +27,7 @@
     --secondary: 241 245 249;
     --secondary-foreground: 51 65 85;
 
-    --muted: 241 245 249;
+    --muted: 249 250 251;
     --muted-foreground: 100 116 139;
 
     --accent: 245 158 11;
@@ -83,6 +83,17 @@
   }
 }
 
+/* ============== 纸张质感背景 ============== */
+body {
+  background: linear-gradient(135deg, #fbfaf5 0%, #f8f6f0 50%, #f5f2eb 100%);
+  background-attachment: fixed;
+}
+
+/* 衬线字体用于标题 */
+h1, h2, h3, .font-serif {
+  font-family: var(--font-serif), "Noto Serif SC", "Songti SC", serif;
+}
+
 /* ============== 动画系统 ============== */
 @keyframes slideUp {
   from {
@@ -112,13 +123,28 @@
 }
 
 @keyframes shimmer {
-  0% { background-position: -200% 0; }
-  100% { background-position: 200% 0; }
+ 0% { background-position: -200% 0; }
+ 100% { background-position: 200% 0; }
 }
 
 @keyframes pulse-soft {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.7; }
+}
+
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateX(100%);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.animate-slide-in {
+  animation: slideIn 0.3s ease-out forwards;
 }
 
 /* 消息动画 */
