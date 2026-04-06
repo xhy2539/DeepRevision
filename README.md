@@ -20,8 +20,8 @@
 | 能力 | 描述 |
 |------|------|
 | 📥 多格式课件摄入 | PDF / Word / PPT / TXT / 图片，按页解析，图片内容通过多模态模型并发理解 |
-| 🔍 混合检索 | Query Rewrite + BM25 + 向量检索 RRF 融合 + LLM 重排序 |
-| 🤖 Supervisor 多 Agent | LangGraph Supervisor 分析意图 → 路由到专业 SubAgent（RAG / 出题 / 出卷 / 规划 / 闲聊） |
+| 🔍 混合检索 | Query Rewrite + BM25 + 向量检索 RRF 融合（支持可选重排） |
+| 🤖 Supervisor 多 Agent | LangGraph Supervisor 分析意图 → 路由到专业 SubAgent（RAG / 出题 / 出卷 / 规划 / 历史分析 / 闲聊） |
 | 📝 Reflexion 出题 | LangGraph Reflexion 架构：出题 + 推理链 → Critic 质疑推理 → Revise 针对批评修订（最多 2 轮） |
 | 🧠 双轨记忆 | 短期滑窗 + 后台异步图谱提纯，SQLite 本地持久化，重启不丢失 |
 | 📄 试卷导出 | 生成完整试卷并导出 Word |
@@ -46,7 +46,7 @@
 | LLM 框架 | LangChain 0.3 + LangGraph |
 | Agent 编排 | LangGraph StateGraph（Supervisor + Reflexion） |
 | 向量库 | ChromaDB（本地持久化） |
-| 检索策略 | BM25 + 向量 RRF 混合 + LLM Rerank |
+| 检索策略 | BM25 + 向量 RRF 混合检索（可选重排） |
 | 大模型 | MiniMax（可替换为任意 OpenAI 兼容模型） |
 | 多模态 | MiniMax 视觉模型（图片/PPT 图片理解） |
 | 前端 | React + Tailwind CSS |
@@ -65,18 +65,18 @@ FastAPI (ASGI) /api/chat/stream
 Supervisor Agent (LangGraph StateGraph)
   ├── 分析用户意图 → 输出结构化路由决策（JSON）
   └── 条件路由 add_conditional_edges
-        ├── rag_agent    → RAG Service（混合检索 + LLM 总结）
+        ├── rag_agent    → RAG Service（混合检索 + 片段检索）
         ├── quiz_agent   → Reflexion 出题工作流（3 Agent）
         ├── exam_agent   → Reflexion 出卷工作流（3 Agent）
         ├── planner_agent→ 复习计划生成
+        ├── history_agent→ 历史练习分析
         └── chitchat     → 闲聊回复
               │
     ┌─────────┴──────────────────────────────┐
     │           RAG Service                   │
     │  Query Rewrite (LLM)                    │
     │  → BM25 + 向量 RRF 混合检索             │
-    │  → LLM Rerank                           │
-    │  → 上下文总结                            │
+    │  → 结构化上下文拼接                      │
     └────────────────┬───────────────────────┘
                      │
             ChromaDB（per session collection）
@@ -89,13 +89,14 @@ Supervisor Agent (LangGraph StateGraph)
    │
    ▼
 Supervisor LLM（分析意图）
-   │ 输出 {"route": "rag|quiz|exam|planner|chitchat", "params": {...}}
+   │ 输出 {"route": "rag|quiz|exam|planner|history|chitchat", "params": {...}}
    ▼
 add_conditional_edges（条件路由）
    ├── rag      → rag_agent      → END
    ├── quiz     → quiz_agent     → END
    ├── exam     → exam_agent     → END
    ├── planner  → planner_agent  → END
+   ├── history  → history_agent  → END
    └── chitchat → chitchat       → END
 ```
 
@@ -163,11 +164,11 @@ DeepRevision/
 │   ├── tools/
 │   │   └── agent_tools.py       # RAG 缓存清理工具（clear_rag_cache）
 │   └── multi_agent/
-│       ├── supervisor.py        # Supervisor 路由 + 5 个 SubAgent 节点
+│       ├── supervisor.py        # Supervisor 路由 + 6 个 SubAgent 节点
 │       └── quiz_agent.py        # Reflexion 出题 + 出卷工作流（3 Agent）
 │
 ├── rag/
-│   ├── rag_service.py           # 混合检索 + Query Rewrite + LLM Rerank
+│   ├── rag_service.py           # 混合检索 + Query Rewrite（可选重排）
 │   └── vector_store.py          # ChromaDB 封装 + 并发图片处理
 │
 ├── model/
@@ -297,7 +298,7 @@ def _rrf_fuse(self, docs1, docs2):
     return sorted by score
 ```
 
-流程：Query Rewrite → BM25 + 向量并行检索 → RRF 融合 → LLM Rerank 精筛
+流程：Query Rewrite → BM25 + 向量并行检索 → RRF 融合（可选重排）
 
 ### 5. 图片并发处理
 
@@ -380,6 +381,7 @@ async def add_message(self, session_id, role, content):
 | POST | `/api/knowledge/upload` | 上传课件（最多5个，后台向量化） |
 | GET | `/api/knowledge/list` | 已上传文件列表（含 processing/completed/failed 状态） |
 | POST | `/api/knowledge/retry-failed` | 重试当前会话中失败文件 |
+| DELETE | `/api/knowledge/file/{filename}` | 删除上传文件并同步删除其向量/状态 |
 | POST | `/api/knowledge/sample/upload` | 上传样卷（学习试卷风格） |
 | GET | `/api/knowledge/sample` | 获取样卷格式 |
 | DELETE | `/api/knowledge/sample` | 删除样卷 |
@@ -414,16 +416,20 @@ chunk_overlap: 200      # 分块重叠
 k: 8                    # 向量检索 top-k
 
 retrieve_top_k: 10      # 混合检索召回数量
-rerank_top_k: 8         # LLM 重排后保留数量
+rerank_final_k: 8       # 最终返回数量
 rrf_k: 60               # RRF 公式参数
+mmr_enabled: true       # 是否启用 MMR 多样性检索
+mmr_lambda: 0.5         # 0=多样性, 1=相关性
 ```
 
 ### `config/rag.yml` — 模型配置
 
 ```yaml
-chat_model_name: abab6.5s-chat       # 主对话模型
+chat_model_name: MiniMax-M2.7        # 主对话模型
+light_model_name: MiniMax-M2.7       # 轻量路由模型
 embedding_model_name: text-embedding-v3
-vision_model_name: abab6.5g-chat     # 图片理解模型
+vision_model_name: qwen-vl-max        # 图片理解模型
+max_tokens: 32768
 ```
 
 ### `config/agent.yml` — Agent 行为
@@ -478,7 +484,7 @@ Supervisor prompt 注入 `{recent_history}`（最近 N 条对话格式化为"学
 
 **Q: RAG 路径有几次 LLM 调用？**
 
-`retrieve_context` 路径（Supervisor RAG SubAgent / 出题 Agent 使用）：Query Rewrite × 1 + LLM Rerank × 1 = 2 次，最终回答由 SubAgent 再调 1 次，共 3 次。`rag_summarize` 路径（完整链路）：额外 +1 次总结 LLM，共 4 次。两个方法分开暴露，避免 SubAgent 把 LLM 摘要当 context 再喂给另一个 LLM（信息被稀释两层）。
+当前默认链路中，`retrieve_context` 只做 Query Rewrite + 混合检索 + 上下文拼接，不再执行 LLM Rerank；RAG 问答由 SubAgent 再调用一次 LLM 生成最终回答。`rag_summarize` 保留为“检索+总结”接口。
 
 **Q: SQLite 写入策略？**
 
@@ -494,7 +500,7 @@ Supervisor prompt 注入 `{recent_history}`（最近 N 条对话格式化为"学
 
 **Q: 整体架构是什么？**
 
-两层 LangGraph 工作流。外层：Supervisor 节点分析意图，`add_conditional_edges` 路由到 5 个 SubAgent（RAG/出题/出卷/规划/闲聊）。内层（出题/出卷）：Reflexion 架构，Generate+推理链 → Critic质疑推理 → Revise修订，最多 2 轮。
+两层 LangGraph 工作流。外层：Supervisor 节点分析意图，`add_conditional_edges` 路由到 6 个 SubAgent（RAG/出题/出卷/规划/历史分析/闲聊）。内层（出题/出卷）：Reflexion 架构，Generate+推理链 → Critic质疑推理 → Revise修订，最多 2 轮。
 
 **Q: Reflexion 与普通质检有什么区别？**
 
@@ -510,11 +516,11 @@ Supervisor prompt 注入 `{recent_history}`（最近 N 条对话格式化为"学
 
 **Q: SSE 流式输出中如何处理 Supervisor 的路由 JSON？**
 
-用 `astream_events(version="v2")`，每个事件携带 `metadata.langgraph_node`。在 `on_chat_model_stream` 事件里先判断 `if node == "supervisor": continue`，Supervisor 的 JSON 输出（`{"route":"quiz","reason":"..."}`）不会透传给前端。
+当前实现使用 `supervisor_workflow.ainvoke()` 拿到最终结构化结果，再通过统一消息协议输出 SSE 事件：`start / delta / complete`。前端只消费协议字段，不再暴露 Supervisor 原始路由 JSON。
 
 **Q: 出题/出卷结果如何从 SSE 输出？**
 
-quiz_agent/exam_agent 内部调用 `ainvoke`（非流式），结果存在 `final_answer` 字段。在 `on_chain_end` 事件中检测到这两个节点完成后，从 `output["final_answer"]` 取值，按行拆分逐行 yield（间隔 30ms），给用户呈现流式感而不是一次性弹出全文。
+出题/出卷 SubAgent 返回结构化对象（`kind/render_mode/payload/text`），后端通过 `api/message_protocol.py` 组装后在 `complete` 事件一次下发，前端据 `kind` 渲染为题卡或试卷画布；普通聊天仍通过 `delta` 做伪流式输出。
 
 **Q: 多 Agent 出题系统 LLM 调用次数？**
 
@@ -597,8 +603,8 @@ quiz_agent/exam_agent 内部调用 `ainvoke`（非流式），结果存在 `fina
 
 `load_document()` 已有 `chunk_md5_hex()` 和 `save_md5_hex()` 函数，入库前检查 MD5 存在则跳过。
 
-### 12. 缺少已上传文件删除 API
+### 12. ~~缺少已上传文件删除 API~~ ✅ 已修复
 
-用户上传课件后无法删除，只能创建新会话隔离。需要在 `knowledge.py` 添加 `DELETE /api/knowledge/file/{file_id}` 端点。
+`knowledge.py` 已提供 `DELETE /api/knowledge/file/{filename}`，会同时清理文件、向量映射和状态记录。
 
 ---
