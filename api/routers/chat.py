@@ -18,14 +18,31 @@ from utils.session_context import current_session_id
 from rag.vector_store import VectorStoreService
 
 router = APIRouter()
+_VALID_SESSION_ID = re.compile(r'^[\u4e00-\u9fa5a-zA-Z0-9_\-]{1,64}$')
 
 # 轻量运行指标（进程内）
 RUNTIME_METRICS: Dict[str, Any] = {
     "total_requests": 0,
     "failed_requests": 0,
     "routes": {"rag": 0, "quiz": 0, "exam": 0, "planner": 0, "history": 0, "chitchat": 0},
+    "quiz_timeout_count": 0,
+    "fallback_quality_guard_count": 0,
+    "tool_call_count_rag": 0,
+    "tool_call_count_web": 0,
     "exam_total": 0,
     "exam_success": 0,
+    "revise_timeout_count": 0,
+    "degraded_delivery_count": 0,
+    "exam_latency_samples_ms": [],
+    "quiz_latency_samples_ms": [],
+    "exam_stage_timeout_count": 0,
+    "exam_stage_retry_count": 0,
+    "exam_stage_fail_count": 0,
+    "exam_stage_latency_ms": [],
+    "exam_choice_missing_options_fix_count": 0,
+    "exam_score_rebalance_count": 0,
+    "exam_duplicate_rewrite_count": 0,
+    "exam_prompt_contract_violation_count": 0,
     "last_error": "",
 }
 
@@ -225,6 +242,51 @@ def _safe_inc(metric_key: str, delta: int = 1):
         pass
 
 
+def _record_exam_latency(latency_ms: int):
+    try:
+        samples = RUNTIME_METRICS.setdefault("exam_latency_samples_ms", [])
+        samples.append(int(latency_ms))
+        # 保留最近 200 条样本
+        if len(samples) > 200:
+            del samples[:-200]
+    except Exception:
+        pass
+
+
+def _record_quiz_latency(latency_ms: int):
+    try:
+        samples = RUNTIME_METRICS.setdefault("quiz_latency_samples_ms", [])
+        samples.append(int(latency_ms))
+        if len(samples) > 200:
+            del samples[:-200]
+    except Exception:
+        pass
+
+
+def _record_exam_stage_latency(latency_ms: int):
+    try:
+        samples = RUNTIME_METRICS.setdefault("exam_stage_latency_ms", [])
+        samples.append(int(latency_ms))
+        if len(samples) > 500:
+            del samples[:-500]
+    except Exception:
+        pass
+
+
+def _calc_p95(values: List[int]) -> int:
+    if not values:
+        return 0
+    arr = sorted(int(v) for v in values)
+    idx = max(0, min(len(arr) - 1, int(len(arr) * 0.95) - 1))
+    return arr[idx]
+
+
+def _validate_session_id(session_id: str) -> str:
+    if not _VALID_SESSION_ID.match(session_id):
+        raise HTTPException(status_code=400, detail="非法 session_id")
+    return session_id
+
+
 @router.post("/stream")
 async def chat_stream_endpoint(request: Request):
     """
@@ -235,11 +297,13 @@ async def chat_stream_endpoint(request: Request):
     body = await request.json()
     session_id = body.get("session_id", "default")
     query = body.get("query", "")
+    exam_stage_plan = bool(body.get("exam_stage_plan", True))
+    exam_rerun_stage = body.get("exam_rerun_stage")
+    exam_partial_questions = body.get("exam_partial_questions") if isinstance(body.get("exam_partial_questions"), list) else []
     logger.info(f"session_id={session_id}, query={query[:50]}...")
 
     # 安全校验
-    if not re.match(r'^[\u4e00-\u9fa5a-zA-Z0-9_\-]{1,64}$', session_id):
-        raise HTTPException(status_code=400, detail="非法 session_id")
+    _validate_session_id(session_id)
 
     query = query[:2000]
     current_session_id.set(session_id)
@@ -263,6 +327,9 @@ async def chat_stream_endpoint(request: Request):
             "chat_history": chat_history,
             "memory_context": graph_context,
             "session_id": session_id,
+            "exam_stage_plan": exam_stage_plan,
+            "exam_rerun_stage": exam_rerun_stage,
+            "exam_partial_questions": exam_partial_questions,
             "route": "",
             "route_reason": "",
             "route_params": {},
@@ -273,6 +340,7 @@ async def chat_stream_endpoint(request: Request):
         logger.info("开始执行 Supervisor 工作流...")
         stream_start = time.time()
         answer = ""  # 初始化 answer 变量
+        error_text = ""
         message = None
         try:
             # 先发送一个占位消息，避免长耗时任务期间前端完全空白
@@ -287,7 +355,11 @@ async def chat_stream_endpoint(request: Request):
             yield f"data: {pending_start}\n\n"
             yield f"data: {pending_delta}\n\n"
 
-            result = await supervisor_workflow.ainvoke(initial_state)
+            result = await asyncio.wait_for(
+                supervisor_workflow.ainvoke(initial_state),
+                timeout=960.0,  # 外层略大于 15 分钟出卷预算，避免前后层超时打架
+            )
+            workflow_latency_ms = int((time.time() - stream_start) * 1000)
             raw_subagent_result = result.get("subagent_result", "")
             structured_result = raw_subagent_result if isinstance(raw_subagent_result, dict) else None
             answer = result.get("final_answer", "")
@@ -326,28 +398,119 @@ async def chat_stream_endpoint(request: Request):
                     exam_questions = exam_data.get("questions", []) if isinstance(exam_data, dict) else []
                     if isinstance(exam_questions, list) and len(exam_questions) > 0:
                         _safe_inc("exam_success")
+                    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+                    if meta.get("degrade_reason") == "revise_timeout":
+                        _safe_inc("revise_timeout_count")
+                    if meta.get("delivery_mode") == "partial_revised" or meta.get("degrade_reason"):
+                        _safe_inc("degraded_delivery_count")
+                    fixed_items = meta.get("fixed_items") if isinstance(meta.get("fixed_items"), list) else []
+                    if "missing_options" in fixed_items:
+                        _safe_inc("exam_choice_missing_options_fix_count")
+                    if "score_rebalanced" in fixed_items:
+                        _safe_inc("exam_score_rebalance_count")
+                    if "duplicate_rewrite" in fixed_items:
+                        _safe_inc("exam_duplicate_rewrite_count")
+                    if "prompt_contract_violation" in fixed_items:
+                        _safe_inc("exam_prompt_contract_violation_count")
+                    if isinstance(meta.get("exam_end_to_end_ms"), int):
+                        _record_exam_latency(meta.get("exam_end_to_end_ms"))
+                    else:
+                        _record_exam_latency(int((time.time() - stream_start) * 1000))
+                    tool_calls = meta.get("tool_calls") if isinstance(meta.get("tool_calls"), dict) else {}
+                    _safe_inc("tool_call_count_rag", int(tool_calls.get("rag", 0) or 0))
+                    _safe_inc("tool_call_count_web", int(tool_calls.get("web", 0) or 0))
+                    stage_trace = meta.get("stage_trace") if isinstance(meta.get("stage_trace"), list) else []
+                    for st in stage_trace:
+                        if not isinstance(st, dict):
+                            continue
+                        attempt = int(st.get("attempt") or 0)
+                        if attempt > 1:
+                            _safe_inc("exam_stage_retry_count", attempt - 1)
+                        if st.get("stage_status") == "failed":
+                            _safe_inc("exam_stage_fail_count")
+                        if isinstance(st.get("stage_latency_ms"), int):
+                            _record_exam_stage_latency(int(st.get("stage_latency_ms")))
+                        err_text = str(st.get("error") or "")
+                        if "超时" in err_text.lower() or "timeout" in err_text.lower():
+                            _safe_inc("exam_stage_timeout_count")
+                elif route == "exam":
+                    # 严格模式下可能返回失败消息（kind=chat），同样记录段级轨迹
+                    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+                    fixed_items = meta.get("fixed_items") if isinstance(meta.get("fixed_items"), list) else []
+                    if "missing_options" in fixed_items:
+                        _safe_inc("exam_choice_missing_options_fix_count")
+                    if "score_rebalanced" in fixed_items:
+                        _safe_inc("exam_score_rebalance_count")
+                    if "duplicate_rewrite" in fixed_items:
+                        _safe_inc("exam_duplicate_rewrite_count")
+                    if "prompt_contract_violation" in fixed_items:
+                        _safe_inc("exam_prompt_contract_violation_count")
+                    stage_trace = meta.get("stage_trace") if isinstance(meta.get("stage_trace"), list) else []
+                    for st in stage_trace:
+                        if not isinstance(st, dict):
+                            continue
+                        attempt = int(st.get("attempt") or 0)
+                        if attempt > 1:
+                            _safe_inc("exam_stage_retry_count", attempt - 1)
+                        if st.get("stage_status") == "failed":
+                            _safe_inc("exam_stage_fail_count")
+                        if isinstance(st.get("stage_latency_ms"), int):
+                            _record_exam_stage_latency(int(st.get("stage_latency_ms")))
+                        err_text = str(st.get("error") or "")
+                        if "超时" in err_text.lower() or "timeout" in err_text.lower():
+                            _safe_inc("exam_stage_timeout_count")
+                if route == "quiz" and message.get("kind") in {"quiz_set", "chat"}:
+                    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+                    if meta.get("degrade_reason") in {"budget_exhausted", "revise_timeout"}:
+                        _safe_inc("quiz_timeout_count")
+                    if meta.get("degrade_reason") == "quality_guard_no_evidence":
+                        _safe_inc("fallback_quality_guard_count")
+                    if meta.get("delivery_mode") == "partial_revised" or meta.get("degrade_reason"):
+                        _safe_inc("degraded_delivery_count")
+                    if isinstance(meta.get("quiz_end_to_end_ms"), int):
+                        _record_quiz_latency(meta.get("quiz_end_to_end_ms"))
+                    else:
+                        _record_quiz_latency(int((time.time() - stream_start) * 1000))
+                    tool_calls = meta.get("tool_calls") if isinstance(meta.get("tool_calls"), dict) else {}
+                    _safe_inc("tool_call_count_rag", int(tool_calls.get("rag", 0) or 0))
+                    _safe_inc("tool_call_count_web", int(tool_calls.get("web", 0) or 0))
                 logger.info(
                     f"[Observability] session={session_id}, route={route}, reason={route_reason}, "
                     f"fallback={fallback_used}, kind={message['kind']}, latency_ms={int((time.time()-stream_start)*1000)}"
                 )
+                logger.info(f"[Latency] supervisor_workflow_ms={workflow_latency_ms}")
 
+        except asyncio.TimeoutError:
+            logger.error("流式输出异常: supervisor_workflow timeout")
+            _safe_inc("failed_requests")
+            error_text = "出题耗时过长已超时，请缩小题量或减少考点后重试"
+            RUNTIME_METRICS["last_error"] = error_text
+            logger.info(f"[Latency] supervisor_workflow_failed_ms={int((time.time()-stream_start)*1000)}")
+            yield f"data: {json.dumps({'error': error_text}, ensure_ascii=False)}\n\n"
         except Exception as e:
             logger.error(f"流式输出异常: {e}")
             _safe_inc("failed_requests")
-            RUNTIME_METRICS["last_error"] = str(e)
-            yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+            error_text = str(e) or "请求超时，请稍后重试"
+            RUNTIME_METRICS["last_error"] = error_text
+            logger.info(f"[Latency] supervisor_workflow_failed_ms={int((time.time()-stream_start)*1000)}")
+            yield f"data: {json.dumps({'error': error_text}, ensure_ascii=False)}\n\n"
 
         yield "data: [DONE]\n\n"
 
-        # 保存对话历史
+        # 保存对话历史（成功/失败都要记录用户输入，避免历史断层）
+        now = int(time.time() * 1000)
+        await memory_manager.add_message(
+            session_id,
+            "user",
+            query,
+            timestamp=now,
+        )
         if answer:
-            now = int(time.time() * 1000)
-            await memory_manager.add_message(
-                session_id,
-                "user",
-                query,
-                timestamp=now,
-            )
+            ai_meta = message.get("meta") if message else None
+            if not isinstance(ai_meta, dict):
+                ai_meta = {}
+            if error_text:
+                ai_meta = {**ai_meta, "error": True, "error_message": error_text}
             await memory_manager.add_message(
                 session_id,
                 "ai",
@@ -355,7 +518,18 @@ async def chat_stream_endpoint(request: Request):
                 kind=message["kind"] if message else "chat",
                 render_mode=message["render_mode"] if message else "markdown",
                 payload=message.get("payload") if message else None,
-                meta=message.get("meta") if message else None,
+                meta=ai_meta,
+                timestamp=now + 1,
+            )
+        elif error_text:
+            await memory_manager.add_message(
+                session_id,
+                "ai",
+                f"[系统提示: {error_text}]",
+                kind="chat",
+                render_mode="markdown",
+                payload=None,
+                meta={"error": True, "error_message": error_text},
                 timestamp=now + 1,
             )
 
@@ -368,8 +542,7 @@ async def submit_practice_records(req: PracticeSubmitRequest = Body(...)):
     提交练习记录（错题追踪主入口）。
     """
     session_id = req.session_id or "default"
-    if not re.match(r'^[\u4e00-\u9fa5a-zA-Z0-9_\-]{1,64}$', session_id):
-        raise HTTPException(status_code=400, detail="非法 session_id")
+    _validate_session_id(session_id)
 
     if not req.records:
         return {"code": 200, "message": "无记录需要提交", "saved": 0}
@@ -419,8 +592,7 @@ async def get_similar_questions_batch(req: SimilarBatchRequest = Body(...)):
     根据错题批量返回相似题，供前端复练模块直接渲染。
     """
     session_id = req.session_id or "default"
-    if not re.match(r'^[\u4e00-\u9fa5a-zA-Z0-9_\-]{1,64}$', session_id):
-        raise HTTPException(status_code=400, detail="非法 session_id")
+    _validate_session_id(session_id)
 
     current_session_id.set(session_id)
     result: Dict[int, List[Dict[str, Any]]] = {}
@@ -429,6 +601,7 @@ async def get_similar_questions_batch(req: SimilarBatchRequest = Body(...)):
             question_content=item.question_content,
             knowledge_point=item.knowledge_point or "",
             limit=max(1, min(req.limit, 8)),
+            session_id=session_id,
         )
         result[item.question_number] = sims
 
@@ -440,8 +613,7 @@ async def get_practice_stats(session_id: str):
     """
     获取练习统计（用于错题复练率看板）。
     """
-    if not re.match(r'^[\u4e00-\u9fa5a-zA-Z0-9_\-]{1,64}$', session_id):
-        raise HTTPException(status_code=400, detail="非法 session_id")
+    _validate_session_id(session_id)
 
     history = memory_manager.get_practice_history(session_id, limit=500)
     kp_stats = memory_manager.get_knowledge_point_stats(session_id)
@@ -473,17 +645,46 @@ async def get_runtime_metrics():
     exam_total = int(RUNTIME_METRICS.get("exam_total", 0))
     exam_success = int(RUNTIME_METRICS.get("exam_success", 0))
     exam_success_rate = round((exam_success / exam_total) * 100, 2) if exam_total > 0 else 0.0
+    samples = RUNTIME_METRICS.get("exam_latency_samples_ms", []) or []
+    avg_ms = int(sum(samples) / len(samples)) if samples else 0
+    max_ms = int(max(samples)) if samples else 0
+    p95_ms = _calc_p95(samples)
+    quiz_samples = RUNTIME_METRICS.get("quiz_latency_samples_ms", []) or []
+    quiz_avg_ms = int(sum(quiz_samples) / len(quiz_samples)) if quiz_samples else 0
+    quiz_max_ms = int(max(quiz_samples)) if quiz_samples else 0
+    quiz_p95_ms = _calc_p95(quiz_samples)
+    stage_samples = RUNTIME_METRICS.get("exam_stage_latency_ms", []) or []
+    stage_avg_ms = int(sum(stage_samples) / len(stage_samples)) if stage_samples else 0
+    stage_max_ms = int(max(stage_samples)) if stage_samples else 0
+    stage_p95_ms = _calc_p95(stage_samples)
+    structured_fail_count_by_reason = {}
+    try:
+        from agent.multi_agent.quiz_agent import get_structured_fail_stats
+        structured_fail_count_by_reason = get_structured_fail_stats()
+    except Exception:
+        structured_fail_count_by_reason = {}
     return {
         "code": 200,
         "data": {
             **RUNTIME_METRICS,
+            "structured_fail_count_by_reason": structured_fail_count_by_reason,
             "exam_success_rate": exam_success_rate,
+            "exam_end_to_end_avg_ms": avg_ms,
+            "exam_end_to_end_max_ms": max_ms,
+            "exam_end_to_end_p95_ms": p95_ms,
+            "quiz_e2e_avg_ms": quiz_avg_ms,
+            "quiz_e2e_max_ms": quiz_max_ms,
+            "quiz_e2e_p95_ms": quiz_p95_ms,
+            "exam_stage_latency_avg_ms": stage_avg_ms,
+            "exam_stage_latency_max_ms": stage_max_ms,
+            "exam_stage_latency_p95_ms": stage_p95_ms,
         },
     }
 
 
 @router.delete("/session/{session_id}")
 async def delete_session(session_id: str):
+    _validate_session_id(session_id)
     current_session_id.set(session_id)
     try:
         vs = VectorStoreService()
@@ -503,6 +704,7 @@ class RenameRequest(BaseModel):
 
 @router.put("/session/{session_id}")
 async def rename_session(session_id: str, req: RenameRequest = Body(...)):
+    _validate_session_id(session_id)
     success = memory_manager.rename_session(session_id, req.new_name)
     if success:
         return {"code": 200, "message": "重命名成功"}
@@ -515,10 +717,46 @@ class SessionCreateRequest(BaseModel):
     parent_id: Optional[str] = None
 
 
+class SessionCleanupRequest(BaseModel):
+    session_id: str
+
+
 @router.post("/session")
 async def register_session(req: SessionCreateRequest = Body(...)):
+    _validate_session_id(req.session_id)
     memory_manager.register_session(req.session_id, req.name, req.parent_id)
     return {"code": 200, "message": "会话注册成功"}
+
+
+@router.post("/session/cleanup")
+async def cleanup_legacy_session(req: SessionCleanupRequest = Body(...)):
+    """
+    兼容清理历史遗留非法 session_id（例如旧版本产生的 ../x）。
+    - 合法 session_id：等价于普通删除（含知识库销毁）
+    - 非法 session_id：仅清理记忆与缓存，不触发向量库目录操作
+    """
+    sid = (req.session_id or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="session_id 不能为空")
+
+    if _VALID_SESSION_ID.match(sid):
+        current_session_id.set(sid)
+        try:
+            vs = VectorStoreService()
+            await vs.destroy_knowledge_base()
+        except Exception as e:
+            logger.warning(f"[cleanup] 合法会话知识库清理失败 sid={sid}: {e}")
+        clear_rag_cache(sid)
+        success = memory_manager.clear_session(sid)
+        return {"code": 200 if success else 404, "message": "会话已清理" if success else "会话不存在"}
+
+    # 非法 ID 仅从会话存储中移除，避免路径相关安全风险
+    clear_rag_cache(sid)
+    success = memory_manager.clear_session(sid)
+    return {
+        "code": 200 if success else 404,
+        "message": "已清理历史遗留非法会话" if success else "会话不存在",
+    }
 
 
 @router.get("/sessions")
@@ -529,6 +767,7 @@ async def get_all_sessions():
 
 @router.get("/messages")
 async def get_session_messages(session_id: str):
+    _validate_session_id(session_id)
     memory_manager._init_session(session_id)
     recent_records = memory_manager.store[session_id]["recent"]
     messages = []

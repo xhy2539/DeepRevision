@@ -110,16 +110,37 @@ def parse_exam_content(exam_paper: str) -> dict:
             q_content = q_match.group(2).strip()
 
             # 检查是否是选项
-            if re.match(r'^[A-D][.、、]', q_content):
+            if re.match(r'^[A-D][.、．]\s*', q_content):
                 if current_question:
-                    current_question["content"] += "\n" + line
+                    mm_opt = re.match(r'^([A-D])[.、．]\s*(.+)$', q_content)
+                    if mm_opt and mm_opt.group(2).strip():
+                        if "options" not in current_question:
+                            current_question["options"] = []
+                        current_question["options"].append(f"{mm_opt.group(1)}. {mm_opt.group(2).strip()}")
                 continue
 
             # 新题目
+            content_text = q_content
+            options = []
+            if current_section == "选择题" and re.search(r'[A-D][.、．]\s*', q_content):
+                split_parts = [p.strip() for p in re.split(r'(?=[A-D][.、．]\s*)', q_content) if p.strip()]
+                if split_parts:
+                    first = split_parts[0]
+                    if not re.match(r'^[A-D][.、．]\s*', first):
+                        content_text = first
+                        split_parts = split_parts[1:]
+                    else:
+                        content_text = ""
+                    for part in split_parts:
+                        mm = re.match(r'^([A-D])[.、．]\s*(.+)$', part)
+                        if mm and mm.group(2).strip():
+                            options.append(f"{mm.group(1)}. {mm.group(2).strip()}")
+
             current_question = {
                 "number": int(q_num),
                 "type": current_section,
-                "content": line,
+                "content": content_text,
+                "options": options,
                 "answer": "",
                 "analysis": "",
                 "score": 10,  # 默认分值
@@ -136,6 +157,21 @@ def parse_exam_content(exam_paper: str) -> dict:
         elif current_question and ("解析" in line or "解析：" in line):
             analysis = re.sub(r'^解析[：:]\s*', '', line)
             current_question["analysis"] = analysis
+        elif current_question and current_section == "选择题" and re.match(r'^[A-D][.、．]\s*', line):
+            mm = re.match(r'^([A-D])[.、．]\s*(.+)$', line)
+            if mm and mm.group(2).strip():
+                if "options" not in current_question:
+                    current_question["options"] = []
+                current_question["options"].append(f"{mm.group(1)}. {mm.group(2).strip()}")
+        elif current_question and current_section == "选择题" and re.search(r'\b[A-D][.、．]\s+', line):
+            matches = re.findall(r'([A-D])[.、．]\s*(.+?)(?=\s+[A-D][.、．]\s+|$)', line)
+            if matches:
+                if "options" not in current_question:
+                    current_question["options"] = []
+                for letter, text in matches:
+                    text = (text or "").strip()
+                    if text:
+                        current_question["options"].append(f"{letter}. {text}")
 
     return result
 
@@ -228,6 +264,10 @@ async def export_docx(request: ExamExportRequest):
                 else:
                     p2 = doc.add_paragraph(line)
                     p2.paragraph_format.left_indent = Inches(0.5)
+
+            for opt in q.get("options", []) or []:
+                opt_p = doc.add_paragraph(str(opt))
+                opt_p.paragraph_format.left_indent = Inches(0.5)
 
             # 答案（如果需要）
             if request.include_answers and q["answer"]:

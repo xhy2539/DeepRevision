@@ -31,6 +31,60 @@ interface PracticeRecord {
   isCorrect: boolean;
 }
 
+function stripLeadingQuestionNumber(text: string): string {
+  const raw = (text || "").trim();
+  if (!raw) return raw;
+  // 兼容: "1. xxx" / "1、xxx" / "（1）xxx" / "(1) xxx"
+  return raw
+    .replace(/^\s*\d+\s*[.、]\s*/, "")
+    .replace(/^\s*[（(]\s*\d+\s*[）)]\s*/, "")
+    .trim();
+}
+
+function normalizeOptions(raw: unknown): string[] | undefined {
+  if (!raw) return undefined;
+  if (Array.isArray(raw)) {
+    const opts = raw
+      .map((v, i) => {
+        const text = String(v || "").trim();
+        if (!text) return "";
+        if (/^[A-D][.、]\s*/.test(text)) return text;
+        return `${String.fromCharCode(65 + i)}. ${text}`;
+      })
+      .filter(Boolean);
+    return opts.length ? opts : undefined;
+  }
+  if (typeof raw === "object") {
+    const obj = raw as Record<string, unknown>;
+    const keys = ["A", "B", "C", "D"];
+    const opts = keys
+      .map((k) => {
+        const v = String(obj[k] || "").trim();
+        return v ? `${k}. ${v}` : "";
+      })
+      .filter(Boolean);
+    return opts.length ? opts : undefined;
+  }
+  return undefined;
+}
+
+function canonicalizeOptionLines(rawOptions: string[]): string[] {
+  const cleaned: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of rawOptions || []) {
+    const text = String(raw || "").trim();
+    if (!text) continue;
+    const content = text.replace(/^[A-D][.、．:：)\s]+/, "").trim();
+    if (!content) continue;
+    const sig = content.replace(/\s+/g, " ").toLowerCase();
+    if (seen.has(sig)) continue;
+    seen.add(sig);
+    cleaned.push(content);
+    if (cleaned.length >= 4) break;
+  }
+  return cleaned.map((content, idx) => `${String.fromCharCode(65 + idx)}. ${content}`);
+}
+
 // Props
 interface ExamCanvasProps {
   examContent: string;
@@ -130,19 +184,14 @@ function tryParseJSONExam(content: string): ExamData | null {
         const question: Question = {
           number: q.id || q.number || 1,
           type: q.type || "选择题",
-          content: q.content || "",
-          options: Array.isArray(q.options) ? q.options : undefined,
+          content: stripLeadingQuestionNumber(q.content || ""),
+          options: normalizeOptions(q.options),
           answer: q.answer || "",
           analysis: q.analysis || "",
           score: typeof q.score === 'number' ? q.score : (q.score_value || 5),
           difficulty: q.difficulty || q.difficult || "中等",
           knowledge_point: q.knowledge_point || undefined
         };
-
-        // 选择题处理选项
-        if (q.options && Array.isArray(q.options)) {
-          question.content += "\n" + q.options.join("\n");
-        }
 
         result.questions.push(question);
         result.total_score += question.score;
@@ -255,9 +304,9 @@ function parseExamContent(content: string): ExamData {
     // 格式1: "A. 选项1" 每行一个（标准格式）
     // 格式2: "A. 选项1  B. 选项2  C. 选项3  D. 选项4" 多选项在同一行
     // 格式3: "A" 单独一行 + "选项内容" 在下一行（LLM 错误输出格式）
-    if (/^[A-D][.、]\s*/.test(trimmed)) {
+    if (currentSection === "选择题" && /^[A-D][.、]\s+\S+/.test(trimmed)) {
       // 先尝试拆分成多行选项
-      const optionMatches = trimmed.match(/([A-D])[.、]\s*([^A-D]+?)(?=\s*[A-D][.、]|$)/g);
+      const optionMatches = trimmed.match(/([A-D])[.、]\s+(.+?)(?=\s+[A-D][.、]\s+|$)/g);
       if (optionMatches && optionMatches.length > 1) {
         // 多选项在同一行，拆分成多行
         if (currentQuestion) {
@@ -276,7 +325,7 @@ function parseExamContent(content: string): ExamData {
 
     // 格式3修复：单独一个 "A" 或 "B" 或 "C" 或 "D" 后面跟着选项内容
     // 如果当前行只是单独的 A/B/C/D，且下一行是较长的文本（选项内容），合并它们
-    if (/^[A-D]$/.test(trimmed) && currentQuestion) {
+    if (currentSection === "选择题" && /^[A-D]$/.test(trimmed) && currentQuestion) {
       // 标记这是一个选项的开始，下一行会合并
       currentQuestion.content += "\n" + trimmed + ".";
       continue;
@@ -301,7 +350,7 @@ function parseExamContent(content: string): ExamData {
       }
 
       // 检查是否是选项行（不是题目）
-      if (/^[A-D][.、]/.test(qContent)) {
+      if (currentSection === "选择题" && /^[A-D][.、]\s+\S+/.test(qContent)) {
         if (currentQuestion) {
           currentQuestion.content += "\n" + trimmed;
         }
@@ -310,15 +359,15 @@ function parseExamContent(content: string): ExamData {
 
       // 【修复】检查题目内容中是否包含选项（选项和题干在同一行）
       // 例如："题干 A. 选项1 B. 选项2 C. 选项3 D. 选项4"
-      if (/\b[A-D][.、]/.test(qContent)) {
+      if (currentSection === "选择题" && /\b[A-D][.、]\s+/.test(qContent)) {
         // 用 split 分割：按选项字母分割字符串
-        const segments = qContent.split(/(?=[A-D][.、])/);
+        const segments = qContent.split(/(?=[A-D][.、]\s+)/);
         const questionPart = segments[0].trim();
         const optionsParts = segments.slice(1);
         // 清理每个选项，提取字母和内容
         const cleanOptions = optionsParts
           .map(seg => seg.trim())
-          .filter(seg => seg.length > 0 && /^[A-D]/.test(seg))
+          .filter(seg => seg.length > 0 && /^[A-D][.、]\s+/.test(seg))
           .map(seg => {
             // 提取字母和内容
             const letter = seg.charAt(0);
@@ -388,7 +437,7 @@ function parseExamContent(content: string): ExamData {
       currentQuestion = {
         number: qNum,
         type: inferredType,
-        content: qContent,  // 只取编号后的内容，不包含编号
+        content: stripLeadingQuestionNumber(qContent),
         answer: "",
         analysis: "",
         score: defaultScore,
@@ -490,7 +539,7 @@ function getDifficultyColor(difficulty: string): string {
   if (normalized === "简单" || normalized === "基础") {
     return "bg-emerald-100 text-emerald-800 border border-emerald-300";
   }
-  if (normalized === "较难" || normalized === "困难" || normalized === "高难") {
+  if (normalized === "较难" || normalized === "困难" || normalized === "高难" || normalized === "难") {
     return "bg-rose-100 text-rose-800 border border-rose-300";
   }
   return "bg-amber-100 text-amber-800 border border-amber-300";
@@ -591,8 +640,16 @@ export default function ExamCanvas({ examContent, examDataOverride, courseName =
   // 解析试卷
   useEffect(() => {
     if (isValidExamData(examDataOverride) && examDataOverride.questions.length > 0) {
+      const normalizedQuestions = examDataOverride.questions.map((q) => ({
+        ...q,
+        content: stripLeadingQuestionNumber(q.content || ""),
+        options: q.type === "选择题"
+          ? canonicalizeOptionLines(normalizeOptions((q as any).options) || [])
+          : normalizeOptions((q as any).options),
+      }));
       const normalizedData: ExamData = {
         ...examDataOverride,
+        questions: normalizedQuestions,
         title: examDataOverride.title || courseName,
       };
       setExamData(normalizedData);
@@ -897,20 +954,20 @@ export default function ExamCanvas({ examContent, examDataOverride, courseName =
                     {questions.map((q, idx) => {
                       const rawLines = q.content.split('\n');
                       const questionLines: string[] = [];
-                      const options: string[] = q.options ? [...q.options] : [];
+                      const options: string[] = q.type === "选择题" && q.options ? [...q.options] : [];
 
                       for (const line of rawLines) {
-                        if (q.options && q.options.length > 0) {
+                        if (q.type === "选择题" && q.options && q.options.length >= 4) {
                           if (line.trim()) {
                             questionLines.push(line);
                           }
                           continue;
                         }
 
-                        if (/^[A-D][.、]/.test(line)) {
+                        if (q.type === '选择题' && /^[A-D][.、]\s+\S+/.test(line)) {
                           options.push(line);
-                        } else if (/\b[A-D][.、]/.test(line)) {
-                          const optionRegex = /\b([A-D])[.、]\s*/g;
+                        } else if (q.type === '选择题' && /\b[A-D][.、]\s+/.test(line)) {
+                          const optionRegex = /\b([A-D])[.、]\s+/g;
                           const parts: string[] = line.split(optionRegex);
                           if (parts.length >= 3) {
                             const questionPart = parts[0].trim();
@@ -920,7 +977,7 @@ export default function ExamCanvas({ examContent, examDataOverride, courseName =
                             for (let i = 1; i < parts.length - 1; i += 2) {
                               const letter = parts[i].trim();
                               let content = parts[i + 1] || '';
-                              content = content.replace(/\s*[A-D][.、]\s*$/, '').trim();
+                              content = content.replace(/\s*[A-D][.、]\s+$/, '').trim();
                               if (letter && content) {
                                 const sep = line.match(/\b([A-D])[.、]/)?.[0]?.slice(-1) || '.';
                                 options.push(`${letter}${sep} ${content}`);
@@ -931,6 +988,8 @@ export default function ExamCanvas({ examContent, examDataOverride, courseName =
                           questionLines.push(line);
                         }
                       }
+                      const normalizedRenderOptions = q.type === "选择题" ? canonicalizeOptionLines(options) : options;
+                      const hasOptionIssue = q.type === "选择题" && normalizedRenderOptions.length < 4;
 
                       return (
                         <div key={`${type}-${q.number}-${idx}`} className="question-item group p-4 bg-slate-50 rounded-lg hover:bg-slate-100 transition-colors">
@@ -992,10 +1051,16 @@ export default function ExamCanvas({ examContent, examDataOverride, courseName =
                             ))}
                           </div>
 
+                          {hasOptionIssue && (
+                            <div className="ml-10 mb-3 text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded px-2 py-1">
+                              题目结构异常：该选择题选项不足 4 项，可点击右上角重生此题。
+                            </div>
+                          )}
+
                           {/* 选择题选项 - 交互式练习模式 */}
-                          {options.length > 0 && (
+                          {q.type === "选择题" && normalizedRenderOptions.length > 0 && (
                             <div className="ml-10 grid grid-cols-1 sm:grid-cols-2 gap-2 mb-3">
-                              {options.map((opt, i) => {
+                              {normalizedRenderOptions.map((opt, i) => {
                                 const optionKey = opt.charAt(0);
                                 const isSelected = answers[q.number] === optionKey;
                                 const isCorrect = submitted && optionKey === q.answer.trim().charAt(0);
@@ -1031,7 +1096,7 @@ export default function ExamCanvas({ examContent, examDataOverride, courseName =
                                     }`}>
                                       {isCorrect ? '✓' : isWrong ? '✗' : optionKey}
                                     </span>
-                                    <span className="text-slate-700">{opt.substring(2).trim()}</span>
+                                    <span className="text-slate-700">{opt.replace(/^[A-D][.、．]\s*/, "").trim()}</span>
                                   </div>
                                 );
                               })}
@@ -1039,7 +1104,7 @@ export default function ExamCanvas({ examContent, examDataOverride, courseName =
                           )}
 
                           {/* 非选择题：填空/简答/判断题输入框 */}
-                          {options.length === 0 && q.type !== '选择题' && (
+                          {normalizedRenderOptions.length === 0 && q.type !== '选择题' && (
                             <div className="ml-10 mb-3">
                               {q.type === '判断题' ? (
                                 <div className="flex gap-4">
