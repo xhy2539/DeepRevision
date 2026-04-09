@@ -3,6 +3,14 @@ import time
 from typing import Any, Dict, List, Optional
 
 from api.routers.exam_export import parse_exam_content
+from utils.logger_handler import logger
+
+SCHEMA_VERSION = "1.0.0"
+PARSE_FAILURE_METRICS: Dict[str, int] = {}
+
+
+def _inc_parse_failure_metric(failure_type: str) -> None:
+    PARSE_FAILURE_METRICS[failure_type] = PARSE_FAILURE_METRICS.get(failure_type, 0) + 1
 
 
 def _parse_quiz_content(content: str) -> List[Dict[str, Any]]:
@@ -92,11 +100,15 @@ def _parse_quiz_content(content: str) -> List[Dict[str, Any]]:
             questions.append({
                 "type": current_type,
                 "question": question_text,
+                "stem": question_text,
                 "options": options or None,
                 "answer": answer,
                 "explanation": explanation,
+                "analysis": explanation,
                 "score": score or None,
                 "difficulty": difficulty or None,
+                "knowledge_points": [],
+                "evidence_snippets": [],
             })
 
     if not questions and has_inline_options:
@@ -106,11 +118,15 @@ def _parse_quiz_content(content: str) -> List[Dict[str, Any]]:
             questions.append({
                 "type": "选择题",
                 "question": question_text,
+                "stem": question_text,
                 "options": options,
                 "answer": "",
                 "explanation": "",
+                "analysis": "",
                 "score": None,
                 "difficulty": None,
+                "knowledge_points": [],
+                "evidence_snippets": [],
             })
 
     return questions
@@ -145,28 +161,45 @@ def build_assistant_message(
     route_params = route_params or {}
 
     if structured_result:
-        content = structured_result.get("text", answer) or answer
-        kind = structured_result.get("kind") or _infer_message_kind(route, content)
-        render_mode = structured_result.get("render_mode")
-        if not render_mode:
-            render_mode = (
-                "interactive_cards" if kind == "quiz_set"
-                else "exam_canvas" if kind == "exam_paper"
-                else "markdown"
+        try:
+            payload = structured_result.get("payload")
+            if not isinstance(payload, dict):
+                raise ValueError("payload_not_dict")
+
+            content = structured_result.get("text", answer) or answer
+            kind = structured_result.get("kind") or payload.get("kind") or _infer_message_kind(route, content)
+            render_mode = structured_result.get("render_mode") or payload.get("render_mode")
+            if not render_mode:
+                render_mode = (
+                    "interactive_cards" if kind == "quiz_set"
+                    else "exam_canvas" if kind == "exam_paper"
+                    else "markdown"
+                )
+
+            schema_version = (
+                structured_result.get("schema_version")
+                or payload.get("schema_version")
+                or SCHEMA_VERSION
             )
-        payload = structured_result.get("payload") or {}
-        return {
-            "kind": kind,
-            "render_mode": render_mode,
-            "content": content,
-            "payload": payload,
-            "meta": {
-                "route": route,
-                "session_id": session_id,
-                "generated_at": int(time.time()),
-                "structured": True,
-            },
-        }
+            payload = {**payload, "schema_version": payload.get("schema_version") or schema_version}
+
+            return {
+                "kind": kind,
+                "render_mode": render_mode,
+                "schema_version": schema_version,
+                "content": content,
+                "payload": payload,
+                "meta": {
+                    "route": route,
+                    "session_id": session_id,
+                    "generated_at": int(time.time()),
+                    "structured": True,
+                },
+            }
+        except Exception as exc:
+            failure_type = str(exc) if str(exc) else exc.__class__.__name__
+            _inc_parse_failure_metric(failure_type)
+            logger.warning(f"[message_protocol] structured payload 透传失败，降级文本解析: failure_type={failure_type}")
 
     kind = _infer_message_kind(route, answer)
     render_mode = "markdown"
@@ -175,6 +208,9 @@ def build_assistant_message(
     if kind == "quiz_set":
         render_mode = "interactive_cards"
         payload = {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "quiz_set",
+            "render_mode": "interactive_cards",
             "title": route_params.get("topic") or "练习题",
             "show_answers_default": False,
             "show_analysis_default": False,
@@ -188,6 +224,7 @@ def build_assistant_message(
     return {
         "kind": kind,
         "render_mode": render_mode,
+        "schema_version": SCHEMA_VERSION,
         "content": answer,
         "payload": payload,
         "meta": {
@@ -214,7 +251,9 @@ def _build_exam_payload(content: str) -> Dict[str, Any]:
 
         question = {
             "number": int(q.get("number") or len(questions) + 1),
+            "id": int(q.get("number") or len(questions) + 1),
             "type": q.get("type") or "选择题",
+            "stem": stem,
             "content": stem,
             "options": options or None,
             "answer": q.get("answer") or "",
@@ -222,6 +261,8 @@ def _build_exam_payload(content: str) -> Dict[str, Any]:
             "score": score,
             "difficulty": difficulty,
             "knowledge_point": q.get("knowledge_point"),
+            "knowledge_points": q.get("knowledge_points") or ([q.get("knowledge_point")] if q.get("knowledge_point") else []),
+            "evidence_snippets": q.get("evidence_snippets") or [],
         }
         questions.append(question)
         total_score += score
@@ -233,11 +274,16 @@ def _build_exam_payload(content: str) -> Dict[str, Any]:
         question_types[qtype]["total_score"] += score
 
     return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "exam_paper",
+        "render_mode": "exam_canvas",
         "title": parsed.get("title") or "完整试卷",
         "subtitle": parsed.get("subtitle") or "",
         "show_answers_default": False,
         "show_analysis_default": False,
+        "questions": questions,
         "exam_data": {
+            "schema_version": SCHEMA_VERSION,
             "title": parsed.get("title") or "完整试卷",
             "subtitle": parsed.get("subtitle") or "",
             "total_score": total_score,

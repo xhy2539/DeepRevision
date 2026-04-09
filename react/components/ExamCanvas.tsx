@@ -5,7 +5,9 @@ import { useState, useRef, useEffect } from "react";
 // 题目类型
 interface Question {
   number: number;
+  id?: number;
   type: string;
+  stem?: string;
   content: string;
   options?: string[];
   answer: string;
@@ -13,16 +15,35 @@ interface Question {
   score: number;
   difficulty: string;
   knowledge_point?: string;
+  knowledge_points?: string[];
+  evidence_snippets?: string[];
 }
 
 // 解析后的试卷数据
 interface ExamData {
+  schema_version?: string;
   title: string;
   subtitle: string;
   total_score: number;
   total_questions: number;
   question_types: Record<string, { count: number; total_score: number }>;
   questions: Question[];
+}
+
+interface SchemaQuestion {
+  id?: number;
+  number?: number;
+  type?: string;
+  stem?: string;
+  content?: string;
+  options?: string[];
+  answer?: string;
+  analysis?: string;
+  score?: number | string;
+  difficulty?: string;
+  knowledge_point?: string;
+  knowledge_points?: string[];
+  evidence_snippets?: string[];
 }
 
 // Props
@@ -41,131 +62,8 @@ interface ExamCanvasProps {
   similarQuestions?: Record<number, Array<{question_content: string; answer: string; knowledge_point: string; question_id: string}>>;
 }
 
-// 尝试解析 JSON 格式的试卷（后端结构化输出）
-function extractJSONObject(text: string): string {
-  let braceCount = 0;
-  let start = -1;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (c === '{') {
-      if (start === -1) start = i;
-      braceCount++;
-    } else if (c === '}') {
-      braceCount--;
-      if (braceCount === 0 && start !== -1) {
-        return text.slice(start, i + 1);
-      }
-    }
-  }
-  let bracketCount = 0;
-  start = -1;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (c === '[') {
-      if (start === -1) start = i;
-      bracketCount++;
-    } else if (c === ']') {
-      bracketCount--;
-      if (bracketCount === 0 && start !== -1) {
-        return text.slice(start, i + 1);
-      }
-    }
-  }
-  return text.trim();
-}
-
-function tryParseJSONExam(content: string): ExamData | null {
-  try {
-    // 预检：如果内容不包含 "{" 或 "```" 很可能不是 JSON，直接返回 null
-    const trimmed = content.trim();
-    if (!trimmed.includes('{') && !trimmed.includes('```')) {
-      return null;
-    }
-
-    console.log("[ExamCanvas] 尝试解析JSON，内容前200字:", trimmed.slice(0, 200));
-
-    let jsonStr = trimmed;
-
-    // 1. 优先尝试代码块包裹的 JSON
-    let match = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
-    if (match) {
-      jsonStr = match[1].trim();
-    } else {
-      jsonStr = extractJSONObject(jsonStr);
-    }
-
-    // 预检：提取后仍不包含 "{" 也不是 JSON
-    if (!jsonStr.includes('{')) {
-      return null;
-    }
-
-    const data = JSON.parse(jsonStr);
-    console.log("[ExamCanvas] JSON解析成功，exam_paper长度:", data.exam_paper?.length, "questions数:", data.questions?.length);
-
-    // 检查是否是结构化试卷格式
-    if (data.questions && Array.isArray(data.questions) && data.questions.length > 0) {
-      const result: ExamData = {
-        title: data.title || "期末考试",
-        subtitle: data.subtitle || "",
-        total_score: 0,
-        total_questions: 0,
-        question_types: {},
-        questions: []
-      };
-
-      // 转换题目格式
-      for (const q of data.questions) {
-        const question: Question = {
-          number: q.id || q.number || 1,
-          type: q.type || "选择题",
-          content: q.content || "",
-          options: Array.isArray(q.options) ? q.options : undefined,
-          answer: q.answer || "",
-          analysis: q.analysis || "",
-          score: typeof q.score === 'number' ? q.score : (q.score_value || 5),
-          difficulty: q.difficulty || q.difficult || "中等",
-          knowledge_point: q.knowledge_point || undefined
-        };
-
-        // 选择题处理选项
-        if (q.options && Array.isArray(q.options)) {
-          question.content += "\n" + q.options.join("\n");
-        }
-
-        result.questions.push(question);
-        result.total_score += question.score;
-      }
-
-      console.log("[ExamCanvas] 解析成功，总分:", result.total_score);
-
-      // 统计题型
-      result.total_questions = result.questions.length;
-      for (const q of result.questions) {
-        if (!result.question_types[q.type]) {
-          result.question_types[q.type] = { count: 0, total_score: 0 };
-        }
-        result.question_types[q.type].count++;
-        result.question_types[q.type].total_score += q.score;
-      }
-
-      return result;
-    }
-
-    return null;
-  } catch (e) {
-    console.warn("[ExamCanvas] JSON解析失败:", e);
-    return null;
-  }
-}
-
 // 解析试卷内容
 function parseExamContent(content: string): ExamData {
-  // 先尝试解析 JSON 格式
-  const jsonResult = tryParseJSONExam(content);
-  if (jsonResult && jsonResult.questions.length > 0) {
-    return jsonResult;
-  }
-
   const result: ExamData = {
     title: "",
     subtitle: "",
@@ -489,6 +387,49 @@ function isValidExamData(data: any): data is ExamData {
   return !!data && Array.isArray(data.questions) && typeof data.total_questions === "number";
 }
 
+function normalizeSchemaQuestions(questions: SchemaQuestion[], courseName: string): ExamData {
+  const normalizedQuestions: Question[] = [];
+  const questionTypes: Record<string, { count: number; total_score: number }> = {};
+  let totalScore = 0;
+
+  questions.forEach((q, index) => {
+    const score = typeof q.score === "number" ? q.score : parseInt(String(q.score || "0"), 10) || 0;
+    const finalScore = score > 0 ? score : ((q.type || "选择题") === "简答题" ? 10 : 2);
+    const normalized: Question = {
+      number: q.number || q.id || index + 1,
+      id: q.id || q.number || index + 1,
+      type: q.type || "选择题",
+      stem: q.stem || q.content || "",
+      content: q.content || q.stem || "",
+      options: Array.isArray(q.options) ? q.options : undefined,
+      answer: q.answer || "",
+      analysis: q.analysis || "",
+      score: finalScore,
+      difficulty: q.difficulty || "中等",
+      knowledge_point: q.knowledge_point,
+      knowledge_points: q.knowledge_points || (q.knowledge_point ? [q.knowledge_point] : []),
+      evidence_snippets: q.evidence_snippets || [],
+    };
+    normalizedQuestions.push(normalized);
+    totalScore += normalized.score;
+    if (!questionTypes[normalized.type]) {
+      questionTypes[normalized.type] = { count: 0, total_score: 0 };
+    }
+    questionTypes[normalized.type].count += 1;
+    questionTypes[normalized.type].total_score += normalized.score;
+  });
+
+  return {
+    schema_version: "1.0.0",
+    title: courseName,
+    subtitle: "",
+    total_score: totalScore,
+    total_questions: normalizedQuestions.length,
+    question_types: questionTypes,
+    questions: normalizedQuestions,
+  };
+}
+
 export default function ExamCanvas({ examContent, examDataOverride, courseName = "期末考试", onExportWord, onExportAnswerSheet, onRequestAnswers, onRegenerateQuestion, onRegenerateComplete, onQuestionFeedback, onWrongAnswer, onPracticeComplete, similarQuestions }: ExamCanvasProps) {
   const [examData, setExamData] = useState<ExamData | null>(null);
   const [showAnswers, setShowAnswers] = useState(false);
@@ -572,6 +513,12 @@ export default function ExamCanvas({ examContent, examDataOverride, courseName =
 
   // 解析试卷
   useEffect(() => {
+    if (Array.isArray(examDataOverride) && examDataOverride.length > 0) {
+      setExamData(normalizeSchemaQuestions(examDataOverride as SchemaQuestion[], courseName));
+      setHasAnswers((examDataOverride as SchemaQuestion[]).some(q => !!q.answer?.trim()));
+      return;
+    }
+
     if (isValidExamData(examDataOverride) && examDataOverride.questions.length > 0) {
       const normalizedData: ExamData = {
         ...examDataOverride,

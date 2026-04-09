@@ -20,6 +20,7 @@ from utils.session_context import current_session_id
 from utils.logger_handler import logger
 from api.routers.exam_export import parse_exam_content
 
+SCHEMA_VERSION = "1.0.0"
 
 # ==================== 状态定义 ====================
 
@@ -80,6 +81,8 @@ class Question(BaseModel):
     analysis: str = Field(description="题目解析")
     score: int = Field(description="分值")
     difficulty: str = Field(description="难度：简单/中等/较难")
+    knowledge_points: List[str] = Field(default_factory=list, description="知识点列表")
+    evidence_snippets: List[str] = Field(default_factory=list, description="答案依据片段")
 
 
 class QuizQuestionItem(BaseModel):
@@ -92,6 +95,8 @@ class QuizQuestionItem(BaseModel):
     explanation: str = Field(description="解析")
     score: Optional[str] = Field(default=None, description="分值，如5分")
     difficulty: Optional[str] = Field(default=None, description="难度")
+    knowledge_points: List[str] = Field(default_factory=list, description="知识点列表")
+    evidence_snippets: List[str] = Field(default_factory=list, description="答案依据片段")
 
 
 class StructuredQuizSetResult(BaseModel):
@@ -746,18 +751,32 @@ def _normalize_options(value: Any) -> Optional[List[str]]:
     return normalized or None
 
 
+def _normalize_string_list(value: Any) -> List[str]:
+    if value in (None, "", []):
+        return []
+    items = value if isinstance(value, list) else [value]
+    normalized: List[str] = []
+    for item in items:
+        text = str(item).strip()
+        if text:
+            normalized.append(text)
+    return normalized
+
+
 def _normalize_question_item(item: Any, fallback_id: int) -> dict:
     if not isinstance(item, dict):
         item = {"question": str(item).strip()}
     return {
         "id": _normalize_int_field(item.get("id"), fallback_id),
         "type": _normalize_text_field(item.get("type"), "选择题"),
-        "question": _normalize_text_field(item.get("question") or item.get("content"), ""),
+        "question": _normalize_text_field(item.get("question") or item.get("stem") or item.get("content"), ""),
         "options": _normalize_options(item.get("options")),
         "answer": _normalize_text_field(item.get("answer"), ""),
         "explanation": _normalize_text_field(item.get("explanation") or item.get("analysis"), ""),
         "score": _format_score(item.get("score")),
         "difficulty": _normalize_text_field(item.get("difficulty"), "中等"),
+        "knowledge_points": _normalize_string_list(item.get("knowledge_points") or item.get("knowledge_point")),
+        "evidence_snippets": _normalize_string_list(item.get("evidence_snippets") or item.get("evidence")),
     }
 
 
@@ -780,6 +799,8 @@ def _normalize_exam_question_item(item: Any, fallback_id: int) -> dict:
         "analysis": _normalize_text_field(item.get("analysis") or item.get("explanation"), ""),
         "score": _normalize_int_field(item.get("score"), 2),
         "difficulty": _normalize_text_field(item.get("difficulty"), "中等"),
+        "knowledge_points": _normalize_string_list(item.get("knowledge_points") or item.get("knowledge_point")),
+        "evidence_snippets": _normalize_string_list(item.get("evidence_snippets") or item.get("evidence")),
     }
 
 
@@ -855,9 +876,12 @@ def _build_quiz_text_from_questions(questions: List[dict]) -> str:
 
 def _build_quiz_payload(topic: str, questions: List[dict]) -> dict:
     return {
+        "schema_version": SCHEMA_VERSION,
         "title": topic or "练习题",
         "show_answers_default": False,
         "show_analysis_default": False,
+        "kind": "quiz_set",
+        "render_mode": "interactive_cards",
         "questions": questions,
     }
 
@@ -881,13 +905,17 @@ def _normalize_exam_question(question: dict, fallback_number: int) -> dict:
             options = parsed_options
     return {
         "number": int(question.get("number") or question.get("id") or fallback_number),
+        "id": int(question.get("number") or question.get("id") or fallback_number),
         "type": qtype,
+        "stem": content,
         "content": content,
         "options": options,
         "answer": question.get("answer") or "",
         "analysis": question.get("analysis") or question.get("explanation") or "",
         "score": score,
         "difficulty": question.get("difficulty") or "中等",
+        "knowledge_points": _normalize_string_list(question.get("knowledge_points") or question.get("knowledge_point")),
+        "evidence_snippets": _normalize_string_list(question.get("evidence_snippets") or question.get("evidence")),
         "knowledge_point": question.get("knowledge_point"),
     }
 
@@ -908,11 +936,16 @@ def _build_exam_payload_from_questions(questions: List[dict], title: str = "完�
         question_types[qtype]["total_score"] += normalized["score"]
 
     return {
+        "schema_version": SCHEMA_VERSION,
         "title": title,
         "subtitle": subtitle,
         "show_answers_default": False,
         "show_analysis_default": False,
+        "kind": "exam_paper",
+        "render_mode": "exam_canvas",
+        "questions": normalized_questions,
         "exam_data": {
+            "schema_version": SCHEMA_VERSION,
             "title": title,
             "subtitle": subtitle,
             "total_score": total_score,
@@ -1188,7 +1221,8 @@ GENERATE_STRUCTURED_QUIZ_PROMPT = """你是一位资深大学期末考试命题�
 2. 必须生成正好 {num} 道题。
 3. 选择题必须包含 4 个完整选项。
 4. 每道题都必须包含答案和解析。
-5. score 使用“5分”这类字符串，difficulty 使用“简单/中等/较难”。
+5. 统一题目 schema 字段：stem(题干)、options、answer、analysis、score、difficulty、knowledge_points、evidence_snippets。
+6. score 使用“5分”这类字符串，difficulty 使用“简单/中等/较难”。
 
 返回格式：
 {{
@@ -1198,11 +1232,15 @@ GENERATE_STRUCTURED_QUIZ_PROMPT = """你是一位资深大学期末考试命题�
       "id": 1,
       "type": "{quiz_type}",
       "question": "题干内容",
+      "stem": "题干内容",
       "options": ["A. 选项1", "B. 选项2", "C. 选项3", "D. 选项4"],
       "answer": "A",
       "explanation": "解析内容",
+      "analysis": "解析内容",
       "score": "5分",
-      "difficulty": "中等"
+      "difficulty": "中等",
+      "knowledge_points": ["知识点1"],
+      "evidence_snippets": ["课件原文片段1"]
     }}
   ],
   "reasoning": {{"knowledge_points": [...], "answer_evidence": [...], "distractor_design": [...]}}
@@ -1497,6 +1535,10 @@ async def generate_with_reasoning_node(state: QuizState) -> QuizState:
         questions = []
         for item in structured_result.questions:
             question = item.model_dump(exclude_none=True)
+            if question.get("question") and not question.get("stem"):
+                question["stem"] = question["question"]
+            if question.get("explanation") and not question.get("analysis"):
+                question["analysis"] = question["explanation"]
             if question.get("score") is not None:
                 question["score"] = _format_score(question["score"])
             questions.append(question)
@@ -2155,6 +2197,7 @@ async def run_quiz_agent(
     return {
         "kind": "quiz_set",
         "render_mode": "interactive_cards",
+        "schema_version": SCHEMA_VERSION,
         "text": final_text,
         "payload": final_payload,
     }
@@ -2286,6 +2329,7 @@ async def run_exam_agent(
     return {
         "kind": "exam_paper",
         "render_mode": "exam_canvas",
+        "schema_version": SCHEMA_VERSION,
         "text": exam_content,
         "payload": final_payload,
     }

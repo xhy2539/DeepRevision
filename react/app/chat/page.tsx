@@ -5,22 +5,30 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import ExamCanvas, { isExamContent } from "@/components/ExamCanvas";
+import ExamCanvas from "@/components/ExamCanvas";
 
 // Types
 type MessageKind = "chat" | "quiz_set" | "exam_paper";
 
 interface QuizQuestion {
+  id?: number;
   type: string;
+  stem?: string;
   question: string;
   options?: string[];
   answer: string;
+  analysis?: string;
   explanation: string;
-  score?: string;
+  score?: string | number;
   difficulty?: string;
+  knowledge_points?: string[];
+  evidence_snippets?: string[];
 }
 
 interface AssistantPayload {
+  schema_version?: string;
+  kind?: MessageKind;
+  render_mode?: "markdown" | "interactive_cards" | "exam_canvas";
   title?: string;
   show_answers_default?: boolean;
   show_analysis_default?: boolean;
@@ -35,6 +43,7 @@ interface Message {
   timestamp: number;
   kind?: MessageKind;
   render_mode?: "markdown" | "interactive_cards" | "exam_canvas";
+  schema_version?: string;
   payload?: AssistantPayload;
 }
 
@@ -78,145 +87,6 @@ function ThoughtChain({ thoughts }: { thoughts: string[] }) {
 }
 
 // ============== Markdown 渲染组件 ==============
-function parseQuizContent(content: string): {
-  isQuiz: boolean;
-  questions: QuizQuestion[];
-} {
-  const questions: QuizQuestion[] = [];
-
-  const parseInlineOptions = (text: string): { question: string; options: string[] } => {
-    const match = text.match(/^(.*?)(?=\s+[A-D][.、]\s*)/);
-    if (!match) {
-      return { question: text.trim(), options: [] };
-    }
-
-    const question = match[1].trim();
-    const optionPart = text.slice(match[0].length).trim();
-    const optionMatches = optionPart.match(/[A-D][.、]\s*.*?(?=(?:\s+[A-D][.、]\s*)|$)/g) || [];
-    return {
-      question,
-      options: optionMatches.map(opt => opt.trim()),
-    };
-  };
-
-  // 检查是否包含题型标记（支持新旧两种格式）
-  // 新格式：1.（选择题，分值：5分，难度：中等）
-  // 旧格式：【选择题】
-  const hasNewFormat = /\（选择题，|\（填空题，|\（判断题，|\（简答题，/.test(content);
-  const hasOldFormat = /【选择题】|【填空题】|【判断题】|【简答题】/.test(content);
-  const hasInlineOptions = /[A-D][.、][\s\S]*[A-D][.、][\s\S]*/.test(content);
-
-  if (!hasNewFormat && !hasOldFormat && !hasInlineOptions) {
-    return { isQuiz: false, questions: [] };
-  }
-
-  // 分割每道题（统一按编号分段）
-  const questionBlocks = content.split(/(?=^\d+\.)/gm);
-
-  for (const block of questionBlocks) {
-    const trimmed = block.trim();
-    if (!trimmed || !/^\d+\./.test(trimmed)) continue;
-
-    const lines = trimmed.split("\n");
-    let questionText = "";
-    let options: string[] = [];
-    let answer = "";
-    let explanation = "";
-    let score = "";
-    let difficulty = "";
-    let currentType = "选择题";  // 默认题型
-    let inExplanation = false;  // 标记是否已进入解析区域
-
-    for (const line of lines) {
-      const trimmedLine = line.trim();
-      if (!trimmedLine) continue;
-
-      // 解析元数据：1.（选择题，分值：5分，难度：中等）
-      const metaMatch = trimmedLine.match(/^\d+\.\s*（([^）]+)/);
-      if (metaMatch) {
-        const meta = metaMatch[1];
-        // 解析题型
-        if (meta.includes("选择题")) currentType = "选择题";
-        else if (meta.includes("填空题")) currentType = "填空题";
-        else if (meta.includes("判断题")) currentType = "判断题";
-        else if (meta.includes("简答题")) currentType = "简答题";
-        // 解析分值
-        const scoreMatch = meta.match(/分值[：:]?\s*(\d+)分/);
-        // 解析难度
-        const diffMatch = meta.match(/难度[：:]?\s*([^，,，]+)/);
-        if (scoreMatch) score = scoreMatch[1] + "分";
-        if (diffMatch) difficulty = diffMatch[1].trim();
-        inExplanation = false;
-        continue;
-      }
-
-      // 选项（A. B. C. D.）
-      if (/^[A-D][.、]/.test(trimmedLine)) {
-        options.push(trimmedLine);
-        inExplanation = false;
-      }
-      // 答案行
-      else if (trimmedLine.startsWith("答案：") || trimmedLine.startsWith("答案:")) {
-        answer = trimmedLine.replace(/^答案[：:]\s*/, "");
-        inExplanation = true;  // 答案之后的内容属于解析
-      }
-      // 解析行（单独一行）
-      else if (trimmedLine.startsWith("解析：") || trimmedLine.startsWith("解析:")) {
-        explanation = trimmedLine.replace(/^解析[：:]\s*/, "");
-        inExplanation = true;
-      }
-      // 跳过题型标题（旧格式）
-      else if (trimmedLine.includes("【") && trimmedLine.includes("】")) {
-        continue;
-      }
-      // 如果已进入解析区域，后续行追加到解析
-      else if (inExplanation && trimmedLine) {
-        explanation += (explanation ? "\n" : "") + trimmedLine;
-      }
-      // 行内选项
-      else if (/\s+[A-D][.、]\s*/.test(trimmedLine)) {
-        const parsed = parseInlineOptions(trimmedLine);
-        if (parsed.question) {
-          questionText += (questionText ? "\n" : "") + parsed.question;
-        }
-        if (parsed.options.length > 0) {
-          options.push(...parsed.options);
-        }
-      }
-      // 其他行视为题目内容
-      else if (trimmedLine) {
-        questionText += (questionText ? "\n" : "") + trimmedLine;
-      }
-    }
-
-    if (questionText) {
-      questions.push({
-        type: currentType,
-        question: questionText,
-        options: options.length > 0 ? options : undefined,
-        answer,
-        explanation,
-        score,
-        difficulty
-      });
-    }
-  }
-
-  if (questions.length === 0 && hasInlineOptions) {
-    const inlineParsed = parseInlineOptions(content.replace(/^\d+[.、]\s*/, "").trim());
-    if (inlineParsed.question && inlineParsed.options.length >= 2) {
-      questions.push({
-        type: "选择题",
-        question: inlineParsed.question,
-        options: inlineParsed.options,
-        answer: "",
-        explanation: "",
-      });
-    }
-  }
-
-  return { isQuiz: questions.length > 0, questions };
-}
 
 // 题型样式映射
 const quizTypeStyles: Record<string, { tag: string; border: string; bg: string }> = {
@@ -261,8 +131,10 @@ function QuizCard({
                 <span className="text-sm font-medium text-slate-500">第 {idx + 1} 题</span>
               </div>
               <div className="flex items-center gap-3">
-                {q.score && (
-                  <span className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-medium">{q.score}</span>
+                {q.score !== undefined && q.score !== null && (
+                  <span className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-medium">
+                    {typeof q.score === "number" ? `${q.score}分` : q.score}
+                  </span>
                 )}
                 {q.difficulty && (
                   <span className={`text-xs px-2 py-0.5 rounded font-medium ${
@@ -275,7 +147,7 @@ function QuizCard({
               </div>
             </div>
 
-            <div className="text-slate-800 mb-4 whitespace-pre-wrap text-[15px] leading-relaxed font-medium">{q.question}</div>
+            <div className="text-slate-800 mb-4 whitespace-pre-wrap text-[15px] leading-relaxed font-medium">{q.question || q.stem}</div>
 
             {q.options && q.options.length > 0 && (
               <div className="space-y-2 mb-4 ml-1">
@@ -302,7 +174,7 @@ function QuizCard({
               </div>
             )}
 
-            {showAnswers && q.explanation && (
+            {showAnswers && (q.analysis || q.explanation) && (
               <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
                 <div className="flex items-center gap-2 mb-1">
                   <svg className="w-4 h-4 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -310,7 +182,7 @@ function QuizCard({
                   </svg>
                   <span className="font-semibold text-slate-700 text-sm">解析</span>
                 </div>
-                <span className="text-slate-600 text-sm leading-relaxed">{q.explanation}</span>
+                <span className="text-slate-600 text-sm leading-relaxed">{q.analysis || q.explanation}</span>
               </div>
             )}
           </div>
@@ -331,31 +203,17 @@ function MarkdownContent({
   payload?: AssistantPayload;
   onRequestAnswers?: () => void;
 }) {
-  const parsedQuiz = parseQuizContent(content);
+  const schemaKind = payload?.kind || kind;
+  const schemaRenderMode = payload?.render_mode;
+  const effectiveKind = schemaKind;
+  const effectiveRenderMode = schemaRenderMode || (effectiveKind === "quiz_set"
+    ? "interactive_cards"
+    : effectiveKind === "exam_paper"
+    ? "exam_canvas"
+    : "markdown");
 
-  if (kind === "exam_paper") {
-    return (
-      <ExamCanvas
-        examContent={content}
-        examDataOverride={payload?.exam_data}
-        courseName={payload?.title || "期末考试"}
-        onRequestAnswers={onRequestAnswers}
-      />
-    );
-  }
-
-  if (kind === "quiz_set") {
-    const questions = payload?.questions && payload.questions.length > 0
-      ? payload.questions
-      : parsedQuiz.questions;
-    if (questions.length > 0) {
-      return <QuizCard questions={questions} defaultShowAnswers={payload?.show_answers_default} />;
-    }
-  }
-
-  if (kind === "chat" && !parsedQuiz.isQuiz) {
-    return (
-      <div className="prose-custom">
+  const markdownNode = (
+    <div className="prose-custom">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
@@ -391,64 +249,28 @@ function MarkdownContent({
       >
         {content}
       </ReactMarkdown>
-      </div>
+    </div>
+  );
+
+  if (effectiveKind === "exam_paper" || effectiveRenderMode === "exam_canvas") {
+    return (
+      <ExamCanvas
+        examContent={content}
+        examDataOverride={payload?.exam_data || payload?.questions}
+        courseName={payload?.title || "期末考试"}
+        onRequestAnswers={onRequestAnswers}
+      />
     );
   }
 
-  // 检测是否为试卷格式，使用 Canvas 渲染
-  if (isExamContent(content)) {
-    // 直接使用 ExamCanvas 渲染，它内部会处理解析失败的情况
-    // 解析失败时会渲染原始内容作为后备
-    return <ExamCanvas examContent={content} courseName="期末考试" onRequestAnswers={onRequestAnswers} />;
+  if (effectiveKind === "quiz_set" || effectiveRenderMode === "interactive_cards") {
+    const questions = payload?.questions && payload.questions.length > 0 ? payload.questions : [];
+    if (questions.length > 0) {
+      return <QuizCard questions={questions} defaultShowAnswers={payload?.show_answers_default} />;
+    }
   }
 
-  // 尝试用简单方式解析题目
-  if (parsedQuiz.isQuiz && parsedQuiz.questions.length > 0) {
-    const questions = payload?.questions && payload.questions.length > 0
-      ? payload.questions
-      : parsedQuiz.questions;
-    return <QuizCard questions={questions} />;
-  }
-
-  return (
-    <div className="prose-custom">
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
-      components={{
-        h1: ({ children }) => <h1 className="text-2xl font-bold my-4 text-slate-900">{children}</h1>,
-        h2: ({ children }) => <h2 className="text-xl font-bold my-3 text-slate-800">{children}</h2>,
-        h3: ({ children }) => <h3 className="text-lg font-semibold my-2 text-slate-800">{children}</h3>,
-        p: ({ children }) => <p className="my-3 leading-relaxed text-slate-700">{children}</p>,
-        ul: ({ children }) => <ul className="list-disc pl-6 my-3 space-y-1">{children}</ul>,
-        ol: ({ children }) => <ol className="list-decimal pl-6 my-3 space-y-1">{children}</ol>,
-        li: ({ children }) => <li className="text-slate-700">{children}</li>,
-        strong: ({ children }) => <strong className="font-semibold text-slate-900">{children}</strong>,
-        code: ({ children, className }) => {
-          const isInline = !className;
-          if (isInline) {
-            return <code className="bg-slate-100 px-1.5 py-0.5 rounded text-sm font-mono text-teal-700 border border-slate-200">{children}</code>;
-          }
-          return (
-            <pre className="bg-slate-900 text-slate-100 p-4 rounded-lg overflow-x-auto my-4 text-sm font-mono">
-              <code>{children}</code>
-            </pre>
-          );
-        },
-        table: ({ children }) => (
-          <div className="overflow-x-auto my-4">
-            <table className="min-w-full border-collapse border border-slate-300">{children}</table>
-          </div>
-        ),
-        th: ({ children }) => <th className="border border-slate-300 bg-slate-100 px-4 py-2 text-left text-sm font-semibold">{children}</th>,
-        td: ({ children }) => <td className="border border-slate-300 px-4 py-2 text-sm">{children}</td>,
-        blockquote: ({ children }) => <blockquote className="border-l-4 border-teal-500 pl-4 my-3 text-slate-600 italic">{children}</blockquote>,
-        hr: () => <hr className="my-6 border-slate-300" />,
-      }}
-    >
-      {content}
-    </ReactMarkdown>
-    </div>
-  );
+  return markdownNode;
 }
 
 // ============== 知识库面板组件 ==============
