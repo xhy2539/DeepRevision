@@ -996,6 +996,163 @@ function KnowledgePanel({
   );
 }
 
+// ============== 历史记录管理面板 ==============
+function SessionHistoryPanel({
+  sessionId,
+  isOpen,
+  onClose,
+  onMessagesChanged,
+}: {
+  sessionId: string;
+  isOpen: boolean;
+  onClose: () => void;
+  onMessagesChanged: () => void;
+}) {
+  const [historyMessages, setHistoryMessages] = useState<Message[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [clearing, setClearing] = useState(false);
+
+  // Fetch messages when panel opens
+  useEffect(() => {
+    if (!isOpen || !sessionId) return;
+    setLoading(true);
+    fetch(`/api/chat/messages?session_id=${encodeURIComponent(sessionId)}`)
+      .then(res => res.json())
+      .then(data => {
+        if (data.code === 200 && Array.isArray(data.data)) {
+          setHistoryMessages(data.data);
+        } else {
+          setHistoryMessages([]);
+        }
+      })
+      .catch(() => setHistoryMessages([]))
+      .finally(() => setLoading(false));
+  }, [isOpen, sessionId]);
+
+  const handleDeleteMessage = async (timestamp: number) => {
+    setDeletingId(String(timestamp));
+    try {
+      const res = await fetch("/api/chat/message", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, timestamp }),
+      });
+      const data = await res.json();
+      if (data.code === 200) {
+        setHistoryMessages(prev => prev.filter(m => m.timestamp !== timestamp));
+        onMessagesChanged();
+      }
+    } catch { /* ignore */ }
+    setDeletingId(null);
+  };
+
+  const handleClearAll = async () => {
+    if (!confirm("确定清空当前会话的所有历史记录？此操作不可恢复。")) return;
+    setClearing(true);
+    try {
+      const res = await fetch(`/api/chat/messages?session_id=${encodeURIComponent(sessionId)}`, {
+        method: "DELETE",
+      });
+      const data = await res.json();
+      if (data.code === 200) {
+        setHistoryMessages([]);
+        onMessagesChanged();
+      }
+    } catch { /* ignore */ }
+    setClearing(false);
+  };
+
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center animate-fadeIn">
+      <div className="bg-white rounded-xl shadow-2xl w-full max-w-lg overflow-hidden animate-slideUp flex flex-col" style={{ maxHeight: "80vh" }}>
+        {/* Header */}
+        <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50 flex-shrink-0">
+          <div>
+            <h3 className="text-sm font-bold text-slate-900">历史记录</h3>
+            <p className="text-xs text-slate-400 font-mono mt-0.5">{historyMessages.length} 条消息</p>
+          </div>
+          <div className="flex items-center gap-2">
+            {historyMessages.length > 0 && (
+              <button
+                onClick={handleClearAll}
+                disabled={clearing}
+                className="px-3 py-1.5 text-xs font-medium text-red-600 bg-red-50 hover:bg-red-100 border border-red-200 rounded-md transition-all disabled:opacity-50"
+              >
+                {clearing ? "清空中..." : "清空全部"}
+              </button>
+            )}
+            <button onClick={onClose} className="text-slate-400 hover:text-slate-900">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        {/* Message list */}
+        <div className="flex-1 overflow-y-auto p-4">
+          {loading ? (
+            <div className="text-center py-8 text-xs text-slate-400">加载中...</div>
+          ) : historyMessages.length === 0 ? (
+            <div className="text-center py-8">
+              <div className="w-10 h-10 mx-auto mb-3 rounded-full bg-slate-100 flex items-center justify-center">
+                <svg className="w-5 h-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+                </svg>
+              </div>
+              <p className="text-xs text-slate-500">暂无历史消息</p>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {[...historyMessages].reverse().map((msg) => (
+                <div
+                  key={msg.timestamp}
+                  className={`group relative rounded-lg border px-3 py-2.5 transition-all ${
+                    msg.role === "user"
+                      ? "bg-blue-50 border-blue-100"
+                      : "bg-white border-slate-200"
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 min-w-0 flex-1">
+                      <span className={`flex-shrink-0 text-xs font-bold px-1.5 py-0.5 rounded ${
+                        msg.role === "user"
+                          ? "bg-blue-200 text-blue-800"
+                          : "bg-teal-100 text-teal-800"
+                      }`}>
+                        {msg.role === "user" ? "我" : "AI"}
+                      </span>
+                      <span className="text-[11px] font-mono text-slate-400 flex-shrink-0">
+                        {new Date(msg.timestamp).toLocaleString()}
+                      </span>
+                    </div>
+                    <button
+                      onClick={() => handleDeleteMessage(msg.timestamp)}
+                      disabled={deletingId === String(msg.timestamp)}
+                      className="flex-shrink-0 p-1 text-slate-300 hover:text-red-500 rounded transition-all opacity-0 group-hover:opacity-100 disabled:opacity-50"
+                      title="删除此消息"
+                    >
+                      <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                      </svg>
+                    </button>
+                  </div>
+                  <p className="text-xs text-slate-700 mt-1.5 line-clamp-2 leading-relaxed">
+                    {msg.content.slice(0, 200)}{msg.content.length > 200 ? "..." : ""}
+                  </p>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ============== 会话管理模态框 ==============
 function SessionModal({
   isOpen,
@@ -1210,6 +1367,8 @@ export default function ChatPage() {
   // 模态框状态
   const [showSessionModal, setShowSessionModal] = useState(false);
   const [showKnowledgePanel, setShowKnowledgePanel] = useState(false);
+  const [showHistoryPanel, setShowHistoryPanel] = useState(false);
+  const [examFastMode, setExamFastMode] = useState(true);  // True=快速路径, False=完整LLM Critique
   const [isBackendConnected, setIsBackendConnected] = useState(true);
   const [similarQuestionsByMessage, setSimilarQuestionsByMessage] = useState<Record<string, Record<number, SimilarQuestion[]>>>({});
   const [retryingMessageId, setRetryingMessageId] = useState<string | null>(null);
@@ -1630,6 +1789,7 @@ export default function ChatPage() {
         exam_stage_plan: true,
         exam_rerun_stage: failedStage,
         exam_partial_questions: partialQuestions,
+        exam_fast_mode: examFastMode,
       });
     } finally {
       setRetryingMessageId(null);
@@ -1848,6 +2008,37 @@ export default function ChatPage() {
           >
             上传课件
           </button>
+          <button
+            onClick={() => { setExamFastMode(f => !f); showToast(examFastMode ? "已关闭快速模式，将启用完整 LLM Critique" : "已开启快速模式，跳过内容质量审查", "info"); }}
+            title={examFastMode ? "快速模式：跳过内容审查" : "完整模式：启用 LLM Critique"}
+            className={`group relative px-3 py-1.5 text-xs font-medium border rounded-md transition-all ease-out duration-200 ${
+              examFastMode
+                ? "text-amber-700 bg-amber-50 border-amber-200 hover:bg-amber-100"
+                : "text-emerald-700 bg-emerald-50 border-emerald-200 hover:bg-emerald-100"
+            }`}
+          >
+            <span className="flex items-center gap-1.5">
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                {examFastMode
+                  ? <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                  : <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                }
+              </svg>
+              {examFastMode ? "快速" : "完整"}
+            </span>
+          </button>
+          <button
+            onClick={() => setShowHistoryPanel(true)}
+            title="历史记录管理"
+            className="group relative px-3 py-1.5 text-xs font-medium text-slate-600 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-md transition-all ease-out duration-200"
+          >
+            <span className="flex items-center gap-1.5">
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              历史
+            </span>
+          </button>
           {/* 出题按钮组 */}
           <div className="relative group">
             <button
@@ -1864,7 +2055,7 @@ export default function ChatPage() {
                 const prompt = `请出一套综合测试卷题目，选择10道，判断5道，填空5道，简答3道。根据已上传的课件内容生成，考点范围请从课件中提取关键知识点。${sampleInfo}
 
 请生成完整试卷，包含题目、答案和解析。`;
-                await sendMessage(prompt, { exam_stage_plan: true });
+                await sendMessage(prompt, { exam_stage_plan: true, exam_fast_mode: examFastMode });
               }}
               className="px-4 py-1.5 text-xs font-medium text-teal-700 bg-teal-50 hover:bg-teal-100 border border-teal-200 rounded-md transition-all flex items-center gap-1"
             >
@@ -2166,6 +2357,15 @@ export default function ChatPage() {
         sessionId={currentSession}
         isOpen={showKnowledgePanel}
         onClose={() => setShowKnowledgePanel(false)}
+      />
+      <SessionHistoryPanel
+        sessionId={currentSession}
+        isOpen={showHistoryPanel}
+        onClose={() => setShowHistoryPanel(false)}
+        onMessagesChanged={() => {
+          setMessages([]);
+          loadSessionMessages(currentSession);
+        }}
       />
       <ToastContainer />
 

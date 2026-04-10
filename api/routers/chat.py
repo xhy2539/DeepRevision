@@ -295,6 +295,7 @@ async def chat_stream_endpoint(request: Request):
     exam_stage_plan = bool(body.get("exam_stage_plan", True))
     exam_rerun_stage = body.get("exam_rerun_stage")
     exam_partial_questions = body.get("exam_partial_questions") if isinstance(body.get("exam_partial_questions"), list) else []
+    exam_fast_mode = bool(body.get("exam_fast_mode", True))  # True=快速路径(格式检查), False=完整路径(LLM Critique)
     logger.info(f"session_id={session_id}, query={query[:50]}...")
 
     # 安全校验
@@ -325,6 +326,7 @@ async def chat_stream_endpoint(request: Request):
             "exam_stage_plan": exam_stage_plan,
             "exam_rerun_stage": exam_rerun_stage,
             "exam_partial_questions": exam_partial_questions,
+            "exam_fast_mode": exam_fast_mode,
             "route": "",
             "route_reason": "",
             "route_params": {},
@@ -778,6 +780,47 @@ async def cleanup_legacy_session(req: SessionCleanupRequest = Body(...)):
 async def get_all_sessions():
     sessions = memory_manager.get_all_sessions()
     return {"code": 200, "data": sessions}
+
+
+# ==================== 消息管理 ====================
+
+@router.get("/messages")
+async def get_messages(session_id: str):
+    """
+    获取指定会话的所有消息，用于历史管理 UI。
+    """
+    _validate_session_id(session_id)
+    messages = memory_manager.get_messages(session_id)
+    return {"code": 200, "messages": messages, "count": len(messages)}
+
+
+class DeleteMessageRequest(BaseModel):
+    session_id: str
+    timestamp: int
+
+
+@router.delete("/message")
+async def delete_message(req: DeleteMessageRequest = Body(...)):
+    """
+    删除指定 timestamp 的单条消息。
+    """
+    _validate_session_id(req.session_id)
+    success = memory_manager.delete_message(req.session_id, req.timestamp)
+    if success:
+        return {"code": 200, "message": "消息已删除"}
+    return {"code": 404, "message": "消息未找到"}
+
+
+@router.delete("/messages")
+async def clear_messages(session_id: str):
+    """
+    清空指定会话的所有消息。
+    """
+    _validate_session_id(session_id)
+    success = memory_manager.clear_messages(session_id)
+    if success:
+        return {"code": 200, "message": "消息已清空"}
+    return {"code": 404, "message": "会话不存在"}
 
 
 @router.get("/messages")

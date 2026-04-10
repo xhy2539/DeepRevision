@@ -615,6 +615,43 @@ class SessionMemoryManager:
                 merged.append(node)
         return merged
 
+    def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
+        """获取会话中的所有消息"""
+        self._init_session(session_id)
+        _ensure_session_loaded(self.store, self.db, session_id)
+        return list(self.store.get(session_id, {}).get("recent", []))
+
+    def delete_message(self, session_id: str, timestamp: int) -> bool:
+        """
+        删除指定 timestamp 的消息。
+        返回 True 表示成功，False 表示未找到。
+        """
+        self._init_session(session_id)
+        _ensure_session_loaded(self.store, self.db, session_id)
+        session = self.store.get(session_id)
+        if not session:
+            return False
+        recent = session.get("recent", [])
+        original_len = len(recent)
+        session["recent"] = [m for m in recent if m.get("timestamp") != timestamp]
+        deleted = len(recent) - len(session["recent"])
+        if deleted > 0:
+            loop = asyncio.get_event_loop()
+            loop.create_task(self._persist(session_id))
+        return deleted > 0
+
+    def clear_messages(self, session_id: str) -> bool:
+        """清空会话中的所有消息"""
+        self._init_session(session_id)
+        _ensure_session_loaded(self.store, self.db, session_id)
+        session = self.store.get(session_id)
+        if not session:
+            return False
+        session["recent"] = []
+        loop = asyncio.get_event_loop()
+        loop.create_task(self._persist(session_id))
+        return True
+
     def get_all_sessions(self) -> List[Dict[str, str]]:
         return [{"id": k, "name": v["name"], "parent_id": v.get("parent_id")} for k, v in self.store.items()]
 

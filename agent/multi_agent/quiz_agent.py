@@ -3049,6 +3049,7 @@ async def _run_exam_stage_with_retry(
     context: str,
     sample_paper_context: str,
     deadline_ts: float,
+    exam_fast_mode: bool = True,
 ) -> tuple[List[dict], dict]:
     stage_id = stage["id"]
     stage_dist = stage["quantity_dist"]
@@ -3092,7 +3093,7 @@ async def _run_exam_stage_with_retry(
             "exam_budget_seconds": int(stage_timeout),
             "target_total_score": int(stage.get("target_score", 100)),
             "critic_timeout_count": 0,
-            "stage_fast_mode": True,
+            "stage_fast_mode": exam_fast_mode,
             "reflection_rounds": 0,
         }
 
@@ -3182,6 +3183,7 @@ async def run_exam_agent(
     stage_plan: bool = False,
     rerun_stage: Optional[str] = None,
     partial_questions: Optional[List[dict]] = None,
+    exam_fast_mode: bool = True,
 ) -> dict:
     """
     运行 Reflexion 出卷系统（3 Agent 协作）
@@ -3318,7 +3320,7 @@ async def run_exam_agent(
         "exam_budget_seconds": EXAM_BUDGET_SECONDS,
         "target_total_score": 100,
         "critic_timeout_count": 0,
-        "stage_fast_mode": False,
+        "stage_fast_mode": exam_fast_mode,
         "reflection_rounds": 0,
     }
 
@@ -3410,6 +3412,7 @@ async def run_exam_agent(
                 context=merged_context,
                 sample_paper_context=final_sample_context,
                 deadline_ts=deadline_ts,
+                exam_fast_mode=exam_fast_mode,
             )
             trace["stage_latency_ms"] = int((time.monotonic() - stage_started) * 1000)
             trace["strict_mode"] = True

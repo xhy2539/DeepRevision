@@ -37,6 +37,7 @@ class SupervisorState(TypedDict):
     exam_stage_plan: bool   # 是否启用分段出卷
     exam_rerun_stage: str   # 失败后仅重跑某一段
     exam_partial_questions: list  # 已成功段题目（重跑失败段时回传）
+    exam_fast_mode: bool   # True=快速路径(格式检查), False=完整路径(LLM Critique)
     # Supervisor 决策
     route: str              # "rag" | "quiz" | "exam" | "planner" | "chitchat"
     route_reason: str       # 路由原因（用于日志）
@@ -950,9 +951,13 @@ async def exam_subagent_node(state: SupervisorState) -> SupervisorState:
             stage_plan=True,
             rerun_stage=str(state.get("exam_rerun_stage") or "").strip() or None,
             partial_questions=state.get("exam_partial_questions") if isinstance(state.get("exam_partial_questions"), list) else None,
+            exam_fast_mode=bool(state.get("exam_fast_mode", True)),
         )
     else:
-        exam_result = await run_exam_agent(topics_with_weak, quiz_types, total, sample_ctx, quantity_dist)
+        exam_result = await run_exam_agent(
+            topics_with_weak, quiz_types, total, sample_ctx, quantity_dist,
+            exam_fast_mode=bool(state.get("exam_fast_mode", True)),
+        )
     logger.info(f"[Latency] exam_generate_ms={int((time.time() - exam_start) * 1000)}")
     exam_text = exam_result.get("text", "") if isinstance(exam_result, dict) else exam_result
     if not exam_text or not str(exam_text).strip():
