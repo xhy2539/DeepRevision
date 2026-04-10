@@ -20,7 +20,7 @@ from utils.logger_handler import logger
 from utils.config_handler import chroma_conf
 from langchain_core.runnables import RunnableLambda
 from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
@@ -481,11 +481,21 @@ class SessionMemoryManager:
             await self._distill_to_graph(session_id, trash_data)
         except Exception as e:
             logger.error(f"[记忆提纯失败] {e}")
+            # 失败回滚：避免提纯失败导致 trash 记录丢失
+            session = self.store.get(session_id)
+            if session is not None:
+                current_trash = session.get("trash") or []
+                session["trash"] = (trash_data + current_trash)[-self.max_trash_size:]
+                try:
+                    await self._persist(session_id)
+                except Exception as persist_err:
+                    logger.error(f"[记忆提纯失败] 回滚持久化失败: {persist_err}")
         finally:
             self._distilling.discard(session_id)
 
     async def _distill_to_graph(self, session_id: str, trash_data: List[Dict]):
-        parser = JsonOutputParser(pydantic_object=KnowledgeGraphNode)
+        # 使用通用 JSON 解析器，兼容返回数组；后续再逐条校验节点结构
+        parser = JsonOutputParser()
         prompt = PromptTemplate(
             template=(
                 "你是知识提炼师。请从以下零散的对话历史中，提炼出学生掌握不牢固的知识点或是复习焦点。"
@@ -498,34 +508,59 @@ class SessionMemoryManager:
             partial_variables={"format_instructions": parser.get_format_instructions()},
         )
 
-        history_text = "\n".join([f"{m['role']}: {m['content']}" for m in trash_data])
+        history_text = "\n".join([
+            f"{m.get('role', 'unknown')}: {str(m.get('content', ''))}"
+            for m in trash_data
+        ])
 
         def strip_think_tags(text):
             """去除 <think> 标签内容，避免 JSON 解析失败"""
             import re
+            # 兼容 AIMessage / BaseMessage 对象
+            if hasattr(text, "content"):
+                text = text.content
+            text = str(text or "")
             text = re.sub(r'<think>[\s\S]*?<\/think>', '', text).strip()
             return text
 
         strip_chain = RunnableLambda(strip_think_tags)
-        chain = prompt | chat_model | strip_chain | parser
+        # 先转为纯文本再做清洗，避免把 AIMessage 直接传给正则
+        chain = prompt | chat_model | StrOutputParser() | strip_chain | parser
 
         logger.info(f"[记忆提纯] 正在提纯 {session_id} 的 {len(trash_data)} 条记录...")
         result = await chain.ainvoke({"history": history_text})
 
+        if result and isinstance(result, dict):
+            result = [result]
+
         if result and isinstance(result, list):
+            # 只保留结构完整的节点，避免脏数据污染图谱
+            valid_nodes = []
+            for item in result:
+                if not isinstance(item, dict):
+                    continue
+                subject = str(item.get("subject", "")).strip()
+                relation = str(item.get("relation", "")).strip()
+                obj = str(item.get("object", "")).strip()
+                if subject and relation and obj:
+                    valid_nodes.append({"subject": subject, "relation": relation, "object": obj})
+
+            if not valid_nodes:
+                return
+
             session = self.store[session_id]
             current_size = len(session["graph"])
-            result_size = len(result)
+            result_size = len(valid_nodes)
             if current_size + result_size > self.max_graph_nodes:
                 available = self.max_graph_nodes - current_size
                 if available > 0:
-                    session["graph"].extend(result[:available])
+                    session["graph"].extend(valid_nodes[:available])
                 else:
-                    session["graph"] = result[:self.max_graph_nodes] if result else []
+                    session["graph"] = valid_nodes[:self.max_graph_nodes] if valid_nodes else []
                 logger.info(f"[记忆提纯] {session_id} 图谱超限，保留最近 {self.max_graph_nodes} 条知识节点")
             else:
-                session["graph"].extend(result)
-                logger.info(f"[记忆提纯] {session_id} 抽取 {len(result)} 条知识节点")
+                session["graph"].extend(valid_nodes)
+                logger.info(f"[记忆提纯] {session_id} 抽取 {len(valid_nodes)} 条知识节点")
             await self._persist(session_id)
 
     def get_memory_context(self, session_id: str) -> str:
@@ -708,19 +743,27 @@ class SessionMemoryManager:
         logger.info(f"[题库] 已存储题目 {question_id} 到题库")
         return chroma_id
 
-    def search_similar_questions(self, question_content: str, knowledge_point: str = None,
-                                  limit: int = 5) -> List[Dict]:
-        """搜索相似题目（基于向量相似度）"""
+    def search_similar_questions(
+        self,
+        question_content: str,
+        knowledge_point: str = None,
+        limit: int = 5,
+        session_id: Optional[str] = None,
+    ) -> List[Dict]:
+        """搜索相似题目（优先向量检索，失败/不足时回退 SQLite 历史练习兜底）"""
         try:
             # 嵌入查询内容
             query_embedding = embed_model.embed_query(question_content)
 
             # 搜索 ChromaDB
             chroma = self._get_question_bank_chroma()
-            results = chroma.similarity_search_by_vector(
-                embedding=query_embedding,
-                k=limit * 2,  # 多取一些，后面过滤
-            )
+            search_kwargs = {
+                "embedding": query_embedding,
+                "k": limit * 2,  # 多取一些，后面过滤
+            }
+            if session_id:
+                search_kwargs["filter"] = {"session_id": session_id}
+            results = chroma.similarity_search_by_vector(**search_kwargs)
 
             similar_questions = []
             seen_content = set()
@@ -748,17 +791,27 @@ class SessionMemoryManager:
                 if len(similar_questions) >= limit:
                     break
 
-            # 如果不够，回退到只看知识点匹配
+            # 如果不够，回退到 question_bank 的 SQLite（按 session + 知识点）
             if len(similar_questions) < limit:
                 conn = sqlite3.connect(self.db)
                 try:
-                    rows = conn.execute("""
-                        SELECT question_content, answer, knowledge_point, question_id
-                        FROM question_bank
-                        WHERE knowledge_point = ?
-                        ORDER BY RANDOM()
-                        LIMIT ?
-                    """, (knowledge_point, limit - len(similar_questions))).fetchall()
+                    needed = limit - len(similar_questions)
+                    if session_id:
+                        rows = conn.execute("""
+                            SELECT question_content, answer, knowledge_point, question_id
+                            FROM question_bank
+                            WHERE session_id = ? AND knowledge_point = ?
+                            ORDER BY RANDOM()
+                            LIMIT ?
+                        """, (session_id, knowledge_point, needed)).fetchall()
+                    else:
+                        rows = conn.execute("""
+                            SELECT question_content, answer, knowledge_point, question_id
+                            FROM question_bank
+                            WHERE knowledge_point = ?
+                            ORDER BY RANDOM()
+                            LIMIT ?
+                        """, (knowledge_point, needed)).fetchall()
 
                     for row in rows:
                         content = row[0]
@@ -772,6 +825,44 @@ class SessionMemoryManager:
                             "question_id": row[3],
                         })
                         seen_content.add(content_key)
+
+                    # 兜底：question_bank 仍不足时，从练习历史中补同知识点题目（避免空推荐）
+                    needed = limit - len(similar_questions)
+                    if needed > 0:
+                        if session_id:
+                            history_rows = conn.execute("""
+                                SELECT question_content, correct_answer, knowledge_point, question_id
+                                FROM practice_records
+                                WHERE session_id = ? AND knowledge_point = ?
+                                ORDER BY created_at DESC
+                                LIMIT ?
+                            """, (session_id, knowledge_point, needed * 3)).fetchall()
+                        else:
+                            history_rows = conn.execute("""
+                                SELECT question_content, correct_answer, knowledge_point, question_id
+                                FROM practice_records
+                                WHERE knowledge_point = ?
+                                ORDER BY created_at DESC
+                                LIMIT ?
+                            """, (knowledge_point, needed * 3)).fetchall()
+
+                        for row in history_rows:
+                            content = row[0] or ""
+                            if not content:
+                                continue
+                            content_key = content[:50]
+                            # 去重 + 排除当前题干
+                            if content_key in seen_content or content.strip() == (question_content or "").strip():
+                                continue
+                            similar_questions.append({
+                                "question_content": content,
+                                "answer": row[1] or "",
+                                "knowledge_point": row[2] or knowledge_point or "",
+                                "question_id": row[3] or "",
+                            })
+                            seen_content.add(content_key)
+                            if len(similar_questions) >= limit:
+                                break
                 finally:
                     conn.close()
 

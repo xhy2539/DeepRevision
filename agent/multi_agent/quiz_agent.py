@@ -24,11 +24,13 @@ from utils.session_context import current_session_id
 from utils.logger_handler import logger
 from api.routers.exam_export import parse_exam_content
 
-EXAM_BUDGET_SECONDS = 900
+EXAM_BUDGET_SECONDS = 600
 QUIZ_BUDGET_SECONDS = 600
 QUIZ_MIN_COURSEWARE_HITS = 2
 ALLOW_DEGRADED_DELIVERY = True
 EXAM_STAGE_RETRY_ENABLED = True
+EXAM_ENABLE_LOCAL_EMERGENCY_FALLBACK = False
+EXAM_MISSING_MODEL_RETRY_ROUNDS = 6
 EXAM_TYPE_ORDER = ["选择题", "填空题", "判断题", "简答题"]
 TYPE_KEY_TO_LABEL = {"choice": "选择题", "fill": "填空题", "judge": "判断题", "essay": "简答题"}
 TYPE_LABEL_TO_KEY = {v: k for k, v in TYPE_KEY_TO_LABEL.items()}
@@ -96,6 +98,8 @@ class ExamPaperState(TypedDict):
     exam_budget_started_at: float
     exam_budget_seconds: int
     target_total_score: int
+    critic_timeout_count: int
+    stage_fast_mode: bool
     # 控制
     reflection_rounds: int
 
@@ -421,7 +425,7 @@ async def call_llm_structured(prompt_template: str, schema: type[BaseModel], **k
 # ---------- 分批生成单题型试卷的 Prompt ----------
 EXAM_GENERATE_SINGLE_TYPE_PROMPT = """【警告】绝对禁止使用'...'、'等'、'以下略'等任何占位符！你必须逐字逐句地生成所有要求的题目。
 
-你是一位资深大学期末考试命题专家。根据课件资料生成单种题型的试卷。
+你是一位资深大学期末考试命题专家。请基于课程知识点生成单种题型试卷。
 
 【考点范围】{topics}
 【题型】{quiz_type}
@@ -431,20 +435,24 @@ EXAM_GENERATE_SINGLE_TYPE_PROMPT = """【警告】绝对禁止使用'...'、'等
 【总分】{total_score} 分
 【样卷格式参考】{sample_paper_context}
 
-【课件资料】:
+【课程参考资料】:
 {context}
 
 【硬性要求】：
 1. 必须生成正好 {num} 道 {quiz_type}，编号从 {start_num} 到 {end_num}，一道都不能少！
-2. 选择题必须有 A、B、C、D 四个完整选项，题干描述要详细（至少30字）
-3. 填空题题干要详细，需要填空的部位用括号表示
-4. 判断题题干要详细
-5. 简答题/解答题必须有2-3个小问
-6. 【重要】所有题目统一分值：{score} 分/题，总分 {total_score} 分，每道题必须标注这个分值！
-7. 题目描述要详细，包含足够信息
-8. 难度分布：简单30%、中等50%、困难20%
-9. 【强制出题】必须逐字逐句生成所有要求的题目，禁止任何省略！
-10. 每道题必须包含答案、解析和分值标注
+2. 选择题必须有 A、B、C、D 四个完整选项，且每个选项独立成行。
+3. 填空题需要填空的部位用括号表示；判断题表述清晰可判定。
+4. 简答题/解答题建议 2-3 个小问,分值自行分配，但是总分每题20。
+5. 【重要】所有题目统一分值：{score} 分/题，总分 {total_score} 分，每道题必须标注这个分值！
+6. 题干要自然考试语气，详略得当，不要教材段落式堆砌。
+7. 难度分布：简单30%、中等50%、困难20%
+8. 【强制出题】必须逐字逐句生成所有要求的题目，禁止任何省略！
+9. 每道题必须包含答案、解析和分值标注。
+10. “来源依据说明”只能写在 reasoning 字段，严禁写入题干、选项、答案、解析。
+11. 选择题题干长度建议 40-90 字；整批题目需有短中长变化，避免长度雷同。
+12. 不得出现 "A A"/"B B" 前缀重复。
+13. 禁止输出泛化模板选项：`会直接影响系统行为与资源约束`、`只影响文字表述`、`仅在理想场景成立`、`与性能和正确性无关`。
+14. 用户可见字段（题干/选项/答案/解析）禁止“中文术语（英文解释）”样式；CPU/TLB/TCP 等纯缩写可保留。
 
 【格式示例】
 {format_example}
@@ -458,7 +466,7 @@ EXAM_GENERATE_SINGLE_TYPE_PROMPT = """【警告】绝对禁止使用'...'、'等
 # ---------- 结构化试卷生成 Prompt（返回 JSON） ----------
 EXAM_GENERATE_STRUCTURED_PROMPT = """【警告】绝对禁止使用'...'、'等'、'以下略'等任何占位符！你必须逐字逐句地生成所有要求的题目。
 
-你是一位资深大学期末考试命题专家。根据课件资料生成结构化试卷。
+你是一位资深大学期末考试命题专家。请基于课程知识点生成结构化试卷。
 
 【考点范围】{topics}
 【题型】{quiz_type}
@@ -466,20 +474,23 @@ EXAM_GENERATE_STRUCTURED_PROMPT = """【警告】绝对禁止使用'...'、'等'
 【起始编号】{start_num}
 【样卷格式参考】{sample_paper_context}
 
-【课件资料】:
+【课程参考资料】:
 {context}
 
 【硬性要求】：
 1. 必须生成正好 {num} 道 {quiz_type}，编号从 {start_num} 开始
-2. 选择题必须有 A、B、C、D 四个完整选项，题干描述要详细
-3. 填空题题干要详细，需要填空的部位用括号表示
-4. 判断题题干要详细
-5. 简答题/解答题可以有2-3个小问
-6. 【必须】每道题都要包含 score（分值）和 difficulty（难度）
-7. 分值分配由你根据题型和难度决定：选择题2-3分，填空题2-3分，判断题2分，简答题8-10分
-8. 难度分布：简单30%、中等50%、困难20%，根据题目内容自行判断
-9. 【强制出题】必须逐字逐句生成所有要求的题目，禁止任何省略！
-10. 每道题必须包含 answer（答案）和 analysis（解析）
+2. 选择题必须有 A、B、C、D 四个完整选项，且每个选项独立成行。
+3. 填空题需要填空部位用括号表示；判断题表述清晰可判定。
+4. 简答题/解答题可以有 2-3 个小问。
+5. 【必须】每道题都要包含 score（分值）和 difficulty（难度）。
+6. 分值分配由你根据题型和难度决定：选择题2-3分，填空题2-3分，判断题2分，简答题8-10分。
+7. 难度分布：简单30%、中等50%、困难20%，根据题目内容自行判断。
+8. 【强制出题】必须逐字逐句生成所有要求的题目，禁止任何省略！
+9. 每道题必须包含 answer（答案）和 analysis（解析）。
+10. 允许你在 reasoning 中说明证据来源，但禁止在题干/选项/答案/解析中写“根据课件/依据资料/参考资料”等来源措辞。
+11. 选择题题干长度建议 40-90 字，整批题目需有短中长变化，不得重复前缀（如 "A A"）。
+12. 禁止输出泛化模板选项：`会直接影响系统行为与资源约束`、`只影响文字表述`、`仅在理想场景成立`、`与性能和正确性无关`。
+13. 用户可见字段（题干/选项/答案/解析）禁止“中文术语（英文解释）”样式；CPU/TLB/TCP 等纯缩写可保留。
 
 请生成 JSON 格式的试卷：
 {{
@@ -505,15 +516,21 @@ EXAM_GENERATE_STRUCTURED_PROMPT = """【警告】绝对禁止使用'...'、'等'
 # 单题型生成模板（带分值和难度标注）
 SINGLE_TYPE_FORMAT_EXAMPLES = {
     "选择题": """一、选择题（共{num}题，每题{score}分，计{total_score}分）
-{start_num}. [详细题干内容，至少30字]
-   A. 选项1  B. 选项2  C. 选项3  D. 选项4
+{start_num}. [题干内容（建议40-90字）]
+   A. 选项1
+   B. 选项2
+   C. 选项3
+   D. 选项4
 答案：A
 分值：{score}
 难度：中等
-解析：根据课件内容...
+解析：该选项符合课程定义，其他选项存在概念偏差。
 
-{start_num_plus1}. [详细题干内容]
-   A. 选项1  B. 选项2  C. 选项3  D. 选项4
+{start_num_plus1}. [题干内容（建议40-90字）]
+   A. 选项1
+   B. 选项2
+   C. 选项3
+   D. 选项4
 答案：B
 分值：{score}
 难度：简单
@@ -801,7 +818,7 @@ def _quiz_budget_left_seconds(state: QuizState) -> float:
 
 
 def _normalize_option_text(option: str, index: int) -> str:
-    option_text = str(option or "").strip()
+    option_text = _sanitize_user_visible_text(str(option or "").strip())
     if not option_text:
         return f"{chr(65 + index)}. （无内容）"
     m = re.match(r'^([A-D])[.、．:：)\s]*(.*)$', option_text, flags=re.IGNORECASE)
@@ -974,9 +991,9 @@ def _build_emergency_questions(
         topic_seed = "本课程重点内容"
     questions: List[dict] = []
     choice_templates = [
-        "下列关于“{topic}”的说法，正确的是哪一项？",
+        "下列关于“{topic}”的表述，正确的是哪一项？",
         "“{topic}”的核心目标最准确的是哪一项？",
-        "关于“{topic}”的关键作用，下列描述正确的是：",
+        "关于“{topic}”的关键作用，哪项描述正确？",
     ]
     fill_templates = [
         "在“{topic}”中，系统设计通常需要在（____）与（____）之间权衡。",
@@ -997,12 +1014,12 @@ def _build_emergency_questions(
             questions.append({
                 "number": q_no,
                 "type": "选择题",
-                "content": f"{choice_templates[i % len(choice_templates)].format(topic=topic_seed)}（变式{i + 1}）",
+                "content": f"{choice_templates[i % len(choice_templates)].format(topic=topic_seed)}",
                 "options": [
-                    "A. 该机制直接影响系统行为与资源约束",
-                    "B. 该机制只影响文字表述，不影响系统行为",
-                    "C. 该机制仅在理想场景成立，工程中不可用",
-                    "D. 该机制与正确性、性能均无关系",
+                    f"A. {topic_seed}对应的是内核或系统关键机制",
+                    f"B. {topic_seed}只属于文档表达，不影响系统行为",
+                    f"C. {topic_seed}可在不受权限约束下直接操作硬件",
+                    f"D. {topic_seed}与性能和正确性没有关系",
                 ],
                 "answer": "A",
                 "analysis": "正确选项体现了系统机制与工程约束，其他选项存在明显逻辑错误。",
@@ -1013,7 +1030,7 @@ def _build_emergency_questions(
             questions.append({
                 "number": q_no,
                 "type": "填空题",
-                "content": f"{fill_templates[i % len(fill_templates)].format(topic=topic_seed)}（变式{i + 1}）",
+                "content": f"{fill_templates[i % len(fill_templates)].format(topic=topic_seed)}",
                 "answer": "正确性；性能",
                 "analysis": "课程中常强调正确性与性能的平衡。",
                 "score": score_per_question,
@@ -1023,7 +1040,7 @@ def _build_emergency_questions(
             questions.append({
                 "number": q_no,
                 "type": "判断题",
-                "content": f"{judge_templates[i % len(judge_templates)].format(topic=topic_seed)}（变式{i + 1}）",
+                "content": f"{judge_templates[i % len(judge_templates)].format(topic=topic_seed)}",
                 "answer": "错",
                 "analysis": "核心机制会直接影响系统实现与运行表现。",
                 "score": score_per_question,
@@ -1033,7 +1050,7 @@ def _build_emergency_questions(
             questions.append({
                 "number": q_no,
                 "type": "简答题",
-                "content": f"{essay_templates[i % len(essay_templates)].format(topic=topic_seed)}（变式{i + 1}）",
+                "content": f"{essay_templates[i % len(essay_templates)].format(topic=topic_seed)}",
                 "answer": "应包含定义、流程、问题分析与可行优化方案。",
                 "analysis": "考查对知识点的结构化理解与工程应用能力。",
                 "score": score_per_question,
@@ -1110,18 +1127,20 @@ async def _ensure_single_type_questions(
     def time_left() -> float:
         return hard_deadline_seconds - (time.monotonic() - start_ts)
 
-    # 结构化阶段：最多 2 次小批次尝试（选择/填空/判断=2题，简答=1题）
+    # 结构化阶段：动态批次尝试（避免固定2次导致必然补题）
     structured_questions: List[dict] = []
     structured_attempts = 0
+    structured_batch_size = _get_structured_batch_size(quiz_type)
+    # 例如选择题10道、每批2道，至少要5次尝试才可能全结构化补齐
+    max_structured_attempts = max(2, min(8, (num + structured_batch_size - 1) // structured_batch_size + 1))
     while (
         len(structured_questions) < num
-        and structured_attempts < 2
+        and structured_attempts < max_structured_attempts
         and time_left() > budget_reserved_for_fallback
     ):
         structured_attempts += 1
         remaining = num - len(structured_questions)
-        batch_size = _get_structured_batch_size(quiz_type)
-        batch_num = min(max(1, batch_size), remaining)
+        batch_num = min(max(1, structured_batch_size), remaining)
         batch_start = start_num + len(structured_questions)
         structured_timeout = max(30.0, min(150.0, structured_budget_ceiling / 2))
         try:
@@ -1139,18 +1158,18 @@ async def _ensure_single_type_questions(
             batch_questions = [q.model_dump() for q in structured.questions]
             if not batch_questions:
                 logger.warning(
-                    f"[分批补题] {quiz_type} 结构化批次为空，attempt={structured_attempts}/2, "
+                    f"[分批补题] {quiz_type} 结构化批次为空，attempt={structured_attempts}/{max_structured_attempts}, "
                     f"batch={batch_num}, start={batch_start}"
                 )
                 continue
             structured_questions.extend(batch_questions[:batch_num])
             logger.info(
-                f"[分批补题] {quiz_type} 结构化批次成功，attempt={structured_attempts}/2, "
+                f"[分批补题] {quiz_type} 结构化批次成功，attempt={structured_attempts}/{max_structured_attempts}, "
                 f"batch={batch_num}, accumulated={len(structured_questions)}/{num}"
             )
         except Exception as e:
             logger.warning(
-                f"[分批补题] {quiz_type} 结构化批次失败，attempt={structured_attempts}/2: {e}"
+                f"[分批补题] {quiz_type} 结构化批次失败，attempt={structured_attempts}/{max_structured_attempts}: {e}"
             )
 
     if len(structured_questions) >= num:
@@ -1236,22 +1255,67 @@ async def _ensure_single_type_questions(
 
     if len(merged) < num:
         missing = num - len(merged)
-        logger.warning(f"[分批补题] {quiz_type} 最终仍缺{missing}道，启用本地兜底题")
-        merged = _merge_exam_questions(
-            merged,
-            _build_emergency_questions(
-                quiz_type=quiz_type,
-                num=missing,
-                start_num=start_num + len(merged),
-                topics=topics,
-                score_per_question=score_per_question,
-            ),
-            quiz_type,
-            start_num,
-        )
+        logger.warning(f"[分批补题] {quiz_type} 仍缺{missing}道，进入模型重试兜底（禁用本地模板兜底）")
+        rounds = 0
+        while len(merged) < num and rounds < EXAM_MISSING_MODEL_RETRY_ROUNDS and time_left() > 8:
+            rounds += 1
+            next_num = start_num + len(merged)
+            logger.info(f"[分批补题] {quiz_type} 缺题模型重试 round={rounds}/{EXAM_MISSING_MODEL_RETRY_ROUNDS}, 编号{next_num}")
+            try:
+                supplement_text = await asyncio.wait_for(
+                    generate_single_type_paper(
+                        quiz_type=quiz_type,
+                        num=1,
+                        start_num=next_num,
+                        topics=topics,
+                        context=context,
+                        sample_paper_context=sample_paper_context,
+                        score_per_question=score_per_question,
+                    ),
+                    timeout=max(20.0, min(90.0, time_left())),
+                )
+            except Exception as e:
+                logger.warning(f"[分批补题] {quiz_type} 缺题模型重试失败 round={rounds}: {e}")
+                supplement_text = ""
+            supplement_questions = parse_exam_content(supplement_text).get("questions", []) if supplement_text else []
+            if supplement_questions:
+                merged = _merge_exam_questions(merged, supplement_questions[:1], quiz_type, start_num)
+
+    if len(merged) < num:
+        missing = num - len(merged)
+        if EXAM_ENABLE_LOCAL_EMERGENCY_FALLBACK:
+            logger.warning(f"[分批补题] {quiz_type} 最终仍缺{missing}道，启用本地兜底题")
+            merged = _merge_exam_questions(
+                merged,
+                _build_emergency_questions(
+                    quiz_type=quiz_type,
+                    num=missing,
+                    start_num=start_num + len(merged),
+                    topics=topics,
+                    score_per_question=score_per_question,
+                ),
+                quiz_type,
+                start_num,
+            )
+        else:
+            raise RuntimeError(f"{quiz_type} 生成不足：仍缺{missing}道，且已禁用本地兜底")
 
     if len(merged) > num:
         merged = merged[:num]
+    if quiz_type == "选择题":
+        normalized_choice_questions: List[dict] = []
+        repaired_count = 0
+        for idx, q in enumerate(merged, start=1):
+            qq = _normalize_exam_question(q, start_num + idx - 1)
+            before_opts = qq.get("options") if isinstance(qq.get("options"), list) else []
+            qq = _ensure_choice_structure(qq)
+            after_opts = qq.get("options") if isinstance(qq.get("options"), list) else []
+            if len(before_opts) < 4 and len(after_opts) >= 4:
+                repaired_count += 1
+            normalized_choice_questions.append(qq)
+        merged = normalized_choice_questions
+        if repaired_count > 0:
+            logger.warning(f"[分批补题] {quiz_type} 交付前自动修复缺失选项 {repaired_count} 道")
     logger.info(f"[分批补题] {quiz_type} 最终数量={len(merged)} / 目标={num}")
     logger.info(f"[分批补题] {quiz_type} stage_exit_reason={'filled' if len(merged) >= num else 'budget_exhausted'}")
     return merged
@@ -1619,6 +1683,32 @@ META_QUESTION_PATTERNS = [
 ]
 
 
+def _sanitize_user_visible_text(text: str) -> str:
+    cleaned = _sanitize_question_text(text)
+    cleaned = re.sub(r'^(解析[:：]?)\s*(根据|依据)\s*(课件|资料|参考资料)', r'\1 ', cleaned)
+    cleaned = re.sub(r'(根据|依据)\s*(课件|资料|参考资料)\s*(内容)?(可知|可得|显示|指出)?', '', cleaned)
+    # 用户可见字段禁止“中文术语 + 英文括号解释”，例如：微内核（microkernel）
+    cleaned = re.sub(
+        r'([\u4e00-\u9fa5]{2,})\s*[（(]\s*[A-Za-z][A-Za-z0-9\s/_\-]{1,48}\s*[)）]',
+        r'\1',
+        cleaned,
+    )
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
+
+def _contains_term_style_violation(text: str) -> bool:
+    t = str(text or "")
+    if not t:
+        return False
+    return bool(
+        re.search(
+            r'[\u4e00-\u9fa5]{2,}\s*[（(]\s*[A-Za-z][A-Za-z0-9\s/_\-]{1,48}\s*[)）]',
+            t,
+        )
+    )
+
+
 def _sanitize_question_text(text: str) -> str:
     cleaned = str(text or "").strip()
     if not cleaned:
@@ -1630,6 +1720,10 @@ def _sanitize_question_text(text: str) -> str:
     cleaned = cleaned.replace("当前课件核心知识点", "本课程重点内容")
     cleaned = cleaned.replace("课程核心知识点", "本课程重点内容")
     cleaned = cleaned.replace("根据课件", "")
+    cleaned = re.sub(r'(根据|依据)\s*(已上传)?课件(资料)?', '', cleaned)
+    cleaned = re.sub(r'(课件资料|参考资料)\s*显示', '', cleaned)
+    cleaned = re.sub(r'请结合课件资料', '请结合课程内容', cleaned)
+    cleaned = re.sub(r'请依据课件资料', '请依据课程内容', cleaned)
     cleaned = re.sub(r'^\s*[，,:：]\s*', '', cleaned)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     return cleaned
@@ -1706,8 +1800,26 @@ def _normalize_options(value: Any) -> Optional[List[str]]:
         items = [value]
 
     normalized: List[str] = []
+    inline_option_pattern = re.compile(
+        r'([A-DＡ-Ｄ])[.、．:：)\s]+\s*(.+?)(?=(?:\s+[A-DＡ-Ｄ][.、．:：)\s]+)|$)',
+        flags=re.IGNORECASE,
+    )
+    marker_pattern = re.compile(r'[A-DＡ-Ｄ][.、．:：)\s]+', flags=re.IGNORECASE)
+
     for idx, item in enumerate(items):
-        opt = _normalize_option_text(str(item or ""), idx)
+        raw = str(item or "").strip()
+        if not raw:
+            continue
+        # 兼容一整行中包含 A/B/C/D 多个选项
+        if len(marker_pattern.findall(raw)) >= 2:
+            matches = inline_option_pattern.findall(raw)
+            if matches:
+                for letter, text in matches:
+                    txt = str(text or "").strip()
+                    if txt:
+                        normalized.append(f"{str(letter).upper()}. {txt}")
+                continue
+        opt = _normalize_option_text(raw, idx)
         if opt and opt.strip():
             normalized.append(opt.strip())
 
@@ -1734,10 +1846,10 @@ def _normalize_question_item(item: Any, fallback_id: int) -> dict:
     return {
         "id": _normalize_int_field(item.get("id"), fallback_id),
         "type": _normalize_text_field(item.get("type"), "选择题"),
-        "question": _sanitize_question_text(_normalize_text_field(item.get("question") or item.get("content"), "")),
+        "question": _sanitize_user_visible_text(_sanitize_question_text(_normalize_text_field(item.get("question") or item.get("content"), ""))),
         "options": _normalize_options(item.get("options")),
-        "answer": _normalize_text_field(item.get("answer"), ""),
-        "explanation": _normalize_text_field(item.get("explanation") or item.get("analysis"), ""),
+        "answer": _sanitize_user_visible_text(_normalize_text_field(item.get("answer"), "")),
+        "explanation": _sanitize_user_visible_text(_normalize_text_field(item.get("explanation") or item.get("analysis"), "")),
         "score": _format_score(item.get("score")),
         "difficulty": _normalize_text_field(item.get("difficulty"), "中等"),
     }
@@ -1750,6 +1862,26 @@ def _normalize_questions_payload(value: Any) -> List[dict]:
     return [_normalize_question_item(item, index) for index, item in enumerate(items, start=1)]
 
 
+def _sanitize_quiz_questions_for_delivery(questions: Any) -> List[dict]:
+    normalized = _normalize_questions_payload(questions)
+    out: List[dict] = []
+    for idx, q in enumerate(normalized, start=1):
+        item = dict(q)
+        item["id"] = int(item.get("id") or idx)
+        item["question"] = _sanitize_user_visible_text(_normalize_text_field(item.get("question"), ""))
+        item["answer"] = _sanitize_user_visible_text(_normalize_text_field(item.get("answer"), ""))
+        item["explanation"] = _sanitize_user_visible_text(_normalize_text_field(item.get("explanation"), ""))
+        qtype = str(item.get("type") or "").strip() or "选择题"
+        item["type"] = qtype
+        if qtype == "选择题":
+            opts = _normalize_options(item.get("options")) or []
+            item["options"] = [_normalize_option_text(opt, i) for i, opt in enumerate(opts[:4])]
+        else:
+            item["options"] = None
+        out.append(item)
+    return out
+
+
 def _normalize_exam_question_item(item: Any, fallback_id: int) -> dict:
     if not isinstance(item, dict):
         item = {"content": str(item).strip()}
@@ -1759,7 +1891,7 @@ def _normalize_exam_question_item(item: Any, fallback_id: int) -> dict:
         "content": _sanitize_question_text(_normalize_text_field(item.get("content") or item.get("question"), "")),
         "options": _normalize_options(item.get("options")),
         "answer": _normalize_text_field(item.get("answer"), ""),
-        "analysis": _normalize_text_field(item.get("analysis") or item.get("explanation"), ""),
+        "analysis": _sanitize_user_visible_text(_normalize_text_field(item.get("analysis") or item.get("explanation"), "")),
         "score": _normalize_int_field(item.get("score"), 2),
         "difficulty": _normalize_text_field(item.get("difficulty"), "中等"),
     }
@@ -1894,10 +2026,10 @@ def _parse_questions_from_serialized_quiz(text: str) -> List[dict]:
         normalized.append({
             "id": _normalize_int_field(item.get("id") or item.get("question_number"), idx),
             "type": _normalize_text_field(item.get("type"), "选择题"),
-            "question": question,
+            "question": _sanitize_user_visible_text(_sanitize_question_text(question)),
             "options": options or None,
-            "answer": _normalize_text_field(item.get("answer"), ""),
-            "explanation": _normalize_text_field(item.get("explanation") or item.get("analysis"), ""),
+            "answer": _sanitize_user_visible_text(_normalize_text_field(item.get("answer"), "")),
+            "explanation": _sanitize_user_visible_text(_normalize_text_field(item.get("explanation") or item.get("analysis"), "")),
             "score": _format_score(item.get("score")) or "5分",
             "difficulty": _normalize_text_field(item.get("difficulty"), "中等"),
         })
@@ -1916,7 +2048,7 @@ def _questions_from_quiz_text(text: str, topic: str) -> dict:
 def _normalize_exam_question(question: dict, fallback_number: int) -> dict:
     qtype = question.get("type") or "选择题"
     score = int(question.get("score") or (2 if qtype in {"选择题", "填空题", "判断题"} else 10))
-    content = _sanitize_question_text(question.get("content") or question.get("question") or "")
+    content = _sanitize_user_visible_text(question.get("content") or question.get("question") or "")
     options = question.get("options") or None
     if qtype == "选择题":
         stem, parsed_options = _split_stem_and_options_for_payload(content)
@@ -1928,8 +2060,8 @@ def _normalize_exam_question(question: dict, fallback_number: int) -> dict:
         "type": qtype,
         "content": content,
         "options": options,
-        "answer": question.get("answer") or "",
-        "analysis": question.get("analysis") or question.get("explanation") or "",
+        "answer": _sanitize_user_visible_text(question.get("answer") or ""),
+        "analysis": _sanitize_user_visible_text(question.get("analysis") or question.get("explanation") or ""),
         "score": score,
         "difficulty": question.get("difficulty") or "中等",
         "knowledge_point": question.get("knowledge_point"),
@@ -1983,8 +2115,11 @@ def _split_stem_and_options_for_payload(raw_content: str) -> tuple[str, List[str
     lines = [line.strip() for line in content.splitlines() if line.strip()]
     stem_lines: List[str] = []
     options: List[str] = []
-    option_line_pattern = re.compile(r'^([A-DＡ-Ｄ])[.、．]\s*(.+)$')
-    inline_split_pattern = re.compile(r'(?=[A-DＡ-Ｄ][.、．]\s*)')
+    option_line_pattern = re.compile(r'^([A-DＡ-Ｄ])[.、．:：)\s]+\s*(.+)$')
+    inline_split_pattern = re.compile(r'(?=[A-DＡ-Ｄ][.、．:：)\s]+\s*)')
+    inline_capture_pattern = re.compile(
+        r'([A-DＡ-Ｄ])[.、．:：)\s]+\s*(.+?)(?=(?:\s+[A-DＡ-Ｄ][.、．:：)\s]+)|$)'
+    )
 
     for line in lines:
         line = line.replace('．', '.')
@@ -1996,7 +2131,21 @@ def _split_stem_and_options_for_payload(raw_content: str) -> tuple[str, List[str
                 options.append(f"{letter}. {option_text}")
             continue
 
-        if re.search(r'[A-DＡ-Ｄ][.、．]\s*', line):
+        if re.search(r'[A-DＡ-Ｄ][.、．:：)\s]+\s*', line):
+            # 优先用捕获模式拆分同一行的多选项，兼容 "A xxx B xxx C xxx D xxx"
+            inline_matches = inline_capture_pattern.findall(line)
+            if len(inline_matches) >= 2:
+                first_marker = re.search(r'[A-DＡ-Ｄ][.、．:：)\s]+\s*', line)
+                if first_marker and first_marker.start() > 0:
+                    stem_prefix = line[:first_marker.start()].strip()
+                    if stem_prefix:
+                        stem_lines.append(stem_prefix)
+                for letter, opt_text in inline_matches:
+                    txt = str(opt_text or "").strip()
+                    if txt:
+                        options.append(f"{str(letter).upper()}. {txt}")
+                continue
+
             parts = [p.strip() for p in inline_split_pattern.split(line) if p.strip()]
             if parts:
                 first = parts[0]
@@ -2167,6 +2316,28 @@ def _target_counts(quantity_dist: dict, fallback_questions: Optional[List[dict]]
     }
 
 
+def _question_term_style_ok(question: dict) -> bool:
+    if not isinstance(question, dict):
+        return True
+    visible_parts: List[str] = [
+        str(question.get("content") or question.get("question") or ""),
+        str(question.get("answer") or ""),
+        str(question.get("analysis") or question.get("explanation") or ""),
+    ]
+    options = question.get("options") or []
+    if isinstance(options, list):
+        visible_parts.extend([str(opt) for opt in options])
+    return not any(_contains_term_style_violation(part) for part in visible_parts if part)
+
+
+def _collect_term_style_violation_numbers(questions: List[dict]) -> List[int]:
+    bad: List[int] = []
+    for i, q in enumerate(questions or [], start=1):
+        if not _question_term_style_ok(q):
+            bad.append(int((q or {}).get("number") or i))
+    return bad
+
+
 def _score_map_for_counts(target: dict, target_total_score: int = 100) -> dict:
     choice_score = 2
     fill_score = 2
@@ -2199,13 +2370,154 @@ def _ensure_answer_analysis(questions: List[dict]) -> List[dict]:
 
 def _build_choice_option_templates(stem: str) -> List[str]:
     stem_core = re.sub(r'\s+', ' ', str(stem or "").strip())
-    stem_core = stem_core[:48] if stem_core else "该知识点"
+    stem_core = stem_core[:36] if stem_core else "该机制"
     return [
-        f"A. {stem_core}体现了系统机制与约束条件",
-        "B. 该描述与系统机制无关，只影响文档表述",
-        "C. 该机制仅在理想场景成立，工程上不可用",
-        "D. 该机制与资源约束和正确性都无关",
+        f"A. {stem_core}符合课程中的标准定义",
+        f"B. {stem_core}只在用户态生效，与内核机制无关",
+        f"C. {stem_core}可以绕过系统调用直接执行特权操作",
+        f"D. {stem_core}与资源管理和正确性没有关系",
     ]
+
+
+def _normalize_choice_option_content(text: str) -> str:
+    content = str(text or "").strip()
+    if not content:
+        return ""
+    # 清理重复前缀: "A A xxx" / "B. B. xxx"
+    content = re.sub(r'^\s*[A-D][.、．:：)\s]+\s*', '', content, flags=re.IGNORECASE)
+    content = re.sub(r'^\s*[A-D][.、．:：)\s]+\s*', '', content, flags=re.IGNORECASE)
+    content = re.sub(r'\s+', ' ', content).strip()
+    return content
+
+
+def _shorten_stem_for_exam(stem: str, max_len: int = 90) -> str:
+    text = _sanitize_question_text(stem)
+    if len(text) <= max_len:
+        return text
+    # 优先截到第一个完整句
+    parts = re.split(r'[。！？!?]', text)
+    if parts:
+        first = parts[0].strip()
+        if 12 <= len(first) <= max_len:
+            return first + "。"
+    clipped = text[:max_len].rstrip("，,;；:： ")
+    # 避免截断在连接词/残片上，导致“才。”这类不完整句
+    clipped = re.sub(r'(其|并|且|才|及|和|或|与|中|上|下|于|及其|以及)$', '', clipped)
+    clipped = re.sub(r'[A-Za-z]$', '', clipped)
+    clipped = clipped.rstrip("（(").rstrip()
+    return (clipped or text[:max_len]).rstrip("，,;；:： ") + "。"
+
+
+def _stem_max_len_for_question(question: dict, index: int) -> int:
+    qtype = str((question or {}).get("type") or "")
+    diff = str((question or {}).get("difficulty") or "中等")
+    if qtype == "选择题":
+        base = 62 if diff in {"简单", "基础"} else (82 if diff in {"中等"} else 96)
+        # 长短搭配：每 4 题做一个小周期
+        cycle = index % 4
+        if cycle == 0:
+            return min(108, base + 12)
+        if cycle == 1:
+            return max(54, base - 8)
+        return base
+    if qtype in {"填空题", "判断题"}:
+        return 84 if diff in {"简单", "基础"} else 108
+    return 160 if diff in {"中等"} else 190
+
+
+def _content_token_set(text: str) -> set:
+    src = str(text or "")
+    tokens = re.findall(r'[\u4e00-\u9fff]{2,6}|[A-Za-z]{3,}', src)
+    return {t.lower() for t in tokens if t and len(t) >= 2}
+
+
+def _is_near_duplicate_text(a: str, b: str, threshold: float = 0.72) -> bool:
+    ta = _content_token_set(a)
+    tb = _content_token_set(b)
+    if not ta or not tb:
+        return False
+    inter = len(ta & tb)
+    uni = len(ta | tb)
+    if uni == 0:
+        return False
+    return (inter / uni) >= threshold
+
+
+_CONCEPT_ANCHORS = [
+    "系统调用", "微内核", "宏内核", "混合内核", "特权指令", "进程调度", "线程", "进程",
+    "死锁", "信号量", "临界区", "内存管理", "虚拟内存", "页表", "TLB", "缺页", "抖动",
+    "文件系统", "I/O", "设备驱动", "网络协议", "TCP", "资源分配图",
+]
+
+
+def _detect_concept_anchor(text: str) -> str:
+    src = str(text or "")
+    for anchor in _CONCEPT_ANCHORS:
+        if anchor in src:
+            return anchor
+    # 回退：取首个较长中文词
+    m = re.search(r'[\u4e00-\u9fff]{3,8}', src)
+    return m.group(0) if m else "通用概念"
+
+
+def _concept_key_for_question(question: dict) -> str:
+    content = str((question or {}).get("content") or "")
+    kp = str((question or {}).get("knowledge_point") or "").strip()
+    base = kp if kp else content
+    return _detect_concept_anchor(base)
+
+
+def _enforce_concept_uniqueness(
+    questions: List[dict],
+    topics: List[str],
+    score_map: Dict[str, int],
+) -> List[dict]:
+    """
+    综合卷去重：同一考点锚点仅保留 1 题，重复题替换为不同 topic 的同题型题目。
+    """
+    if not questions:
+        return questions
+
+    pool = [t.strip() for t in (topics or []) if str(t).strip()]
+    if not pool:
+        pool = ["进程与线程", "调度与同步", "死锁与资源管理", "内存管理", "文件系统与I/O", "网络与通信机制", "系统调用", "内核架构"]
+
+    used_concepts: Dict[str, int] = {}
+    used_topics: set = set()
+    fixed: List[dict] = []
+
+    for idx, q in enumerate(questions, start=1):
+        qq = dict(q)
+        ckey = _concept_key_for_question(qq)
+        if used_concepts.get(ckey, 0) >= 1:
+            qtype = qq.get("type") or "选择题"
+            candidate_topic = None
+            for p in pool:
+                if p in used_topics:
+                    continue
+                if _detect_concept_anchor(p) != ckey:
+                    candidate_topic = p
+                    break
+            if candidate_topic is None:
+                candidate_topic = f"{pool[idx % len(pool)]}·专题{idx}"
+            if EXAM_ENABLE_LOCAL_EMERGENCY_FALLBACK:
+                replacement = _build_emergency_questions(
+                    qtype,
+                    1,
+                    idx,
+                    candidate_topic,
+                    score_map.get(qtype, 2),
+                )[0]
+                qq = _normalize_exam_question(replacement, idx)
+                if qq.get("type") == "选择题":
+                    qq = _ensure_choice_structure(qq)
+                ckey = _concept_key_for_question(qq)
+
+        used_concepts[ckey] = used_concepts.get(ckey, 0) + 1
+        used_topics.add(str(_detect_concept_anchor(str(qq.get("content") or ""))))
+        fixed.append(qq)
+
+    return fixed
 
 
 def _normalize_choice_answer(answer: str, options: List[str]) -> str:
@@ -2225,11 +2537,11 @@ def _normalize_choice_answer(answer: str, options: List[str]) -> str:
 
 def _ensure_choice_structure(question: dict) -> dict:
     q = dict(question)
-    stem = str(q.get("content") or "").strip()
+    stem = _shorten_stem_for_exam(str(q.get("content") or "").strip(), max_len=90)
     options = _normalize_options(q.get("options")) or []
     parsed_stem, parsed_options = _split_stem_and_options_for_payload(stem)
     if parsed_stem:
-        stem = parsed_stem
+        stem = _shorten_stem_for_exam(parsed_stem, max_len=90)
     if len(options) < 4 and parsed_options:
         options = _normalize_options(parsed_options) or options
     if len(options) < 4:
@@ -2250,7 +2562,7 @@ def _ensure_choice_structure(question: dict) -> dict:
 
     rebuilt_options: List[str] = []
     for idx, opt in enumerate((options or [])[:4]):
-        content = re.sub(r'^[A-D][.、．]\s*', '', str(opt)).strip()
+        content = _normalize_choice_option_content(re.sub(r'^[A-D][.、．]\s*', '', str(opt)).strip())
         if not content:
             content = f"选项{chr(65 + idx)}"
         rebuilt_options.append(f"{chr(65 + idx)}. {content}")
@@ -2306,6 +2618,9 @@ def _repair_exam_questions_locally(
     target = _target_counts(quantity_dist, fallback_questions=questions)
     score_map = _score_map_for_counts(target, target_total_score=target_total_score)
     topics_seed = "；".join([t for t in (topics or []) if t][:3]) or "本课程重点内容"
+    topic_pool = [t.strip() for t in (topics or []) if str(t).strip()]
+    if not topic_pool:
+        topic_pool = ["进程与线程", "调度与同步", "死锁与资源管理", "内存管理", "文件系统与I/O", "网络与通信机制"]
 
     grouped: Dict[str, List[dict]] = {label: [] for label in EXAM_TYPE_ORDER}
     for idx, q in enumerate(questions, start=1):
@@ -2323,26 +2638,37 @@ def _repair_exam_questions_locally(
             grouped[label] = current[:target_count]
         elif len(current) < target_count:
             missing = target_count - len(current)
-            start_no = len(current) + 1
-            grouped[label].extend(_build_emergency_questions(label, missing, start_no, topics_seed, score_map.get(label, 2)))
+            if EXAM_ENABLE_LOCAL_EMERGENCY_FALLBACK:
+                start_no = len(current) + 1
+                grouped[label].extend(_build_emergency_questions(label, missing, start_no, topics_seed, score_map.get(label, 2)))
 
     ordered_questions: List[dict] = []
     for label in EXAM_TYPE_ORDER:
         ordered_questions.extend(grouped.get(label, []))
 
     seen = set()
+    seen_texts: List[str] = []
     deduped: List[dict] = []
     for i, q in enumerate(ordered_questions, start=1):
         qq = _normalize_exam_question(q, i)
+        max_len = _stem_max_len_for_question(qq, i)
+        qq["content"] = _shorten_stem_for_exam(qq.get("content", ""), max_len=max_len)
         if qq.get("type") == "选择题":
             qq = _ensure_choice_structure(qq)
         sig = _question_signature(qq.get("content", ""))
-        if sig and sig in seen:
+        is_dup = bool(sig and sig in seen)
+        if not is_dup:
+            for prev in seen_texts:
+                if _is_near_duplicate_text(prev, qq.get("content", ""), threshold=0.72):
+                    is_dup = True
+                    break
+        if is_dup and EXAM_ENABLE_LOCAL_EMERGENCY_FALLBACK:
+            replacement_topic = topic_pool[(i - 1) % len(topic_pool)]
             replacement = _build_emergency_questions(
                 qq.get("type") or "选择题",
                 1,
                 i,
-                f"{topics_seed}（变式{i}）",
+                replacement_topic,
                 score_map.get(qq.get("type") or "选择题", 2),
             )[0]
             qq = _normalize_exam_question(replacement, i)
@@ -2351,7 +2677,10 @@ def _repair_exam_questions_locally(
             sig = _question_signature(qq.get("content", ""))
         if sig:
             seen.add(sig)
+            seen_texts.append(str(qq.get("content", "")))
         deduped.append(qq)
+
+    deduped = _enforce_concept_uniqueness(deduped, topics, score_map)
 
     for i, q in enumerate(deduped, start=1):
         q["number"] = i
@@ -2363,13 +2692,19 @@ def _repair_exam_questions_locally(
 
 def _exam_quality_floor_flags(questions: List[dict], quantity_dist: dict, target_total_score: int = 100) -> dict:
     target = _target_counts(quantity_dist, fallback_questions=questions)
+    total_questions_target = int(sum(int(target.get(k, 0) or 0) for k in ["choice", "fill", "judge", "essay"]))
+    # 仅对综合卷启用严格“概念不重叠”门槛，小卷不作为硬失败条件
+    enforce_concept_overlap_gate = total_questions_target >= 20
+    concept_repeat_limit = 1 if enforce_concept_overlap_gate else 999999
     counts = {"choice": 0, "fill": 0, "judge": 0, "essay": 0}
     numbers: List[int] = []
     total_score = 0
     seen = set()
     has_duplicates = False
+    concept_overlap = False
     options_ok = True
     answer_analysis_ok = True
+    concept_seen: Dict[str, int] = {}
 
     for q in questions:
         qtype = q.get("type") or "选择题"
@@ -2391,19 +2726,28 @@ def _exam_quality_floor_flags(questions: List[dict], quantity_dist: dict, target
             has_duplicates = True
         if sig:
             seen.add(sig)
+        ckey = _concept_key_for_question(q)
+        concept_seen[ckey] = concept_seen.get(ckey, 0) + 1
+        if concept_seen[ckey] > concept_repeat_limit:
+            concept_overlap = True
 
     quantity_ok = all(int(counts[k]) == int(target.get(k, 0)) for k in counts)
     numbering_ok = bool(numbers) and numbers == list(range(1, len(questions) + 1))
     total_score_ok = total_score == int(target_total_score)
-    quality_floor_passed = quantity_ok and numbering_ok and (not has_duplicates) and total_score_ok and options_ok and answer_analysis_ok
+    concept_ok = (not concept_overlap) if enforce_concept_overlap_gate else True
+    quality_floor_passed = quantity_ok and numbering_ok and (not has_duplicates) and concept_ok and total_score_ok and options_ok and answer_analysis_ok
     return {
         "quantity_ok": quantity_ok,
         "numbering_ok": numbering_ok,
         "duplicates": has_duplicates,
+        "concept_overlap": concept_overlap,
+        "concept_overlap_gate_enabled": enforce_concept_overlap_gate,
         "total_score_ok": total_score_ok,
         "options_ok": options_ok,
         "answer_analysis_ok": answer_analysis_ok,
         "duplicates_ok": not has_duplicates,
+        "concept_overlap_ok": (not concept_overlap) if enforce_concept_overlap_gate else True,
+        "concept_repeat_limit": concept_repeat_limit,
         "quality_floor_passed": quality_floor_passed,
         "counts": counts,
         "total_score": total_score,
@@ -2556,6 +2900,12 @@ GENERATE_STRUCTURED_QUIZ_PROMPT = """你是一位资深大学期末考试命题�
 4. 每道题都必须包含答案和解析。
 5. score 使用“5分”这类字符串，difficulty 使用“简单/中等/较难”。
 6. 题干必须是标准考试表述，禁止出现“根据课件/依据资料/围绕课程核心知识点”等元话术。
+7. 来源依据判断只允许写在 reasoning 字段，question/options/answer/explanation 禁止出现来源措辞。
+8. 选择题题干控制在 80 字以内，不要输出超长背景段落。
+9. 选项必须独立成行，且不得出现 "A A"、"B B" 等重复前缀。
+10. 禁止输出以下泛化选项句式：`会直接影响系统行为与资源约束`、`只影响文字表述`、`仅在理想场景成立`、`与性能和正确性无关`。
+11. 同一概念最多出现 2 次；若出现重复，必须改写为不同章节知识点。
+12. 题干长度要有梯度感：短题约40-60字，中题约60-90字，少量长题可到120字，避免整卷长度雷同。
 
 返回格式：
 {{
@@ -2592,10 +2942,13 @@ GENERATE_WITH_REASONING_PROMPT = """【警告-绝对禁止】绝对禁止使用'
 - 先根据检索结果判断考点范围与重点。
 - 课件为主，模型知识与外部知识为辅；外部信息不得覆盖课件结论。
 
-请生成题目，并为每道题提供推理链（说明为什么这样出题、答案依据在课件哪里）。
+请生成题目，并提供推理链（仅写在 reasoning 字段，说明为什么这样出题与依据判断）。
 
 禁止输出 <think> 标签、思考过程、分析说明。
-禁止在题干中出现“根据课件/依据资料/围绕核心知识点”等元话术。
+禁止在题干、选项、答案、解析中出现“根据课件/依据资料/参考资料/围绕核心知识点”等元话术。
+禁止输出以下泛化选项模板：`会直接影响系统行为与资源约束`、`只影响文字表述`、`仅在理想场景成立`、`与性能和正确性无关`。
+同一概念最多出 2 题，必须跨知识点覆盖。
+题干长短需有变化：短题/中题/少量长题搭配，避免所有题目都同样冗长。
 
 【重要】只返回纯 JSON 对象，不要用 ```json 代码块包裹！直接输出：
 {{"quiz": "...", "reasoning": {{"knowledge_points": [...], "answer_evidence": [...], "distractor_design": [...]}}}}"""
@@ -2657,7 +3010,7 @@ REVISE_WITH_REFLECTION_PROMPT = """你是一位考试命题专家，你刚刚收
 【评审批评】（必须逐条回应）:
 {critique}
 
-请根据批评修订题目，并详细说明你的修改依据。
+请根据批评修订题目，并详细说明你的修改依据（仅写在 revision_notes，不得写进题干与解析）。
 
 禁止输出 <think> 标签、思考过程、分析说明。
 
@@ -2682,6 +3035,12 @@ GENERATE_TEXT_FALLBACK_PROMPT = """你是一位大学期末考试命题专家。
 3. 选择题必须提供 A、B、C、D 四个选项。
 4. 如果 topic 为空，请从课程各模块中综合选题，保证覆盖面。
 5. 题干禁止出现“根据课件/围绕课程核心知识点/依据资料”等元话术。
+6. 解析也禁止出现“根据课件/依据资料/参考资料”等来源措辞。
+7. 选择题题干不超过 80 字；选项一行一个，禁止 `A A` 这类重复前缀。
+8. 禁止使用泛化模板选项：`会直接影响系统行为与资源约束`、`只影响文字表述`、`仅在理想场景成立`、`与性能和正确性无关`。
+9. 必须避免同一概念连续出题，优先覆盖不同章节。
+10. 题干需长短搭配，不要整批题目同样长度。
+11. 用户可见字段（题干/选项/答案/解析）禁止“中文术语（英文解释）”样式；CPU/TLB/TCP 等纯缩写可保留。
 
 输出示例：
 1.（选择题，分值：5分，难度：中等）
@@ -2694,6 +3053,13 @@ D. 选项4
 解析：...
 """
 
+EXAM_PROMPT_CONTRACT = """【统一主契约】
+1. 题干、选项、答案、解析必须是考试语气，禁止出现“根据课件/依据资料/围绕核心知识点”等来源话术。
+2. 选择题必须输出 A-D 四个选项且每个选项独立成行，不得出现 A A / B B 等重复前缀。
+3. 题干长度要有梯度（短中长搭配），避免整卷长度雷同。
+4. 综合卷允许同章节变体，但同一核心概念重复数量必须受控。
+5. 用户可见字段（题干/选项/答案/解析）禁止“中文术语（英文解释）”样式；CPU/TLB/TCP 等纯缩写可保留。"""
+
 
 # ---------- 试卷版本 ----------
 EXAM_GENERATE_WITH_REASONING_PROMPT = """你是一位大学课程命题专家。请按给定题型分布生成完整试卷。
@@ -2704,6 +3070,7 @@ EXAM_GENERATE_WITH_REASONING_PROMPT = """你是一位大学课程命题专家。
 【样卷格式参考】{sample_paper_context}
 【课程参考资料】
 {contexts}
+{exam_contract}
 
 【硬性约束】
 1. 总题数必须为 {total_questions}。
@@ -2713,6 +3080,11 @@ EXAM_GENERATE_WITH_REASONING_PROMPT = """你是一位大学课程命题专家。
 5. 每题必须有答案与解析。
 6. 题干禁止出现“根据课件/依据资料/围绕课程核心知识点”等元话术。
 7. 禁止使用“...”等占位符，不得省略题目。
+8. 解析也禁止出现“根据课件/依据资料/参考资料”等来源措辞；来源判断只能写在 reasoning 字段。
+9. 选择题题干不超过 80 字，选项必须按 A/B/C/D 独立成行。
+10. 禁止输出泛化模板选项：`会直接影响系统行为与资源约束`、`只影响文字表述`、`仅在理想场景成立`、`与性能和正确性无关`。
+11. 覆盖要求：综合卷（23题）必须做到题题考点不重叠，同一核心概念只能出现 1 次。
+12. 体感要求：题干详略得当、又长有短，避免整卷题干长度单一。
 
 【分值与编号约束】
 - 选择题：{choice_count} 题，每题 2 分，编号 1-{choice_end}
@@ -2730,6 +3102,7 @@ EXAM_CRITIQUE_PROMPT = """你是试卷评审专家。请严格检查结构完整
 【参考资料】{contexts}
 【待评审试卷】{exam_paper}
 【出题推理链】{reasoning}
+{exam_contract}
 
 【目标分布】
 - 总题数：{total_questions}
@@ -2745,6 +3118,9 @@ EXAM_CRITIQUE_PROMPT = """你是试卷评审专家。请严格检查结构完整
 4. 选择题是否都有完整 A-D 选项。
 5. 是否存在重复题或高度相似题。
 6. 题干是否含元话术（如“根据课件/依据资料”）。
+7. 是否出现泛化模板选项（如“会直接影响系统行为与资源约束”等）。
+8. 是否存在知识点覆盖失衡（综合卷要求同一概念不得重复）。
+9. 题干是否长度单一（应有短中长搭配）。
 
 只返回纯 JSON：
 {{"approved": false, "overall_score": 75, "critique": "...", "reasoning_flaws": [{{"question": "...", "flaw": "...", "severity": "high"}}], "specific_issues": [{{"question": "...", "issue": "...", "suggestion": "..."}}], "duplicate_check": {{"has_duplicates": false, "duplicate_questions": []}}, "numbering_check": {{"is_continuous": true, "issues": []}}, "quantity_check": {{"choice": {choice_count}, "fill": {fill_count}, "judge": {judge_count}, "essay": {essay_count}, "actual_choice": 0, "actual_fill": 0, "actual_judge": 0, "actual_essay": 0, "is_valid": false}}}}"""
@@ -2764,12 +3140,14 @@ EXAM_REVISE_WITH_REFLECTION_PROMPT = """你是考试命题专家，收到评审�
 
 【评审批评】（必须逐条回应，包括所有问题）：
 {critique}
+{exam_contract}
 
 【关键提醒】
 1. 如果评审批评指出存在重复题目，必须删除或替换重复的题目
 2. 确保修订后总分仍然是100分
 3. 确保修订后题目数量仍然是{total_questions}道
 4. 返回完整的修订后试卷，不要只返回修改的部分
+5. 来源依据说明仅允许写在 revision_notes；禁止写入试卷题干、选项、答案、解析。
 
 【重要】只返回纯 JSON 对象，不要用 ```json 代码块包裹！直接输出：
 {{"revised_exam": "...", "revision_notes": "...", "addressed_issues": [...]}}"""
@@ -3093,9 +3471,7 @@ async def generate_exam_with_reasoning_node(state: ExamPaperState) -> ExamPaperS
             try:
                 budget_left = _exam_budget_left_seconds(state)
                 if budget_left <= 8:
-                    logger.warning(f"[Agent1-出卷] {quiz_type} 剩余预算不足({budget_left:.1f}s)，直接使用本地兜底题")
-                    questions = _build_emergency_questions(quiz_type, num, start_num, topics_str, score)
-                    return {"questions": questions, "type": quiz_type, "count": num}
+                    raise RuntimeError(f"{quiz_type} 剩余预算不足({budget_left:.1f}s)，停止生成（已禁用本地兜底）")
                 per_type_budget = max(120.0, min(480.0, budget_left * 0.9))
                 questions = await asyncio.wait_for(
                     _ensure_single_type_questions(
@@ -3112,8 +3488,7 @@ async def generate_exam_with_reasoning_node(state: ExamPaperState) -> ExamPaperS
                     timeout=max(120.0, min(520.0, budget_left - 12.0)),  # 生成阶段宽松上限，优先完整题量
                 )
             except asyncio.TimeoutError:
-                logger.error(f"[Agent1-出卷] {quiz_type} 超过题型总超时，使用本地兜底题")
-                questions = _build_emergency_questions(quiz_type, num, start_num, topics_str, score)
+                raise RuntimeError(f"{quiz_type} 超过题型总超时（已禁用本地兜底）")
         return {"questions": questions, "type": quiz_type, "count": num}
 
     # 启动所有题型任务，题型间最多并发 2 个
@@ -3198,6 +3573,40 @@ async def critique_exam_node(state: ExamPaperState) -> ExamPaperState:
     contexts_combined = "\n\n".join(state['contexts'])[:2000]
     logger.info("[Agent2-Critic-试卷] 质疑出卷推理链...")
     budget_left = _exam_budget_left_seconds(state)
+    critic_timeout_count = int(state.get("critic_timeout_count") or 0)
+    stage_fast_mode = bool(state.get("stage_fast_mode"))
+
+    if stage_fast_mode:
+        # 阶段模式下，Critic 只做本地快速评审，避免 LLM 评审拖慢整链路。
+        fast_critique = _build_fast_exam_critique(state, exam_paper)
+        if fast_critique is not None:
+            critique = fast_critique
+        else:
+            parsed_questions = parse_exam_content(exam_paper).get("questions", [])
+            fixed_questions = _repair_exam_questions_locally(
+                parsed_questions if isinstance(parsed_questions, list) else [],
+                state.get("quantity_dist", {}),
+                state.get("topics", []),
+                target_total_score=target_total_score,
+            )
+            flags = _exam_quality_floor_flags(fixed_questions, state.get("quantity_dist", {}), target_total_score=target_total_score)
+            critique = {
+                "approved": bool(flags.get("quantity_ok") and flags.get("numbering_ok") and flags.get("duplicates_ok")),
+                "overall_score": 80 if flags.get("quality_floor_passed") else 68,
+                "critique": "阶段快速评审：基于本地结构规则完成。",
+                "reasoning_flaws": [],
+                "specific_issues": [],
+                "duplicate_check": {"has_duplicates": bool(flags.get("duplicates")), "duplicate_questions": []},
+                "numbering_check": {"is_continuous": bool(flags.get("numbering_ok")), "issues": []},
+                "quantity_check": {"is_valid": bool(flags.get("quantity_ok"))},
+            }
+
+        score = critique.get('overall_score', 80)
+        logger.info(f"[Agent2-Critic-试卷] 阶段快速评审，approved={critique.get('approved')}, score={score}")
+        update: dict = {"critique": critique, "critic_timeout_count": critic_timeout_count}
+        if state.get('reflection_rounds', 0) == 0 and not state.get('initial_score'):
+            update["initial_score"] = score
+        return update
 
     fast_critique = _build_fast_exam_critique(state, exam_paper)
     if fast_critique is not None:
@@ -3233,12 +3642,15 @@ async def critique_exam_node(state: ExamPaperState) -> ExamPaperState:
                 exam_paper=exam_paper,
                 reasoning=state.get('reasoning', '{}'),
                 total_questions=state.get('total_questions', 10),
+                exam_contract=EXAM_PROMPT_CONTRACT,
                 **layout_params,
             )
             critique = result.model_dump()
             logger.info(f"[Agent2-Critic-试卷] 结构化输出成功，approved={result.approved}")
         except Exception as e:
             logger.warning(f"[Agent2-Critic-试卷] 结构化输出失败，回退到正则解析: {e}")
+            if "timeout" in str(e).lower():
+                critic_timeout_count += 1
             # 回退机制
             try:
                 result_text = await call_llm(
@@ -3248,10 +3660,12 @@ async def critique_exam_node(state: ExamPaperState) -> ExamPaperState:
                     exam_paper=exam_paper,
                     reasoning=state.get('reasoning', '{}'),
                     total_questions=state.get('total_questions', 10),
+                    exam_contract=EXAM_PROMPT_CONTRACT,
                     **layout_params,
                 )
                 critique = _extract_json(result_text)
             except Exception:
+                critic_timeout_count += 1
                 critique = {"approved": True, "overall_score": 80, "reasoning_flaws": [], "specific_issues": []}
 
     # 【精确数量校验】- 直接解析文本统计题目数量，不依赖 LLM 的正则匹配
@@ -3329,7 +3743,7 @@ async def critique_exam_node(state: ExamPaperState) -> ExamPaperState:
     score = critique.get('overall_score', 80)
     logger.info(f"[Agent2-Critic-试卷] approved={critique.get('approved')}, score={score}, quantity_valid={is_valid}")
 
-    update: dict = {"critique": critique}
+    update: dict = {"critique": critique, "critic_timeout_count": critic_timeout_count}
     if state.get('reflection_rounds', 0) == 0 and not state.get('initial_score'):
         update["initial_score"] = score
     return update
@@ -3428,6 +3842,7 @@ async def revise_exam_with_reflection_node(state: ExamPaperState) -> ExamPaperSt
                 reasoning=state.get('reasoning', '{}'),
                 critique=json.dumps(critique, ensure_ascii=False),
                 total_questions=state.get('total_questions', 10),
+                exam_contract=EXAM_PROMPT_CONTRACT,
             ),
             timeout=llm_budget,
         )
@@ -3450,6 +3865,7 @@ async def revise_exam_with_reflection_node(state: ExamPaperState) -> ExamPaperSt
                     reasoning=state.get('reasoning', '{}'),
                     critique=json.dumps(critique, ensure_ascii=False),
                     total_questions=state.get('total_questions', 10),
+                    exam_contract=EXAM_PROMPT_CONTRACT,
                 ),
                 timeout=max(15.0, min(45.0, llm_budget / 2)),
             )
@@ -3778,8 +4194,10 @@ async def run_quiz_agent(
                 "score": q.get("score") if isinstance(q.get("score"), str) else f"{int(q.get('score') or 5)}分",
                 "difficulty": q.get("difficulty", "中等"),
             })
+        questions = _sanitize_quiz_questions_for_delivery(questions)
         payload = _build_quiz_payload(topic, questions)
         floor_flags = _quiz_quality_floor_flags(questions, quiz_type, num)
+        term_style_ok = all(_question_term_style_ok(q) for q in questions)
         return {
             "kind": "quiz_set",
             "render_mode": "interactive_cards",
@@ -3793,6 +4211,7 @@ async def run_quiz_agent(
                 "tool_calls": {"rag": 1, "web": 1 if web_context else 0},
                 "quiz_end_to_end_ms": int((time.monotonic() - quiz_started_at) * 1000),
                 "tool_gate_reason": gate_reason,
+                "term_style_ok": term_style_ok,
             },
         }
 
@@ -3855,9 +4274,17 @@ async def run_quiz_agent(
                 },
             }
 
+    parsed_questions = _sanitize_quiz_questions_for_delivery(parsed_questions)
+    final_payload = _build_quiz_payload(topic, parsed_questions)
+    final_text = _build_quiz_text_from_questions(parsed_questions)
+
     floor_flags = _quiz_quality_floor_flags(parsed_questions, quiz_type, num)
+    term_style_ok = all(_question_term_style_ok(q) for q in parsed_questions)
     delivery_mode = result.get("delivery_mode") or ("full" if floor_flags.get("quality_floor_passed") else "partial_revised")
     degrade_reason = result.get("degrade_reason") or ("" if floor_flags.get("quality_floor_passed") else "budget_exhausted")
+    if not term_style_ok:
+        delivery_mode = "partial_revised"
+        degrade_reason = degrade_reason or "term_style_violation"
     if (not ALLOW_DEGRADED_DELIVERY) and (delivery_mode != "full" or degrade_reason):
         raise RuntimeError(f"本次出题未达严格质量要求（delivery_mode={delivery_mode}, reason={degrade_reason or 'quality_floor_not_passed'}），已禁止降级交付，请重试。")
     end_to_end_ms = int((time.monotonic() - quiz_started_at) * 1000)
@@ -3874,6 +4301,7 @@ async def run_quiz_agent(
             "tool_calls": {"rag": 1, "web": 1 if web_context else 0},
             "quiz_end_to_end_ms": end_to_end_ms,
             "tool_gate_reason": gate_reason,
+            "term_style_ok": term_style_ok,
         },
     }
 
@@ -3947,33 +4375,53 @@ def _build_exam_layout_params(quantity_dist: dict) -> dict:
     }
 
 
-def _build_default_stage_plan() -> List[dict]:
-    return [
-        {
-            "id": "choice",
-            "label": "选择题阶段",
-            "quantity_dist": {"choice": 10, "fill": 0, "judge": 0, "essay": 0},
-            "quiz_types": ["选择题"],
-            "timeout_seconds": 360,
-            "target_score": 20,
-        },
-        {
-            "id": "fill_judge",
-            "label": "填空判断阶段",
-            "quantity_dist": {"choice": 0, "fill": 5, "judge": 5, "essay": 0},
-            "quiz_types": ["填空题", "判断题"],
-            "timeout_seconds": 315,
-            "target_score": 20,
-        },
-        {
-            "id": "essay",
-            "label": "简答题阶段",
-            "quantity_dist": {"choice": 0, "fill": 0, "judge": 0, "essay": 3},
-            "quiz_types": ["简答题"],
-            "timeout_seconds": 225,
-            "target_score": 60,
-        },
-    ]
+def _build_default_stage_plan(quantity_dist: Optional[dict] = None) -> List[dict]:
+    dist = quantity_dist or {"choice": 10, "fill": 5, "judge": 5, "essay": 3}
+    choice = max(0, int(dist.get("choice", 0) or 0))
+    fill = max(0, int(dist.get("fill", 0) or 0))
+    judge = max(0, int(dist.get("judge", 0) or 0))
+    essay = max(0, int(dist.get("essay", 0) or 0))
+
+    # 小题量阶段缩短超时，避免 1/1/1/1 仍按大卷超时预算运行
+    choice_timeout = max(45, min(240, 24 * max(1, choice)))
+    fill_judge_timeout = max(45, min(210, 22 * max(1, fill + judge)))
+    essay_timeout = max(45, min(150, 35 * max(1, essay)))
+
+    stages: List[dict] = []
+    if choice > 0:
+        stages.append(
+            {
+                "id": "choice",
+                "label": "选择题阶段",
+                "quantity_dist": {"choice": choice, "fill": 0, "judge": 0, "essay": 0},
+                "quiz_types": ["选择题"],
+                "timeout_seconds": choice_timeout,
+                "target_score": choice * 2,
+            }
+        )
+    if fill > 0 or judge > 0:
+        stages.append(
+            {
+                "id": "fill_judge",
+                "label": "填空判断阶段",
+                "quantity_dist": {"choice": 0, "fill": fill, "judge": judge, "essay": 0},
+                "quiz_types": [t for t, c in [("填空题", fill), ("判断题", judge)] if c > 0],
+                "timeout_seconds": fill_judge_timeout,
+                "target_score": (fill + judge) * 2,
+            }
+        )
+    if essay > 0:
+        stages.append(
+            {
+                "id": "essay",
+                "label": "简答题阶段",
+                "quantity_dist": {"choice": 0, "fill": 0, "judge": 0, "essay": essay},
+                "quiz_types": ["简答题"],
+                "timeout_seconds": essay_timeout,
+                "target_score": essay * 20,
+            }
+        )
+    return stages
 
 
 def _strict_stage_quality_ok(questions: List[dict], expected_dist: dict) -> tuple[bool, str]:
@@ -3992,6 +4440,8 @@ def _strict_stage_quality_ok(questions: List[dict], expected_dist: dict) -> tupl
         return False, "存在重复题"
     if not flags.get("options_ok"):
         return False, "选择题选项不完整"
+    if _collect_term_style_violation_numbers(questions):
+        return False, "题面术语风格不符合要求"
     # 严格模式附加：禁止明显兜底模板痕迹
     texts = []
     for q in questions:
@@ -4067,11 +4517,14 @@ async def _run_exam_stage_with_retry(
             "exam_budget_started_at": time.monotonic(),
             "exam_budget_seconds": int(stage_timeout),
             "target_total_score": int(stage.get("target_score", 100)),
+            "critic_timeout_count": 0,
+            "stage_fast_mode": True,
             "reflection_rounds": 0,
         }
 
         try:
             result = await asyncio.wait_for(exam_workflow.ainvoke(stage_state), timeout=stage_timeout)
+            stage_trace["critic_timeout_count"] = int(result.get("critic_timeout_count") or 0)
             payload = result.get("revised_exam_payload") or result.get("exam_payload") or {}
             questions = (payload.get("exam_data") or {}).get("questions", []) if isinstance(payload, dict) else []
             questions = [ _normalize_exam_question(q, i + 1) for i, q in enumerate(questions or []) ]
@@ -4085,8 +4538,15 @@ async def _run_exam_stage_with_retry(
             stage_trace["stage_exit_reason"] = "quality_passed"
             return questions, stage_trace
         except Exception as e:
-            stage_trace["error"] = str(e)
-            stage_trace["stage_exit_reason"] = _classify_structured_error(e)
+            err_text = str(e or "").strip()
+            if not err_text:
+                err_text = type(e).__name__ if type(e).__name__ else "unknown_error"
+            stage_trace["error"] = err_text
+            stage_exit = _classify_structured_error(e)
+            stage_trace["stage_exit_reason"] = stage_exit if stage_exit != "other" else "stage_runtime_error"
+            miss_match = re.search(r'仍缺\s*(\d+)\s*道', err_text)
+            if miss_match:
+                stage_trace["missing_after_retries"] = int(miss_match.group(1))
             logger.warning(f"[ExamStage] stage={stage_id} attempt={attempt}/{retries} 失败: {e}")
             if attempt >= retries:
                 break
@@ -4094,6 +4554,45 @@ async def _run_exam_stage_with_retry(
     if not stage_trace.get("stage_exit_reason"):
         stage_trace["stage_exit_reason"] = "max_retries_exhausted"
     return [], stage_trace
+
+
+def _build_exam_failed_result(
+    message: str,
+    *,
+    exam_started_at: float,
+    stage_trace: Optional[List[dict]] = None,
+    evidence_source: str = "courseware_only",
+    tool_call_rag: int = 1,
+    tool_call_web: int = 0,
+    stage_exit_reason: str = "failed",
+    missing_after_retries: int = 0,
+    quality_checks: Optional[dict] = None,
+    term_style_ok: Optional[bool] = None,
+    critic_timeout_count: int = 0,
+) -> dict:
+    meta = {
+        "delivery_mode": "failed",
+        "quality_floor_passed": False,
+        "degrade_reason": stage_exit_reason,
+        "stage_exit_reason": stage_exit_reason,
+        "missing_after_retries": int(max(0, missing_after_retries)),
+        "quality_checks": quality_checks or {},
+        "critic_timeout_count": int(max(0, critic_timeout_count)),
+        "exam_end_to_end_ms": int((time.monotonic() - exam_started_at) * 1000),
+        "evidence_source": evidence_source,
+        "tool_calls": {"rag": tool_call_rag, "web": tool_call_web},
+    }
+    if stage_trace is not None:
+        meta["stage_trace"] = stage_trace
+    if term_style_ok is not None:
+        meta["term_style_ok"] = bool(term_style_ok)
+    return {
+        "kind": "chat",
+        "render_mode": "markdown",
+        "text": message,
+        "payload": {"exam_data": {"questions": []}},
+        "meta": meta,
+    }
 
 
 async def run_exam_agent(
@@ -4132,7 +4631,6 @@ async def run_exam_agent(
 
     # 如果没有样卷，联网搜索试卷格式参考
     online_format_context = ""
-    online_knowledge_context = ""
     if not sample_paper_context or sample_paper_context.strip() == "":
         logger.info("[Exam Agent] 无样卷，联网搜索试卷格式和考点参考...")
         search_result = ""
@@ -4203,8 +4701,6 @@ async def run_exam_agent(
         logger.warning(
             f"[Exam Relevance] 综合默认出卷模式下忽略相关性硬拦截，继续生成。reason={exam_rel_reason}"
         )
-    if online_knowledge_context:
-        merged_context = merged_context + online_knowledge_context
     merged_context = _limit_context_size(merged_context, max_chars=12000)
     logger.info(
         f"[Exam Agent] 聚合检索完成: topics={len(topics)} -> single_context_len={len(merged_context)}"
@@ -4236,16 +4732,29 @@ async def run_exam_agent(
         "exam_budget_started_at": exam_started_at,
         "exam_budget_seconds": EXAM_BUDGET_SECONDS,
         "target_total_score": 100,
+        "critic_timeout_count": 0,
+        "stage_fast_mode": False,
         "reflection_rounds": 0,
     }
 
     if stage_plan:
-        stage_defs = _build_default_stage_plan()
+        stage_defs = _build_default_stage_plan(quantity_dist)
+        if not stage_defs:
+            return _build_exam_failed_result(
+                "试卷生成失败：题型分布为空，无法分段出卷。",
+                exam_started_at=exam_started_at,
+                evidence_source=evidence_source,
+                tool_call_rag=tool_call_rag,
+                tool_call_web=tool_call_web,
+                stage_exit_reason="empty_stage_plan",
+                missing_after_retries=max(0, total_questions),
+            )
         stage_map = {s["id"]: s for s in stage_defs}
         stage_order = [s["id"] for s in stage_defs]
         deadline_ts = exam_started_at + EXAM_BUDGET_SECONDS
         stage_trace: List[dict] = []
         stage_questions: Dict[str, List[dict]] = {sid: [] for sid in stage_order}
+        stage_critic_timeout_count = 0
 
         def _stage_for_question(q: dict) -> str:
             qtype = str((q or {}).get("type") or "")
@@ -4274,7 +4783,7 @@ async def run_exam_agent(
                         "stage_status": "success",
                         "error": "",
                         "stage_latency_ms": 0,
-                        "strict_mode": False,
+                        "strict_mode": True,
                         "reused": True,
                     })
                     continue
@@ -4282,13 +4791,20 @@ async def run_exam_agent(
                 stage_trace.append({
                     "exam_stage": sid,
                     "attempt": 0,
-                    "stage_status": "degraded",
+                    "stage_status": "failed",
                     "error": fail_text,
                     "stage_latency_ms": 0,
-                    "strict_mode": False,
+                    "strict_mode": True,
                 })
-                # 非严格模式：回退为该阶段重生成，而不是整卷失败
-                rerun_stage = None
+                return _build_exam_failed_result(
+                    fail_text,
+                    exam_started_at=exam_started_at,
+                    stage_trace=stage_trace,
+                    evidence_source=evidence_source,
+                    tool_call_rag=tool_call_rag,
+                    tool_call_web=tool_call_web,
+                    stage_exit_reason="missing_stage_context",
+                )
 
             if stage_questions.get(sid):
                 stage_trace.append({
@@ -4297,7 +4813,7 @@ async def run_exam_agent(
                     "stage_status": "success",
                     "error": "",
                     "stage_latency_ms": 0,
-                    "strict_mode": False,
+                    "strict_mode": True,
                     "reused": True,
                 })
                 continue
@@ -4311,15 +4827,26 @@ async def run_exam_agent(
                 deadline_ts=deadline_ts,
             )
             trace["stage_latency_ms"] = int((time.monotonic() - stage_started) * 1000)
-            trace["strict_mode"] = False
+            trace["strict_mode"] = True
+            stage_critic_timeout_count += int(trace.get("critic_timeout_count") or 0)
             stage_trace.append(trace)
 
             if trace.get("stage_status") != "success":
                 logger.warning(
-                    f"[ExamStage] 非严格模式：阶段 {sid} 失败，继续合并其它阶段结果。"
+                    f"[ExamStage] 严格模式：阶段 {sid} 失败，整卷终止。"
                 )
-                stage_questions[sid] = []
-                continue
+                missing_after_retries = int(trace.get("missing_after_retries") or sum(stage_map[sid]["quantity_dist"].values()))
+                return _build_exam_failed_result(
+                    f"试卷生成失败：阶段 {sid} 执行失败（{trace.get('error') or 'unknown'}）。",
+                    exam_started_at=exam_started_at,
+                    stage_trace=stage_trace,
+                    evidence_source=evidence_source,
+                    tool_call_rag=tool_call_rag,
+                    tool_call_web=tool_call_web,
+                    stage_exit_reason=trace.get("stage_exit_reason") or "stage_failed",
+                    missing_after_retries=missing_after_retries,
+                    critic_timeout_count=stage_critic_timeout_count,
+                )
 
             stage_questions[sid] = questions
 
@@ -4330,35 +4857,59 @@ async def run_exam_agent(
         before_repair_questions = [dict(q) for q in merged_questions]
         merged_questions = _repair_exam_questions_locally(merged_questions, quantity_dist, topics, target_total_score=100)
         fixed_items = _compute_fixed_items(before_repair_questions, merged_questions, quantity_dist or {}, target_total_score=100)
+        term_bad_numbers = _collect_term_style_violation_numbers(merged_questions)
+        term_style_ok = len(term_bad_numbers) == 0
+        if not term_style_ok:
+            fixed_items = list(dict.fromkeys((fixed_items or []) + ["term_style_sanitized"]))
         floor_flags = _exam_quality_floor_flags(merged_questions, quantity_dist or {}, target_total_score=100)
-        delivery_mode = "full" if floor_flags.get("quality_floor_passed") else "partial_revised"
-        degrade_reason = "" if floor_flags.get("quality_floor_passed") else "quality_floor_not_passed"
+        quality_checks = {
+            "quantity_ok": bool(floor_flags.get("quantity_ok")),
+            "numbering_ok": bool(floor_flags.get("numbering_ok")),
+            "total_score_ok": bool(floor_flags.get("total_score_ok")),
+            "options_ok": bool(floor_flags.get("options_ok")),
+            "duplicates_ok": bool(floor_flags.get("duplicates_ok")),
+            "concept_overlap_ok": bool(floor_flags.get("concept_overlap_ok", True)),
+            "term_style_ok": term_style_ok,
+        }
+        quality_ok = bool(floor_flags.get("quality_floor_passed")) and term_style_ok
 
         final_payload = _build_exam_payload_from_questions(merged_questions, title="期末考试试卷")
         end_to_end_ms = int((time.monotonic() - exam_started_at) * 1000)
         logger.info(f"[Latency] exam_end_to_end_ms={end_to_end_ms}")
+        if not quality_ok:
+            return _build_exam_failed_result(
+                "试卷生成失败：质量门校验未通过，请重试。",
+                exam_started_at=exam_started_at,
+                stage_trace=stage_trace,
+                evidence_source=evidence_source,
+                tool_call_rag=tool_call_rag,
+                tool_call_web=tool_call_web,
+                stage_exit_reason="quality_floor_not_passed",
+                missing_after_retries=max(0, total_questions - len(merged_questions)),
+                quality_checks=quality_checks,
+                term_style_ok=term_style_ok,
+                critic_timeout_count=stage_critic_timeout_count,
+            )
         return {
             "kind": "exam_paper",
             "render_mode": "exam_canvas",
             "text": _build_exam_text_from_payload(final_payload),
             "payload": final_payload,
             "meta": {
-                "delivery_mode": delivery_mode,
-                "quality_floor_passed": bool(floor_flags.get("quality_floor_passed")),
-                "degrade_reason": degrade_reason,
+                "delivery_mode": "full",
+                "quality_floor_passed": True,
+                "degrade_reason": "",
                 "auto_fixed": bool(fixed_items),
                 "fixed_items": fixed_items,
-                "quality_checks": {
-                    "quantity_ok": bool(floor_flags.get("quantity_ok")),
-                    "numbering_ok": bool(floor_flags.get("numbering_ok")),
-                    "total_score_ok": bool(floor_flags.get("total_score_ok")),
-                    "options_ok": bool(floor_flags.get("options_ok")),
-                    "duplicates_ok": bool(floor_flags.get("duplicates_ok")),
-                },
-                "strict_mode": False,
+                "quality_checks": quality_checks,
+                "strict_mode": True,
                 "exam_stage": "all",
                 "attempt": max([int(t.get("attempt") or 0) for t in stage_trace] or [1]),
-                "stage_status": "success" if floor_flags.get("quality_floor_passed") else "degraded",
+                "stage_status": "success",
+                "stage_exit_reason": "quality_passed",
+                "missing_after_retries": 0,
+                "term_style_ok": term_style_ok,
+                "critic_timeout_count": stage_critic_timeout_count,
                 "exam_end_to_end_ms": end_to_end_ms,
                 "evidence_source": evidence_source,
                 "tool_calls": {"rag": tool_call_rag, "web": tool_call_web},
@@ -4373,52 +4924,18 @@ async def run_exam_agent(
         )
     except asyncio.TimeoutError:
         logger.error(f"[Exam Agent] exam_workflow 超时（>{max(60, EXAM_BUDGET_SECONDS - 5)}s）")
-        if not ALLOW_DEGRADED_DELIVERY:
-            raise TimeoutError("出卷超时，且已禁用降级交付。请缩小题量后重试。")
-        timeout_base_questions = parse_exam_content(initial_state.get("exam_paper", "")).get("questions", [])
-        fallback_questions = _repair_exam_questions_locally(
-            timeout_base_questions,
-            initial_state.get("quantity_dist", {}),
-            initial_state.get("topics", []),
-            target_total_score=100,
+        return _build_exam_failed_result(
+            "试卷生成失败：整体预算已耗尽，请重试。",
+            exam_started_at=exam_started_at,
+            evidence_source=evidence_source,
+            tool_call_rag=tool_call_rag,
+            tool_call_web=tool_call_web,
+            stage_exit_reason="budget_exhausted",
+            missing_after_retries=max(0, total_questions),
         )
-        timeout_fixed_items = _compute_fixed_items(
-            timeout_base_questions if isinstance(timeout_base_questions, list) else [],
-            fallback_questions,
-            initial_state.get("quantity_dist", {}) or {},
-            target_total_score=100,
-        )
-        fallback_payload = _build_exam_payload_from_questions(fallback_questions, title="期末考试试卷")
-        timeout_flags = _exam_quality_floor_flags(
-            fallback_questions,
-            initial_state.get("quantity_dist", {}),
-            target_total_score=100,
-        )
-        return {
-            "kind": "exam_paper",
-            "render_mode": "exam_canvas",
-            "text": _build_exam_text_from_payload(fallback_payload),
-            "payload": fallback_payload,
-            "meta": {
-                "delivery_mode": "partial_revised",
-                "quality_floor_passed": bool(timeout_flags.get("quality_floor_passed")),
-                "degrade_reason": "budget_exhausted",
-                "auto_fixed": bool(timeout_fixed_items),
-                "fixed_items": timeout_fixed_items,
-                "quality_checks": {
-                    "quantity_ok": bool(timeout_flags.get("quantity_ok")),
-                    "numbering_ok": bool(timeout_flags.get("numbering_ok")),
-                    "total_score_ok": bool(timeout_flags.get("total_score_ok")),
-                    "options_ok": bool(timeout_flags.get("options_ok")),
-                    "duplicates_ok": bool(timeout_flags.get("duplicates_ok")),
-                },
-                "exam_end_to_end_ms": int((time.monotonic() - exam_started_at) * 1000),
-                "evidence_source": evidence_source,
-                "tool_calls": {"rag": tool_call_rag, "web": tool_call_web},
-            },
-        }
 
     rounds = result.get('reflection_rounds', 0)
+    critic_timeout_count = int(result.get("critic_timeout_count") or 0)
     initial_score = result.get('initial_score', 'N/A')
     final_critique = result.get('critique', {})
     final_score = final_critique.get('overall_score', 'N/A')
@@ -4447,14 +4964,38 @@ async def run_exam_agent(
     before_repair_final_questions = [dict(q) for q in final_questions]
     final_questions = _repair_exam_questions_locally(final_questions, quantity_dist or {}, topics, target_total_score=100)
     fixed_items = _compute_fixed_items(before_repair_final_questions, final_questions, quantity_dist or {}, target_total_score=100)
+    term_bad_numbers = _collect_term_style_violation_numbers(final_questions)
+    term_style_ok = len(term_bad_numbers) == 0
+    if not term_style_ok:
+        fixed_items = list(dict.fromkeys((fixed_items or []) + ["term_style_sanitized"]))
     final_payload = _build_exam_payload_from_questions(final_questions, title="期末考试试卷")
     floor_flags = _exam_quality_floor_flags(final_questions, quantity_dist or {}, target_total_score=100)
-    delivery_mode = result.get("delivery_mode") or ("full" if floor_flags.get("quality_floor_passed") else "partial_revised")
-    degrade_reason = result.get("degrade_reason") or ""
-    if (not ALLOW_DEGRADED_DELIVERY) and (delivery_mode != "full" or degrade_reason):
-        raise RuntimeError(f"本次出卷未达严格质量要求（delivery_mode={delivery_mode}, reason={degrade_reason or 'quality_floor_not_passed'}），已禁止降级交付，请重试。")
+    quality_checks = {
+        "quantity_ok": bool(floor_flags.get("quantity_ok")),
+        "numbering_ok": bool(floor_flags.get("numbering_ok")),
+        "total_score_ok": bool(floor_flags.get("total_score_ok")),
+        "options_ok": bool(floor_flags.get("options_ok")),
+        "duplicates_ok": bool(floor_flags.get("duplicates_ok")),
+        "concept_overlap_ok": bool(floor_flags.get("concept_overlap_ok", True)),
+        "term_style_ok": term_style_ok,
+    }
+    quality_ok = bool(floor_flags.get("quality_floor_passed")) and term_style_ok
     end_to_end_ms = int((time.monotonic() - exam_started_at) * 1000)
     logger.info(f"[Latency] exam_end_to_end_ms={end_to_end_ms}")
+    if not quality_ok:
+        stage_exit_reason = result.get("degrade_reason") or "quality_floor_not_passed"
+        return _build_exam_failed_result(
+            "试卷生成失败：质量门校验未通过，请重试。",
+            exam_started_at=exam_started_at,
+            evidence_source=evidence_source,
+            tool_call_rag=tool_call_rag,
+            tool_call_web=tool_call_web,
+            stage_exit_reason=stage_exit_reason,
+            missing_after_retries=max(0, total_questions - len(final_questions)),
+            quality_checks=quality_checks,
+            term_style_ok=term_style_ok,
+            critic_timeout_count=critic_timeout_count,
+        )
 
     return {
         "kind": "exam_paper",
@@ -4462,68 +5003,18 @@ async def run_exam_agent(
         "text": _build_exam_text_from_payload(final_payload),
         "payload": final_payload,
         "meta": {
-            "delivery_mode": delivery_mode,
-            "quality_floor_passed": bool(floor_flags.get("quality_floor_passed")),
-            "degrade_reason": degrade_reason,
+            "delivery_mode": "full",
+            "quality_floor_passed": True,
+            "degrade_reason": "",
             "auto_fixed": bool(fixed_items),
             "fixed_items": fixed_items,
-            "quality_checks": {
-                "quantity_ok": bool(floor_flags.get("quantity_ok")),
-                "numbering_ok": bool(floor_flags.get("numbering_ok")),
-                "total_score_ok": bool(floor_flags.get("total_score_ok")),
-                "options_ok": bool(floor_flags.get("options_ok")),
-                "duplicates_ok": bool(floor_flags.get("duplicates_ok")),
-            },
+            "quality_checks": quality_checks,
+            "stage_exit_reason": "quality_passed",
+            "missing_after_retries": 0,
+            "term_style_ok": term_style_ok,
+            "critic_timeout_count": critic_timeout_count,
             "exam_end_to_end_ms": end_to_end_ms,
             "evidence_source": evidence_source,
             "tool_calls": {"rag": tool_call_rag, "web": tool_call_web},
         },
     }
-
-
-def _strip_answers_and_analysis(exam_text: str) -> str:
-    """
-    去掉试卷中的答案和解析，只保留题目部分
-    """
-    import re
-    lines = exam_text.split('\n')
-    cleaned_lines = []
-    skip_mode = False
-
-    for line in lines:
-        stripped = line.strip()
-
-        # 跳过空白行但保持结构
-        if not stripped:
-            cleaned_lines.append(line)
-            continue
-
-        # 遇到答案行或解析行，跳过后续内容直到遇到新题目
-        # 匹配 "答案：" 或 "答案:" 或 "【答案】" 等格式
-        if re.match(r'^(\【|\[)?答案(\】|\])?[:：]', stripped):
-            skip_mode = True
-            continue
-        # 匹配 "解析：" 或 "解析:" 或 "【解析】" 等格式
-        if re.match(r'^(\【|\[)?解析(\】|\])?[:：]', stripped):
-            skip_mode = True
-            continue
-        # 匹配 "参考答案" 等
-        if re.match(r'^(\【|\[)?参考答案', stripped):
-            skip_mode = True
-            continue
-
-        # 新题型标题，恢复正常模式
-        if re.match(r'^(#{1,3}\s*)?[一二三四五六七八九十]+[、.]\s*[\u4e00-\u9fa5]', stripped):
-            skip_mode = False
-        # 题目编号行（如 "1."、"2."），恢复显示
-        if re.match(r'^\d+[.、]\s', stripped):
-            skip_mode = False
-
-        if not skip_mode:
-            cleaned_lines.append(line)
-
-    # 移除末尾多余的空行（保留最多2个换行）
-    while len(cleaned_lines) > 2 and not cleaned_lines[-1].strip():
-        cleaned_lines.pop()
-
-    return '\n'.join(cleaned_lines)

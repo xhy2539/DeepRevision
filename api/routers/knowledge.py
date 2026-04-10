@@ -7,6 +7,7 @@ import time
 from typing import List, Dict, Any
 
 from fastapi import APIRouter, File, UploadFile, BackgroundTasks, Query, HTTPException
+from fastapi.responses import JSONResponse
 from rag.vector_store import VectorStoreService
 from utils.session_context import current_session_id
 from utils.config_handler import chroma_conf
@@ -112,6 +113,7 @@ def process_document_task(filenames: list, session_id: str = "default"):
     import asyncio as _asyncio
 
     async def _run():
+        task_start = time.time()
         current_session_id.set(session_id)
         vs = VectorStoreService()
         # 标记为处理开始
@@ -120,7 +122,12 @@ def process_document_task(filenames: list, session_id: str = "default"):
             {name: {"status": "processing", "detail": "正在解析并向量化"} for name in filenames},
         )
 
+        parse_start = time.time()
         result_map = await vs.load_document(target_filenames=filenames)
+        logger.info(
+            f"[Latency] upload_vectorize_ms={int((time.time() - parse_start) * 1000)}, "
+            f"session={session_id}, files={len(filenames)}"
+        )
 
         status_patch = {}
         for name in filenames:
@@ -144,6 +151,7 @@ def process_document_task(filenames: list, session_id: str = "default"):
             rag_cache_ref[session_id] = RagSummarizeService()
 
         logger.info(f"[后台任务] 批次 {filenames} 已成功载入科目 [{session_id}] 知识库，并完成向量化！")
+        logger.info(f"[Latency] upload_task_total_ms={int((time.time() - task_start) * 1000)}")
 
     try:
         _asyncio.run(_run())
@@ -592,7 +600,10 @@ async def retry_failed_documents(
     status_store_path = os.path.join(session_data_dir, "ingest_status.json")
 
     if not os.path.isdir(session_data_dir):
-        return {"code": 404, "message": "会话目录不存在", "retry_count": 0}
+        return JSONResponse(
+            status_code=404,
+            content={"code": 404, "message": "会话目录不存在", "retry_count": 0},
+        )
 
     status_data = _load_ingest_status(status_store_path)
     retry_files = []

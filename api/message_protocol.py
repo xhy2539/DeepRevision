@@ -1,5 +1,7 @@
+import json
 import re
 import time
+import ast
 from typing import Any, Dict, List, Optional
 
 from api.routers.exam_export import parse_exam_content
@@ -134,6 +136,59 @@ def _infer_message_kind(route: str, answer: str) -> str:
     return "chat"
 
 
+def _parse_serialized_quiz_questions(content: str) -> List[Dict[str, Any]]:
+    """兼容 Python/JSON 列表字符串题目输出。"""
+    if not content or not str(content).strip():
+        return []
+    raw = str(content).strip()
+    parsed_obj: Any = None
+    try:
+        parsed_obj = json.loads(raw)
+    except Exception:
+        try:
+            parsed_obj = ast.literal_eval(raw)
+        except Exception:
+            return []
+    if isinstance(parsed_obj, dict):
+        parsed_obj = [parsed_obj]
+    if not isinstance(parsed_obj, list):
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for i, item in enumerate(parsed_obj, start=1):
+        if not isinstance(item, dict):
+            continue
+        question = str(item.get("question") or item.get("content") or "").strip()
+        if not question:
+            continue
+        options: List[str] = []
+        raw_options = item.get("options")
+        if isinstance(raw_options, dict):
+            for key in ["A", "B", "C", "D"]:
+                val = raw_options.get(key)
+                if val is not None and str(val).strip():
+                    options.append(f"{key}. {str(val).strip()}")
+        elif isinstance(raw_options, list):
+            for idx, opt in enumerate(raw_options):
+                opt_text = str(opt).strip()
+                if not opt_text:
+                    continue
+                if re.match(r"^[A-D][.、]\s*", opt_text):
+                    options.append(opt_text)
+                else:
+                    options.append(f"{chr(65 + idx)}. {opt_text}")
+        out.append({
+            "type": str(item.get("type") or "选择题"),
+            "question": question,
+            "options": options or None,
+            "answer": str(item.get("answer") or "").strip(),
+            "explanation": str(item.get("explanation") or item.get("analysis") or "").strip(),
+            "score": f"{item.get('score')}分" if item.get("score") not in (None, "") else None,
+            "difficulty": str(item.get("difficulty") or "").strip() or None,
+        })
+    return out
+
+
 def build_assistant_message(
     route: str,
     answer: str,
@@ -155,17 +210,36 @@ def build_assistant_message(
                 else "markdown"
             )
         payload = structured_result.get("payload") or {}
+        if kind == "quiz_set":
+            if not isinstance(payload, dict):
+                payload = {}
+            questions = payload.get("questions") if isinstance(payload.get("questions"), list) else []
+            if not questions:
+                parsed_questions = _parse_quiz_content(content)
+                if not parsed_questions:
+                    parsed_questions = _parse_serialized_quiz_questions(content)
+                if parsed_questions:
+                    payload = {
+                        **payload,
+                        "title": payload.get("title") or (route_params.get("topic") if isinstance(route_params, dict) else "") or "练习题",
+                        "show_answers_default": bool(payload.get("show_answers_default", False)),
+                        "show_analysis_default": bool(payload.get("show_analysis_default", False)),
+                        "questions": parsed_questions,
+                    }
+        extra_meta = structured_result.get("meta") if isinstance(structured_result.get("meta"), dict) else {}
+        merged_meta = {
+            "route": route,
+            "session_id": session_id,
+            "generated_at": int(time.time()),
+            "structured": True,
+        }
+        merged_meta.update(extra_meta)
         return {
             "kind": kind,
             "render_mode": render_mode,
             "content": content,
             "payload": payload,
-            "meta": {
-                "route": route,
-                "session_id": session_id,
-                "generated_at": int(time.time()),
-                "structured": True,
-            },
+            "meta": merged_meta,
         }
 
     kind = _infer_message_kind(route, answer)
@@ -174,11 +248,14 @@ def build_assistant_message(
 
     if kind == "quiz_set":
         render_mode = "interactive_cards"
+        parsed_questions = _parse_quiz_content(answer)
+        if not parsed_questions:
+            parsed_questions = _parse_serialized_quiz_questions(answer)
         payload = {
             "title": route_params.get("topic") or "练习题",
             "show_answers_default": False,
             "show_analysis_default": False,
-            "questions": _parse_quiz_content(answer),
+            "questions": parsed_questions,
         }
     elif kind == "exam_paper":
         kind = "exam_paper"

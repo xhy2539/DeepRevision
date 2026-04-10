@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/input";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import ExamCanvas, { isExamContent } from "@/components/ExamCanvas";
+import ToastContainer, { showToast } from "@/components/ui/toast";
 
 // Types
 type MessageKind = "chat" | "quiz_set" | "exam_paper";
@@ -26,6 +27,23 @@ interface AssistantPayload {
   show_analysis_default?: boolean;
   questions?: QuizQuestion[];
   exam_data?: unknown;
+}
+
+interface QuizExamData {
+  title: string;
+  subtitle: string;
+  total_score: number;
+  total_questions: number;
+  question_types: Record<string, { count: number; total_score: number }>;
+  questions: Array<{
+    number: number;
+    type: string;
+    content: string;
+    answer: string;
+    analysis: string;
+    score: number;
+    difficulty: string;
+  }>;
 }
 
 interface ExamPracticeQuestion {
@@ -60,6 +78,16 @@ interface Message {
   kind?: MessageKind;
   render_mode?: "markdown" | "interactive_cards" | "exam_canvas";
   payload?: AssistantPayload;
+  meta?: Record<string, unknown>;
+}
+
+interface ExamStageTraceItem {
+  exam_stage: "choice" | "fill_judge" | "essay" | string;
+  attempt?: number;
+  stage_status?: "running" | "success" | "failed" | string;
+  error?: string;
+  strict_mode?: boolean;
+  stage_latency_ms?: number;
 }
 
 interface Session {
@@ -67,6 +95,9 @@ interface Session {
   name: string;
   parent_id?: string;
 }
+
+const SESSION_ID_REGEX = /^[\u4e00-\u9fa5a-zA-Z0-9_-]{1,64}$/;
+const isValidSessionId = (sid: string) => SESSION_ID_REGEX.test((sid || "").trim());
 
 interface KnowledgeFile {
   filename: string;
@@ -174,8 +205,8 @@ function parseQuizContent(content: string): {
         continue;
       }
 
-      // 选项（A. B. C. D.）
-      if (/^[A-D][.、]/.test(trimmedLine)) {
+      // 选项（A. B. C. D.）仅选择题解析
+      if (currentType === "选择题" && /^[A-D][.、]\s+\S+/.test(trimmedLine)) {
         options.push(trimmedLine);
         inExplanation = false;
       }
@@ -197,8 +228,8 @@ function parseQuizContent(content: string): {
       else if (inExplanation && trimmedLine) {
         explanation += (explanation ? "\n" : "") + trimmedLine;
       }
-      // 行内选项
-      else if (/\s+[A-D][.、]\s*/.test(trimmedLine)) {
+      // 行内选项仅选择题解析，防止简答题正文被误拆
+      else if (currentType === "选择题" && /\s+[A-D][.、]\s+/.test(trimmedLine)) {
         const parsed = parseInlineOptions(trimmedLine);
         if (parsed.question) {
           questionText += (questionText ? "\n" : "") + parsed.question;
@@ -385,8 +416,58 @@ function MarkdownContent({
       ? payload.questions
       : parsedQuiz.questions;
     if (questions.length > 0) {
-      return <QuizCard questions={questions} defaultShowAnswers={payload?.show_answers_default} />;
+      // 转换为 ExamCanvas 格式，支持练习模式
+      const examData: QuizExamData = {
+        title: payload?.title || "练习题",
+        subtitle: "",
+        total_score: questions.reduce((sum, q) => sum + (typeof q.score === "string" ? parseInt(q.score, 10) || 0 : q.score || 0), 0),
+        total_questions: questions.length,
+        question_types: {},
+        questions: questions.map((q, idx) => {
+          const normalizedOptions = (q.options || []).map((opt, i) => {
+            const text = String(opt || "").trim();
+            if (/^[A-D][.、]\s*/.test(text)) return text;
+            return `${String.fromCharCode(65 + i)}. ${text}`;
+          });
+          return {
+            number: idx + 1,
+            type: q.type,
+            content: normalizedOptions.length > 0
+              ? q.question + "\n" + normalizedOptions.join("\n")
+              : q.question,
+            answer: q.answer || "",
+            analysis: q.explanation || "",
+            score: typeof q.score === "string" ? parseInt(q.score, 10) || 2 : q.score || 2,
+            difficulty: q.difficulty || "中等",
+          };
+        }),
+      };
+      return (
+        <ExamCanvas
+          examContent=""
+          examDataOverride={examData}
+          courseName={payload?.title || "练习"}
+          onRequestAnswers={onRequestAnswers}
+          similarQuestions={similarQuestions}
+          onPracticeComplete={onPracticeComplete}
+        />
+      );
     }
+  }
+
+  // 检测是否为试卷格式，使用 Canvas 渲染
+  if (isExamContent(content)) {
+    // 直接使用 ExamCanvas 渲染，它内部会处理解析失败的情况
+    // 解析失败时会渲染原始内容作为后备
+    return (
+      <ExamCanvas
+        examContent={content}
+        courseName="期末考试"
+        onRequestAnswers={onRequestAnswers}
+        similarQuestions={similarQuestions}
+        onPracticeComplete={onPracticeComplete}
+      />
+    );
   }
 
   if (kind === "chat" && !parsedQuiz.isQuiz) {
@@ -428,21 +509,6 @@ function MarkdownContent({
         {content}
       </ReactMarkdown>
       </div>
-    );
-  }
-
-  // 检测是否为试卷格式，使用 Canvas 渲染
-  if (isExamContent(content)) {
-    // 直接使用 ExamCanvas 渲染，它内部会处理解析失败的情况
-    // 解析失败时会渲染原始内容作为后备
-    return (
-      <ExamCanvas
-        examContent={content}
-        courseName="期末考试"
-        onRequestAnswers={onRequestAnswers}
-        similarQuestions={similarQuestions}
-        onPracticeComplete={onPracticeComplete}
-      />
     );
   }
 
@@ -1146,6 +1212,10 @@ export default function ChatPage() {
   const [showKnowledgePanel, setShowKnowledgePanel] = useState(false);
   const [isBackendConnected, setIsBackendConnected] = useState(true);
   const [similarQuestionsByMessage, setSimilarQuestionsByMessage] = useState<Record<string, Record<number, SimilarQuestion[]>>>({});
+  const [retryingMessageId, setRetryingMessageId] = useState<string | null>(null);
+  const [practiceFeedbackByMessage, setPracticeFeedbackByMessage] = useState<
+    Record<string, { type: "success" | "warning" | "error"; text: string }>
+  >({});
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -1180,7 +1250,7 @@ export default function ChatPage() {
       }));
 
       if (payloadRecords.length > 0) {
-        await fetch("/api/chat/practice/submit", {
+        const submitRes = await fetch("/api/chat/practice/submit", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1188,31 +1258,70 @@ export default function ChatPage() {
             records: payloadRecords,
           }),
         });
+        if (!submitRes.ok) {
+          throw new Error(`练习记录提交失败（HTTP ${submitRes.status}）`);
+        }
+        const submitData = await submitRes.json();
+        if (submitData?.code !== 200) {
+          throw new Error(submitData?.message || "练习记录提交失败");
+        }
 
-        const similarRes = await fetch("/api/chat/practice/similar", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            session_id: currentSession,
-            limit: 3,
-            wrong_questions: wrongAnswers.map((q) => ({
-              question_number: q.number,
-              question_content: q.content,
-              knowledge_point: inferKnowledgePoint(q),
-            })),
-          }),
-        });
-        const similarData = await similarRes.json();
-        if (similarData?.code === 200 && similarData?.similar_questions) {
-          setSimilarQuestionsByMessage((prev) => ({
+        if (wrongAnswers.length > 0) {
+          const similarRes = await fetch("/api/chat/practice/similar", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              session_id: currentSession,
+              limit: 3,
+              wrong_questions: wrongAnswers.map((q) => ({
+                question_number: q.number,
+                question_content: q.content,
+                knowledge_point: inferKnowledgePoint(q),
+              })),
+            }),
+          });
+          if (!similarRes.ok) {
+            throw new Error(`相似题获取失败（HTTP ${similarRes.status}）`);
+          }
+          const similarData = await similarRes.json();
+          if (similarData?.code === 200 && similarData?.similar_questions) {
+            setSimilarQuestionsByMessage((prev) => ({
+              ...prev,
+              [messageId]: similarData.similar_questions,
+            }));
+            const similarCount = Object.values(similarData.similar_questions as Record<string, SimilarQuestion[]>)
+              .reduce((acc, arr) => acc + (Array.isArray(arr) ? arr.length : 0), 0);
+            setPracticeFeedbackByMessage((prev) => ({
+              ...prev,
+              [messageId]: {
+                type: "success",
+                text: `练习已保存，已生成 ${similarCount} 道复练推荐题。`,
+              },
+            }));
+          }
+        } else {
+          setPracticeFeedbackByMessage((prev) => ({
             ...prev,
-            [messageId]: similarData.similar_questions,
+            [messageId]: {
+              type: "success",
+              text: "本次练习全对，记录已保存。",
+            },
           }));
         }
+        showToast("练习记录已保存，已更新相似题推荐", "success");
       }
       console.log("[Practice] 完成练习:", { score, total, totalCount: records.length, wrongCount: wrongAnswers.length });
     } catch (error) {
       console.error("[Practice] 保存练习记录失败:", error);
+      const msg = error instanceof Error ? error.message : "练习记录保存失败";
+      setPracticeFeedbackByMessage((prev) => ({
+        ...prev,
+        [messageId]: {
+          type: "error",
+          text: `练习记录保存失败：${msg}`,
+        },
+      }));
+      showToast(`练习记录保存失败：${msg}`, "error");
     }
   };
 
@@ -1242,11 +1351,31 @@ export default function ChatPage() {
 
   // 加载会话消息历史
   const loadSessionMessages = (sessionId: string) => {
+    if (!isValidSessionId(sessionId)) {
+      setMessages([]);
+      showToast(`会话ID非法（${sessionId}），请先清理该会话`, "warning");
+      return;
+    }
     fetch(`/api/chat/messages?session_id=${encodeURIComponent(sessionId)}`)
-      .then(res => res.json())
+      .then(async res => {
+        const data = await res.json();
+        return { ok: res.ok, status: res.status, data };
+      })
       .then(data => {
-        if (data.code === 200 && data.data) {
-          setMessages(data.data);
+        if (!data.ok) {
+          if (data.status === 404) {
+            showToast("会话不存在，可能已被删除", "warning");
+            setMessages([]);
+            return;
+          }
+          if (data.status === 400) {
+            showToast("会话ID不合法，请删除后重新创建", "warning");
+            setMessages([]);
+            return;
+          }
+        }
+        if (data.data.code === 200 && data.data.data) {
+          setMessages(data.data.data);
         }
       })
       .catch(err => console.error("加载消息失败:", err));
@@ -1258,13 +1387,18 @@ export default function ChatPage() {
   }, [messages, thoughts]);
 
   // 发送消息
-  const sendMessage = async () => {
-    if (!input.trim() || !currentSession) return;
+  const sendMessage = async (overrideText?: string, extraBody?: Record<string, unknown>) => {
+    const outgoingText = (overrideText ?? input).trim();
+    if (!outgoingText || !currentSession || isLoading) return;
+    if (!isValidSessionId(currentSession)) {
+      showToast(`当前会话ID非法（${currentSession}），请先删除该会话`, "error");
+      return;
+    }
 
     const userMessage: Message = {
       id: Date.now().toString(),
       role: "user",
-      content: input,
+      content: outgoingText,
       timestamp: Date.now()
     };
 
@@ -1289,95 +1423,134 @@ export default function ChatPage() {
       const response = await fetch("/api/chat/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: input, session_id: currentSession })
+        body: JSON.stringify({ query: outgoingText, session_id: currentSession, ...(extraBody || {}) })
       });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
 
       const reader = response.body?.getReader();
       const decoder = new TextDecoder();
       let fullContent = "";
+      let sseBuffer = "";
+      let streamErrored = false;
+
+      const appendAssistantContent = (content: string) => {
+        setMessages(prev => prev.map(m =>
+          m.id === assistantMessageId ? { ...m, content } : m
+        ));
+      };
+
+      const processSSEData = (data: string) => {
+        if (data === "[DONE]") return;
+
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.error) {
+            streamErrored = true;
+            const errorText = typeof parsed.error === "string" ? parsed.error : "服务暂时不可用";
+            setMessages(prev => prev.map(m =>
+              m.id === assistantMessageId
+                ? { ...m, content: `[系统提示: ${errorText}]`, meta: { error: true, error_message: errorText } }
+                : m
+            ));
+            return;
+          }
+          if (parsed.event === "start" && parsed.message) {
+            setMessages(prev => prev.map(m =>
+              m.id === assistantMessageId
+                ? {
+                    ...m,
+                    kind: parsed.message.kind || "chat",
+                    render_mode: parsed.message.render_mode || "markdown",
+                    meta: parsed.message.meta,
+                  }
+                : m
+            ));
+            return;
+          }
+          if (parsed.event === "delta" && parsed.text) {
+            fullContent += parsed.text;
+            appendAssistantContent(fullContent);
+            return;
+          }
+          if (parsed.event === "complete" && parsed.message) {
+            const message = parsed.message;
+            fullContent = message.content || fullContent;
+            setMessages(prev => prev.map(m =>
+              m.id === assistantMessageId
+                ? {
+                    ...m,
+                    content: message.content || fullContent,
+                    kind: message.kind || "chat",
+                    render_mode: message.render_mode || "markdown",
+                    payload: message.payload,
+                    meta: message.meta,
+                  }
+                : m
+            ));
+            return;
+          }
+          if (parsed.text) {
+            // 跳过 think 标签内容
+            if (parsed.text.trim().startsWith("<think>")) {
+              return;
+            }
+            // 检测系统思考
+            if (parsed.text.includes("**[系统思考")) {
+              const match = parsed.text.match(/\*\*(.*?)\*\*/);
+              if (match) {
+                const thought = match[1].replace("[系统思考：", "").replace("]", "");
+                setThoughts(prev => [...prev, thought]);
+              }
+            } else {
+              fullContent += parsed.text;
+              appendAssistantContent(fullContent);
+            }
+          }
+        } catch {
+          // 忽略解析错误（可能是非 JSON 的 data 行）
+        }
+      };
 
       if (reader) {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
 
-          const chunk = decoder.decode(value);
-          const lines = chunk.split("\n");
+          sseBuffer += decoder.decode(value, { stream: true });
+          const lines = sseBuffer.split("\n");
+          sseBuffer = lines.pop() || "";
 
-          for (const line of lines) {
-            if (line.startsWith("data: ")) {
-              const data = line.slice(6);
-              if (data === "[DONE]") continue;
-
-              try {
-                const parsed = JSON.parse(data);
-                if (parsed.error) {
-                  // 后端返回的错误，替换现有内容
-                  setMessages(prev => prev.map(m =>
-                    m.id === assistantMessageId ? { ...m, content: `[系统提示: ${parsed.error}]` } : m
-                  ));
-                  break;  // 退出流式读取
-                }
-                if (parsed.event === "start" && parsed.message) {
-                  setMessages(prev => prev.map(m =>
-                    m.id === assistantMessageId
-                      ? {
-                          ...m,
-                          kind: parsed.message.kind || "chat",
-                          render_mode: parsed.message.render_mode || "markdown",
-                        }
-                      : m
-                  ));
-                  continue;
-                }
-                if (parsed.event === "delta" && parsed.text) {
-                  fullContent += parsed.text;
-                  setMessages(prev => prev.map(m =>
-                    m.id === assistantMessageId ? { ...m, content: fullContent } : m
-                  ));
-                  continue;
-                }
-                if (parsed.event === "complete" && parsed.message) {
-                  const message = parsed.message;
-                  fullContent = message.content || fullContent;
-                  setMessages(prev => prev.map(m =>
-                    m.id === assistantMessageId
-                      ? {
-                          ...m,
-                          content: message.content || fullContent,
-                          kind: message.kind || "chat",
-                          render_mode: message.render_mode || "markdown",
-                          payload: message.payload,
-                        }
-                      : m
-                  ));
-                  continue;
-                }
-                if (parsed.text) {
-                  // 跳过 think 标签内容
-                  if (parsed.text.trim().startsWith("<think>")) {
-                    continue;
-                  }
-                  // 检测系统思考
-                  if (parsed.text.includes("**[系统思考")) {
-                    const match = parsed.text.match(/\*\*(.*?)\*\*/);
-                    if (match) {
-                      const thought = match[1].replace("[系统思考：", "").replace("]", "");
-                      setThoughts(prev => [...prev, thought]);
-                    }
-                  } else {
-                    fullContent += parsed.text;
-                    setMessages(prev => prev.map(m =>
-                      m.id === assistantMessageId ? { ...m, content: fullContent } : m
-                    ));
-                  }
-                }
-              } catch (e) {
-                // 忽略解析错误
-              }
-            }
+          for (const rawLine of lines) {
+            const line = rawLine.trimEnd();
+            if (!line.startsWith("data: ")) continue;
+            processSSEData(line.slice(6));
+            if (streamErrored) break;
+          }
+          if (streamErrored) {
+            break;
           }
         }
+
+        // 处理最后一个可能未换行结束的片段
+        sseBuffer += decoder.decode();
+        const finalLine = sseBuffer.trim();
+        if (finalLine.startsWith("data: ")) {
+          processSSEData(finalLine.slice(6));
+        }
+
+        if (!streamErrored && !fullContent.trim()) {
+          setMessages(prev => prev.map(m =>
+            m.id === assistantMessageId && !m.payload
+              ? { ...m, content: "服务已返回空内容，请重试一次。" }
+              : m
+          ));
+        }
+      } else {
+        setMessages(prev => prev.map(m =>
+          m.id === assistantMessageId ? { ...m, content: "流式连接不可用，请稍后重试。" } : m
+        ));
       }
 
       // 更新统计
@@ -1387,10 +1560,79 @@ export default function ChatPage() {
       console.error("Chat error:", error);
       const errorMessage = error instanceof Error ? error.message : String(error);
       setMessages(prev => prev.map(m =>
-        m.id === assistantMessageId ? { ...m, content: `请求失败: ${errorMessage}` } : m
+        m.id === assistantMessageId
+          ? { ...m, content: `请求失败: ${errorMessage}`, meta: { error: true, error_message: errorMessage } }
+          : m
       ));
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const retryAssistantMessage = async (assistantIndex: number) => {
+    if (isLoading) return;
+    const assistantMessage = messages[assistantIndex];
+    for (let i = assistantIndex - 1; i >= 0; i -= 1) {
+      if (messages[i]?.role === "user" && messages[i]?.content?.trim()) {
+        setRetryingMessageId(assistantMessage?.id || null);
+        try {
+          await sendMessage(messages[i].content);
+        } finally {
+          setRetryingMessageId(null);
+        }
+        return;
+      }
+    }
+    showToast("未找到可重试的问题内容", "warning");
+  };
+
+  const getExamStageTrace = (meta?: Record<string, unknown>): ExamStageTraceItem[] => {
+    if (!meta || !Array.isArray(meta.stage_trace)) return [];
+    return meta.stage_trace.filter((item): item is ExamStageTraceItem => !!item && typeof item === "object");
+  };
+
+  const retryFailedExamStage = async (assistantIndex: number) => {
+    if (isLoading) return;
+    const assistantMessage = messages[assistantIndex];
+    if (!assistantMessage) return;
+    const meta = assistantMessage.meta as Record<string, unknown> | undefined;
+    const stageTrace = getExamStageTrace(meta);
+    const failedStage = stageTrace.find((s) => s.stage_status === "failed")?.exam_stage;
+    if (!failedStage) {
+      showToast("没有可重跑的失败阶段", "warning");
+      return;
+    }
+
+    let previousUserText = "";
+    for (let i = assistantIndex - 1; i >= 0; i -= 1) {
+      if (messages[i]?.role === "user" && messages[i]?.content?.trim()) {
+        previousUserText = messages[i].content;
+        break;
+      }
+    }
+    if (!previousUserText) {
+      showToast("未找到原始出卷请求，无法重跑失败段", "warning");
+      return;
+    }
+
+    const questions = ((((assistantMessage.payload || {}) as AssistantPayload).exam_data as QuizExamData | undefined)?.questions || []);
+    const stageTypeMap: Record<string, string[]> = {
+      choice: ["选择题"],
+      fill_judge: ["填空题", "判断题"],
+      essay: ["简答题"],
+    };
+    const failedTypes = new Set(stageTypeMap[failedStage] || []);
+    const partialQuestions = questions.filter((q) => !failedTypes.has(String(q.type || "")));
+
+    setRetryingMessageId(assistantMessage.id || null);
+    try {
+      await sendMessage(previousUserText, {
+        exam_stage_plan: true,
+        exam_rerun_stage: failedStage,
+        exam_partial_questions: partialQuestions,
+      });
+    } finally {
+      setRetryingMessageId(null);
     }
   };
 
@@ -1423,6 +1665,9 @@ export default function ChatPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId, name, parent_id: parentId })
       });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
       const data = await res.json();
       if (data.code === 200) {
         const newSession = { id: sessionId, name, parent_id: parentId };
@@ -1431,48 +1676,85 @@ export default function ChatPage() {
         setCurrentSessionName(name);
         setMessages([]);
         setThoughts([]);
+        showToast("会话创建成功", "success");
+      } else {
+        throw new Error(data?.message || "会话创建失败");
       }
     } catch (error) {
       console.error("Create session error:", error);
-      const newSession = { id: sessionId, name, parent_id: parentId };
-      setSessions(prev => [...prev, newSession]);
-      setCurrentSession(sessionId);
-      setCurrentSessionName(name);
-      setMessages([]);
-      setThoughts([]);
+      const msg = error instanceof Error ? error.message : "请检查后端连接";
+      showToast(`会话创建失败：${msg}`, "error");
     }
   };
 
   // 删除会话
   const deleteSession = async (id: string) => {
     try {
-      await fetch(`/api/chat/session/${id}`, { method: "DELETE" });
+      const res = isValidSessionId(id)
+        ? await fetch(`/api/chat/session/${id}`, { method: "DELETE" })
+        : await fetch(`/api/chat/session/cleanup`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: id }),
+          });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        if (res.status === 404) {
+          throw new Error(data?.message || "会话不存在或已删除");
+        }
+        if (res.status === 400) {
+          throw new Error(data?.message || "会话ID非法");
+        }
+        throw new Error(data?.message || `HTTP ${res.status}`);
+      }
+      if (data?.code !== 200) {
+        throw new Error(data?.message || "删除失败");
+      }
+
+      setSessions(prev => prev.filter(s => s.id !== id));
+      if (currentSession === id) {
+        setCurrentSession("default");
+        setCurrentSessionName("默认科目");
+        setMessages([]);
+        setThoughts([]);
+      }
+      showToast("会话已删除", "success");
     } catch (error) {
       console.error("Delete session error:", error);
-    }
-    setSessions(prev => prev.filter(s => s.id !== id));
-    if (currentSession === id) {
-      setCurrentSession("default");
-      setCurrentSessionName("默认科目");
-      setMessages([]);
-      setThoughts([]);
+      const msg = error instanceof Error ? error.message : "删除失败";
+      showToast(`删除会话失败：${msg}`, "error");
     }
   };
 
   // 重命名会话
   const renameSession = async (id: string, newName: string) => {
     try {
-      await fetch(`/api/chat/session/${id}`, {
+      if (!isValidSessionId(id)) {
+        showToast("该会话ID非法，无法重命名，请先删除该会话", "warning");
+        return;
+      }
+      const res = await fetch(`/api/chat/session/${id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ new_name: newName })
       });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      if (data?.code !== 200) {
+        throw new Error(data?.message || "重命名失败");
+      }
+
+      setSessions(prev => prev.map(s => s.id === id ? { ...s, name: newName } : s));
+      if (currentSession === id) {
+        setCurrentSessionName(newName);
+      }
+      showToast("会话重命名成功", "success");
     } catch (error) {
       console.error("Rename session error:", error);
-    }
-    setSessions(prev => prev.map(s => s.id === id ? { ...s, name: newName } : s));
-    if (currentSession === id) {
-      setCurrentSessionName(newName);
+      const msg = error instanceof Error ? error.message : "重命名失败";
+      showToast(`重命名失败：${msg}`, "error");
     }
   };
 
@@ -1480,13 +1762,29 @@ export default function ChatPage() {
   const clearMemory = async () => {
     if (!confirm("确定要销毁当前会话的记忆吗？此操作不可恢复。")) return;
     try {
-      await fetch(`/api/chat/session/${currentSession}`, { method: "DELETE" });
+      const res = isValidSessionId(currentSession)
+        ? await fetch(`/api/chat/session/${currentSession}`, { method: "DELETE" })
+        : await fetch(`/api/chat/session/cleanup`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: currentSession }),
+          });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      if (data?.code !== 200) {
+        throw new Error(data?.message || "销毁失败");
+      }
       setMessages([]);
       setThoughts([]);
       setTotalTokens(0);
       setResponseTime(0);
+      showToast("当前会话记忆已销毁", "success");
     } catch (error) {
       console.error("Clear memory error:", error);
+      const msg = error instanceof Error ? error.message : "销毁失败";
+      showToast(`销毁记忆失败：${msg}`, "error");
     }
   };
 
@@ -1566,11 +1864,7 @@ export default function ChatPage() {
                 const prompt = `请出一套综合测试卷题目，选择10道，判断5道，填空5道，简答3道。根据已上传的课件内容生成，考点范围请从课件中提取关键知识点。${sampleInfo}
 
 请生成完整试卷，包含题目、答案和解析。`;
-                setInput(prompt);
-                setTimeout(() => {
-                  const btn = document.getElementById('send-btn');
-                  if (btn) btn.click();
-                }, 100);
+                await sendMessage(prompt, { exam_stage_plan: true });
               }}
               className="px-4 py-1.5 text-xs font-medium text-teal-700 bg-teal-50 hover:bg-teal-100 border border-teal-200 rounded-md transition-all flex items-center gap-1"
             >
@@ -1681,22 +1975,104 @@ export default function ChatPage() {
                           handlePracticeCompleteForMessage(message.id, score, total, records, wrongAnswers, userAnswers)
                         }
                         onRequestAnswers={() => {
-                          // 发送消息请求答案
-                          const input = "请给出上面试卷的答案和解析";
-                          setMessages(prev => [...prev, {
-                            id: Date.now().toString(),
-                            role: "user",
-                            content: input,
-                            timestamp: Date.now()
-                          }]);
-                          setInput("");
-                          setTimeout(() => {
-                            const btn = document.getElementById('send-btn');
-                            if (btn) btn.click();
-                          }, 100);
+                          void sendMessage("请给出上面试卷的答案和解析");
                         }}
                       />
                     </div>
+                    {message.role === "assistant" && (
+                      <div className="mt-2 flex items-center gap-2">
+                        {message.kind !== "exam_paper" && message.meta && (
+                          <span className={`text-xs px-2 py-1 rounded border ${
+                            (message.meta as Record<string, unknown>).degrade_reason
+                              ? "bg-yellow-50 text-yellow-700 border-yellow-200"
+                              : "bg-emerald-50 text-emerald-700 border-emerald-200"
+                          }`}>
+                            {(message.meta as Record<string, unknown>).degrade_reason
+                              ? `降级交付：${String((message.meta as Record<string, unknown>).degrade_reason)}`
+                              : "完整交付"}
+                            {(message.meta as Record<string, unknown>).evidence_source
+                              ? ` · ${String((message.meta as Record<string, unknown>).evidence_source)}`
+                              : ""}
+                          </span>
+                        )}
+                        {message.kind === "exam_paper" && message.meta && (
+                          <span className={`text-xs px-2 py-1 rounded border ${
+                            (message.meta as Record<string, unknown>).degrade_reason
+                              ? "bg-yellow-50 text-yellow-700 border-yellow-200"
+                              : "bg-emerald-50 text-emerald-700 border-emerald-200"
+                          }`}>
+                            {(message.meta as Record<string, unknown>).degrade_reason
+                              ? `降级交付：${String((message.meta as Record<string, unknown>).degrade_reason)}`
+                              : "完整交付"}
+                            {typeof (message.meta as Record<string, unknown>).exam_end_to_end_ms === "number"
+                              ? ` · ${String((message.meta as Record<string, unknown>).exam_end_to_end_ms)}ms`
+                              : ""}
+                          </span>
+                        )}
+                        {(() => {
+                          const trace = getExamStageTrace(message.meta as Record<string, unknown> | undefined);
+                          if (!trace.length) return null;
+                          const labelMap: Record<string, string> = { choice: "选择", fill_judge: "填空判断", essay: "简答" };
+                          const brief = trace
+                            .map((s) => `${labelMap[s.exam_stage] || s.exam_stage}:${s.stage_status === "success" ? "成功" : "失败"}(x${s.attempt || 0})`)
+                            .join(" | ");
+                          return (
+                            <span className="text-xs px-2 py-1 rounded border bg-slate-50 text-slate-700 border-slate-200">
+                              {brief}
+                            </span>
+                          );
+                        })()}
+                        {(() => {
+                          const trace = getExamStageTrace(message.meta as Record<string, unknown> | undefined);
+                          const failed = trace.find((s) => s.stage_status === "failed" && s.error);
+                          if (!failed) return null;
+                          const labelMap: Record<string, string> = { choice: "选择题阶段", fill_judge: "填空判断阶段", essay: "简答题阶段" };
+                          return (
+                            <span className="text-xs px-2 py-1 rounded border bg-red-50 text-red-700 border-red-200">
+                              {`${labelMap[failed.exam_stage] || failed.exam_stage}失败：${String(failed.error)}`}
+                            </span>
+                          );
+                        })()}
+                        {(() => {
+                          const trace = getExamStageTrace(message.meta as Record<string, unknown> | undefined);
+                          const hasFailed = trace.some((s) => s.stage_status === "failed");
+                          if (!hasFailed) return null;
+                          return (
+                            <button
+                              onClick={() => retryFailedExamStage(idx)}
+                              disabled={isLoading}
+                              className="text-xs px-2 py-1 rounded border border-slate-300 text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+                            >
+                              {retryingMessageId === message.id ? "重跑中..." : "重跑失败段"}
+                            </button>
+                          );
+                        })()}
+                        {practiceFeedbackByMessage[message.id] && (
+                          <span
+                            className={`text-xs px-2 py-1 rounded border ${
+                              practiceFeedbackByMessage[message.id].type === "success"
+                                ? "bg-green-50 text-green-700 border-green-200"
+                                : practiceFeedbackByMessage[message.id].type === "warning"
+                                ? "bg-yellow-50 text-yellow-700 border-yellow-200"
+                                : "bg-red-50 text-red-700 border-red-200"
+                            }`}
+                          >
+                            {practiceFeedbackByMessage[message.id].text}
+                          </span>
+                        )}
+                        {(message.content.includes("[系统提示:") ||
+                          message.content.startsWith("请求失败:") ||
+                          (message.meta && (message.meta as Record<string, unknown>).error === true)) && (
+                          <button
+                            onClick={() => retryAssistantMessage(idx)}
+                            disabled={isLoading}
+                            className="text-xs px-2 py-1 rounded border border-slate-300 text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+                          >
+                            {retryingMessageId === message.id ? "重试中..." : "重试本轮"}
+                          </button>
+                        )}
+                      </div>
+                    )}
                   </div>
                 </div>
               ))}
@@ -1734,7 +2110,7 @@ export default function ChatPage() {
                 </div>
                 <button
                   id="send-btn"
-                  onClick={sendMessage}
+                  onClick={() => sendMessage()}
                   disabled={isLoading || !input.trim()}
                   className="mb-2 mr-2 p-3 rounded-xl transition-all duration-300 disabled:opacity-40 disabled:cursor-not-allowed"
                   style={{
@@ -1791,6 +2167,7 @@ export default function ChatPage() {
         isOpen={showKnowledgePanel}
         onClose={() => setShowKnowledgePanel(false)}
       />
+      <ToastContainer />
 
       {/* ============== 全局样式 ============== */}
       <style jsx global>{`

@@ -458,6 +458,9 @@ pip install -r requirements.txt
 MINIMAX_API_KEY=your_minimax_api_key
 ```
 
+说明：当前实现会在启动时自动读取项目根目录 `.env`（`model/factory.py`），
+因此不需要把密钥写入系统环境变量，也不强制要求 `uvicorn --env-file`。
+
 > 使用其他模型只需修改 `model/factory.py` 中的 `ChatModelFactory`，接口兼容 OpenAI 标准。
 
 ### 3. 启动服务

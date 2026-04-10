@@ -6,6 +6,7 @@ import threading
 import time
 import asyncio
 from functools import wraps
+from logging.handlers import RotatingFileHandler
 
 from utils.path_tool import get_abs_path
 
@@ -17,6 +18,27 @@ os.makedirs(LOG_ROOT, exist_ok=True)
 DEFAULT_LOGGING_FORMAT = logging.Formatter(
     "%(asctime)s-%(name)s-%(levelname)s-%(filename)s:%(lineno)d-%(message)s"
 )
+
+
+class SafeStreamHandler(logging.StreamHandler):
+    """控制台编码不支持时，降级为可打印转义，避免日志线程抛 UnicodeEncodeError。"""
+
+    def emit(self, record):
+        msg = self.format(record)
+        stream = self.stream
+        try:
+            stream.write(msg + self.terminator)
+            self.flush()
+        except UnicodeEncodeError:
+            try:
+                encoding = getattr(stream, "encoding", None) or "utf-8"
+                safe = msg.encode(encoding, errors="backslashreplace").decode(encoding, errors="ignore")
+                stream.write(safe + self.terminator)
+                self.flush()
+            except Exception:
+                self.handleError(record)
+        except Exception:
+            self.handleError(record)
 
 
 def get_logger(name: str = "agent",
@@ -31,10 +53,22 @@ def get_logger(name: str = "agent",
             logger.removeHandler(h)
     # 禁用向上传播，避免重复输出
     logger.propagate = False
-    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler = SafeStreamHandler(sys.stdout)
     console_handler.setLevel(console_level)
     console_handler.setFormatter(DEFAULT_LOGGING_FORMAT)
     logger.addHandler(console_handler)
+
+    # 文件日志（用于线上排障与回溯）
+    log_filename = log_file or os.path.join(LOG_ROOT, f"{name}.log")
+    file_handler = RotatingFileHandler(
+        log_filename,
+        maxBytes=10 * 1024 * 1024,  # 10MB
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(file_level)
+    file_handler.setFormatter(DEFAULT_LOGGING_FORMAT)
+    logger.addHandler(file_handler)
     return logger
 
 

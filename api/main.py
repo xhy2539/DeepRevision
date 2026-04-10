@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
 from api.routers import knowledge, chat, auth, exam_export
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from utils.memory_service import memory_manager
 
 # 项目根目录
@@ -35,7 +35,8 @@ async def index_ui():
 
 @app.get("/app", summary="打开复习引擎主界面")
 async def app_ui():
-    return FileResponse("static/index.html")
+    # 统一跳转到 Next 前端入口，避免命中旧 static/index.html 导致 _next 资源 404
+    return RedirectResponse(url="http://127.0.0.1:3000/chat", status_code=307)
 
 
 @app.get("/health", summary="健康检查")

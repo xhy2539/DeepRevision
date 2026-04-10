@@ -189,7 +189,7 @@ class RagSummarizeService:
         # ============== 检索配置（从 chroma.yml 读取）==============
         self.rerank_top_k = chroma_conf.get('retrieve_top_k', 10)
         self.final_top_k = chroma_conf.get('rerank_final_k', 8)
-        self.rrf_k = chroma_conf.get('rrf_k', 60)
+        self.rrf_k = chroma_conf.get('rrf_k', 30)
         self.mmr_enabled = chroma_conf.get('mmr_enabled', False)
         self.mmr_lambda = chroma_conf.get('mmr_lambda', 0.5)
 
@@ -234,7 +234,7 @@ class RagSummarizeService:
 
         # --- 步骤二：准备 Query Rewrite 的 Chain ---
         rewrite_prompt = PromptTemplate.from_template(
-            "你是一个期末考试复习助手。学生的问题通常很短或带有代词。请将下面的问题补充完整并改写为更适合在知识库(课件)中检索的关键词串，词与词之间用空格隔开。如果问题本身已经很明确，只需提取出核心名词即可。不超过50个字。\n原问题: {question}"
+            "你是一个期末考试复习助手。学生的问题通常很短或带有代词。请将下面的问题补充完整并改写为更适合在知识库(课件)中检索的关键词串，词与词之间用空格隔开。如果问题本身已经很明确，只需提取出核心名词即可。\n原问题: {question}"
         )
         self.rewrite_chain = rewrite_prompt | light_chat_model | StrOutputParser()
 
@@ -320,11 +320,21 @@ class RagSummarizeService:
         供 Supervisor RAG SubAgent 使用，避免双重 LLM 调用。
         """
         try:
-            expanded_query = await self.rewrite_chain.ainvoke({"question": query})
+            expanded_query = await asyncio.wait_for(
+                self.rewrite_chain.ainvoke({"question": query}),
+                timeout=3.0,
+            )
         except Exception:
             expanded_query = query
 
-        context_docs = await self.retriever_docs(expanded_query)
+        try:
+            context_docs = await asyncio.wait_for(
+                self.retriever_docs(expanded_query),
+                timeout=8.0,
+            )
+        except Exception as e:
+            logger.warning(f"[RAG] retrieve_context 超时/失败，回退空上下文: {e}")
+            context_docs = []
         # 跳过 LLM rerank（rerank 每次都超时 3 秒，10 个 topic 浪费 ~30 秒，且效果不明显）
         # RRF 检索结果已经足够好
 
@@ -336,7 +346,7 @@ class RagSummarizeService:
     async def rag_summarize(self, query: str) -> str:
         session_id = current_session_id.get()
 
-        cached = self.semantic_cache.get(query, session_id)
+        cached = await self.semantic_cache.get(query, session_id)
         if cached is not None:
             return cached
 

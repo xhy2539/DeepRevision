@@ -43,6 +43,10 @@ RUNTIME_METRICS: Dict[str, Any] = {
     "exam_score_rebalance_count": 0,
     "exam_duplicate_rewrite_count": 0,
     "exam_prompt_contract_violation_count": 0,
+    "term_style_violation_count": 0,
+    "missing_model_retry_count": 0,
+    "hard_fail_count": 0,
+    "critic_timeout_count": 0,
     "last_error": "",
 }
 
@@ -134,17 +138,8 @@ def _clean_answer(answer: str) -> str:
                 if next_char in '"\'""''【】（）：:':
                     is_thinking = True
 
-        # 检测短行思考内容：包含多个逗号/分号、没有emoji、不是完整句子
-        # 但列表项（以 -、*、1. 等开头）不视为思考内容
-        if not is_thinking and 3 < len(stripped) < 100:
-            comma_count = stripped.count('，') + stripped.count('、')
-            has_emoji = any(e in stripped for e in ['👋', '😊', '👍', '😄', '🎯', '📚', '💡'])
-            ends_with_punct = any(stripped.endswith(c) for c in '。！？.!?…')
-            # 列表项格式不视为思考内容（即使有多个逗号）
-            is_list_item = stripped.startswith(('- ', '* ', '1. ', '2. ', '3. ', '• ')) or re.match(r'^\d+\.（', stripped) or re.match(r'^[A-D][.、]', stripped)
-            # 思考内容的特征：多逗号连接、没有emoji、不以标点结尾、不是列表项
-            if comma_count >= 2 and not has_emoji and not ends_with_punct and not is_list_item:
-                is_thinking = True
+        # 注意：不要使用“多逗号/短句”这类弱特征判定思考内容，
+        # 否则会误删模型正常回答正文（尤其是闲聊或解释性段落）。
 
         if is_thinking and not skip_mode:
             # 刚开始进入思考，跳过当前行
@@ -357,7 +352,7 @@ async def chat_stream_endpoint(request: Request):
 
             result = await asyncio.wait_for(
                 supervisor_workflow.ainvoke(initial_state),
-                timeout=960.0,  # 外层略大于 15 分钟出卷预算，避免前后层超时打架
+                timeout=660.0,  # 外层略大于 10 分钟出卷预算，避免前后层超时打架
             )
             workflow_latency_ms = int((time.time() - stream_start) * 1000)
             raw_subagent_result = result.get("subagent_result", "")
@@ -401,8 +396,16 @@ async def chat_stream_endpoint(request: Request):
                     meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
                     if meta.get("degrade_reason") == "revise_timeout":
                         _safe_inc("revise_timeout_count")
+                    if meta.get("delivery_mode") == "failed":
+                        _safe_inc("hard_fail_count")
                     if meta.get("delivery_mode") == "partial_revised" or meta.get("degrade_reason"):
                         _safe_inc("degraded_delivery_count")
+                    if meta.get("critic_timeout_count"):
+                        _safe_inc("critic_timeout_count", int(meta.get("critic_timeout_count") or 0))
+                    if not bool(meta.get("term_style_ok", True)):
+                        _safe_inc("term_style_violation_count")
+                    if int(meta.get("missing_after_retries") or 0) > 0:
+                        _safe_inc("missing_model_retry_count", int(meta.get("missing_after_retries") or 0))
                     fixed_items = meta.get("fixed_items") if isinstance(meta.get("fixed_items"), list) else []
                     if "missing_options" in fixed_items:
                         _safe_inc("exam_choice_missing_options_fix_count")
@@ -430,6 +433,8 @@ async def chat_stream_endpoint(request: Request):
                             _safe_inc("exam_stage_fail_count")
                         if isinstance(st.get("stage_latency_ms"), int):
                             _record_exam_stage_latency(int(st.get("stage_latency_ms")))
+                        if int(st.get("critic_timeout_count") or 0) > 0:
+                            _safe_inc("critic_timeout_count", int(st.get("critic_timeout_count") or 0))
                         err_text = str(st.get("error") or "")
                         if "超时" in err_text.lower() or "timeout" in err_text.lower():
                             _safe_inc("exam_stage_timeout_count")
@@ -445,6 +450,14 @@ async def chat_stream_endpoint(request: Request):
                         _safe_inc("exam_duplicate_rewrite_count")
                     if "prompt_contract_violation" in fixed_items:
                         _safe_inc("exam_prompt_contract_violation_count")
+                    if meta.get("delivery_mode") == "failed":
+                        _safe_inc("hard_fail_count")
+                    if meta.get("critic_timeout_count"):
+                        _safe_inc("critic_timeout_count", int(meta.get("critic_timeout_count") or 0))
+                    if not bool(meta.get("term_style_ok", True)):
+                        _safe_inc("term_style_violation_count")
+                    if int(meta.get("missing_after_retries") or 0) > 0:
+                        _safe_inc("missing_model_retry_count", int(meta.get("missing_after_retries") or 0))
                     stage_trace = meta.get("stage_trace") if isinstance(meta.get("stage_trace"), list) else []
                     for st in stage_trace:
                         if not isinstance(st, dict):
@@ -456,6 +469,8 @@ async def chat_stream_endpoint(request: Request):
                             _safe_inc("exam_stage_fail_count")
                         if isinstance(st.get("stage_latency_ms"), int):
                             _record_exam_stage_latency(int(st.get("stage_latency_ms")))
+                        if int(st.get("critic_timeout_count") or 0) > 0:
+                            _safe_inc("critic_timeout_count", int(st.get("critic_timeout_count") or 0))
                         err_text = str(st.get("error") or "")
                         if "超时" in err_text.lower() or "timeout" in err_text.lower():
                             _safe_inc("exam_stage_timeout_count")

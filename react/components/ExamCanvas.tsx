@@ -42,17 +42,52 @@ function stripLeadingQuestionNumber(text: string): string {
 }
 
 function normalizeOptions(raw: unknown): string[] | undefined {
+  const splitInlineOptions = (text: string): string[] => {
+    const src = String(text || "").trim();
+    if (!src) return [];
+    const markerCount = (src.match(/[A-D][.、．:：)\s]+/g) || []).length;
+    if (markerCount < 2) return [];
+    const re = /([A-D])[.、．:：)\s]+\s*(.+?)(?=(?:\s+[A-D][.、．:：)\s]+)|$)/g;
+    const out: string[] = [];
+    let m: RegExpExecArray | null = null;
+    while ((m = re.exec(src)) !== null) {
+      const letter = (m[1] || "").toUpperCase();
+      const content = (m[2] || "").trim();
+      if (letter && content) out.push(`${letter}. ${content}`);
+    }
+    return out;
+  };
+
   if (!raw) return undefined;
   if (Array.isArray(raw)) {
-    const opts = raw
-      .map((v, i) => {
-        const text = String(v || "").trim();
-        if (!text) return "";
-        if (/^[A-D][.、]\s*/.test(text)) return text;
-        return `${String.fromCharCode(65 + i)}. ${text}`;
+    const opts: string[] = [];
+    for (const v of raw) {
+      const text = String(v || "").trim();
+      if (!text) continue;
+      const inline = splitInlineOptions(text);
+      if (inline.length > 0) {
+        opts.push(...inline);
+        continue;
+      }
+      if (/^[A-D][.、．:：)]\s*/.test(text)) {
+        opts.push(text.replace(/^[A-D][.、．:：)]\s*/, (m) => `${m[0].toUpperCase().replace(/[、．:：)]/, ".")} `));
+      } else {
+        opts.push(text);
+      }
+    }
+    const normalized = opts
+      .map((text, i) => {
+        const t = String(text || "").trim();
+        if (!t) return "";
+        if (/^[A-D][.、．:：)]\s*/.test(t)) {
+          const letter = t.charAt(0).toUpperCase();
+          const content = t.replace(/^[A-D][.、．:：)]\s*/, "").trim();
+          return `${letter}. ${content}`;
+        }
+        return `${String.fromCharCode(65 + i)}. ${t}`;
       })
       .filter(Boolean);
-    return opts.length ? opts : undefined;
+    return normalized.length ? normalized : undefined;
   }
   if (typeof raw === "object") {
     const obj = raw as Record<string, unknown>;
