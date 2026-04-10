@@ -1,5 +1,30 @@
 
+# 系统提示词
 main_prompt_path: prompts/main_prompt.txt
+
+# RAG相关
 rag_summarize_prompt_path: prompts/rag_summarize.txt
+
+# 出题相关（单题）
+quiz_generate_structured_path: prompts/quiz_generate_structured.txt
+quiz_generate_reasoning_path: prompts/quiz_generate_reasoning.txt
+quiz_generate_fallback_path: prompts/quiz_generate_fallback.txt
+quiz_critique_path: prompts/quiz_critique.txt
+quiz_revise_path: prompts/quiz_revise.txt
+
+# 试卷相关（多题型）
+exam_generate_single_type_path: prompts/exam_generate_single_type.txt
+exam_generate_structured_path: prompts/exam_generate_structured.txt
+exam_generate_reasoning_path: prompts/exam_generate_reasoning.txt
+exam_critique_path: prompts/exam_critique.txt
+exam_revise_path: prompts/exam_revise.txt
+exam_contract_path: prompts/exam_contract.txt
+
+# 格式示例
+format_examples_path: prompts/format_examples.txt
+
+# 报告生成
 report_prompt_path: prompts/report_prompt.txt
+
+# 旧版出题提示词（保留兼容性）
 quiz_prompt_path: prompts/quiz_prompt.txt

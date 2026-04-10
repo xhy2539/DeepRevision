@@ -14,6 +14,14 @@ venv/
 node_modules/
 dist/
 build/
+.next/
+out/
+react/node_modules/
+react/.next/
+react/dist/
+react/build/
+tsconfig.tsbuildinfo
+*.tsbuildinfo
 
 # 数据库 & 日志 & 临时文件
 chroma_db/
@@ -21,6 +29,8 @@ test_chroma_db_dir/
 logs/
 data/
 *.txt
+server.log
+log.md
 # 如果你需要保留某个特定的 txt，可以把 *.txt 删掉，手动忽略特定的 test 文件：
 # test_math.txt
 # test_os.txt

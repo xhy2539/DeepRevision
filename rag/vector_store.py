@@ -95,13 +95,13 @@ class VectorStoreService():
             return {}
         try:
             with open(self._file_vector_map_path, "r", encoding="utf-8") as f:
-                return _json.load(f)
+                return json.load(f)
         except Exception:
             return {}
 
     def _save_file_vector_map(self, mapping: Dict[str, List[str]]):
         with open(self._file_vector_map_path, "w", encoding="utf-8") as f:
-            _json.dump(mapping, f, ensure_ascii=False)
+            json.dump(mapping, f, ensure_ascii=False)
 
     async def delete_file_vectors(self, filename: str) -> bool:
         mapping = self._load_file_vector_map()
@@ -125,7 +125,6 @@ class VectorStoreService():
         从数据文件夹读取数据转为向量存入向量库。
         图片描述通过 asyncio.gather 并发调用视觉模型，避免串行阻塞。
         """
-        import json as _json
         result_map = {}
         target_set = set(target_filenames or [])
 
