@@ -127,7 +127,9 @@ def normalize_options(value: Any) -> Optional[List[str]]:
     deduped: List[str] = []
     seen = set()
     for opt in options:
-        content = re.sub(r'^[A-D][.、．:：)\s]*', '', opt).strip()
+        # 先完整 normalize，再取其 content 作为 dedup key（避免 "A. A. xxx" 类 malformed 选项逃过去重）
+        normalized_opt = normalize_option_text(opt, 0) if isinstance(opt, str) else str(opt)
+        content = re.sub(r'^[A-D][.、．:：)\s]*', '', normalized_opt).strip()
         key = re.sub(r'\s+', ' ', content)
         if not key or key in seen:
             continue
