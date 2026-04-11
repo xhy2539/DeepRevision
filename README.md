@@ -6,7 +6,6 @@
 ![FastAPI](https://img.shields.io/badge/FastAPI-Async%20Backend-009688.svg)
 ![LangChain](https://img.shields.io/badge/LangChain-0.3-FFD700.svg)
 ![LangGraph](https://img.shields.io/badge/LangGraph-Supervisor%20%2B%20Reflexion-orange.svg)
-![ChromaDB](https://img.shields.io/badge/VectorDB-ChromaDB-purple.svg)
 ![License](https://img.shields.io/badge/License-MIT-blue.svg)
 
 ---
@@ -22,24 +21,11 @@
 | 📥 多格式课件摄入 | PDF / Word / PPT / TXT / 图片，按页解析，图片内容通过多模态模型并发理解 |
 | 🔍 混合检索 | Query Rewrite + BM25 + 向量检索 RRF 融合（支持可选重排） |
 | 🤖 Supervisor 多 Agent | LangGraph Supervisor 分析意图 → 路由到专业 SubAgent（RAG / 出题 / 出卷 / 规划 / 历史分析 / 闲聊） |
-| 📝 Reflexion 出题 | LangGraph Reflexion 架构：出题 + 推理链 → Critic 标记问题 → Revise 修订并交付（试卷默认最多 1 轮修订） |
+| 📝 Reflexion 出题 | LangGraph Reflexion 架构：出题 + 推理链 → Critic 质疑推理链 → Revise 修订并交付（出卷默认最多 1 轮修订） |
 | 🧠 双轨记忆 | 短期滑窗 + 后台异步图谱提纯，SQLite 本地持久化，重启不丢失 |
 | 📄 试卷导出 | 生成完整试卷并导出 Word |
 | 🗂️ 多科目隔离 | ContextVar + ChromaDB Collection，每科目独立知识库 |
 | 📊 算力监控 | AOP 装饰器实时统计 Token 消耗与调用延迟 |
-
-### 当前实现补充（2026-04）
-
-- 对话流式协议已升级为 `start / delta / complete` 事件，支持后端携带 `kind/render_mode/payload`，前端可稳定渲染 `quiz_set` 与 `exam_paper`。
-- 出卷链路默认并发上限为 2，并加入结构化失败时的分批文本补题兜底，避免单批超时导致整卷空白。
-- 知识库上传状态改为持久化 `ingest_status.json`（`processing/completed/failed`），并支持失败文件一键重试。
-- 新增健康检查接口：`GET /health`。
-
-### 最近更新（2026-04-11）
-
-- 前端“快速/完整”开关已隐式透传 `exam_fast_mode` 到所有聊天请求（含手动输入），不在用户回复中额外展示模式字段。
-- 前端“历史”面板已切换为**练习历史管理**（不再是会话消息管理），可查看对错、知识点、错因，并支持删除单条/清空练习记录。
-- 试卷 Reflexion 链路已放宽为 `generate -> critique -> revise -> end`，去除 `revise -> critique` 回环；Critique 以“标记需修订”为主，减少硬阻断导致的长等待。
 
 ---
 
@@ -53,9 +39,10 @@
 | Agent 编排 | LangGraph StateGraph（Supervisor + Reflexion） |
 | 向量库 | ChromaDB（本地持久化） |
 | 检索策略 | BM25 + 向量 RRF 混合检索（可选重排） |
-| 大模型 | MiniMax（可替换为任意 OpenAI 兼容模型） |
-| 多模态 | MiniMax 视觉模型（图片/PPT 图片理解） |
+| 大模型 | MiniMax / Qwen（可替换为任意 OpenAI 兼容模型） |
+| 多模态 | MiniMax/Qwen 视觉模型（图片/PPT 图片理解） |
 | 前端 | React + Tailwind CSS |
+| 数据库 | SQLite（会话记忆，本地持久化） |
 
 ---
 
@@ -71,21 +58,21 @@ FastAPI (ASGI) /api/chat/stream
 Supervisor Agent (LangGraph StateGraph)
   ├── 分析用户意图 → 输出结构化路由决策（JSON）
   └── 条件路由 add_conditional_edges
-        ├── rag_agent    → RAG Service（混合检索 + 片段检索）
-        ├── quiz_agent   → Reflexion 出题工作流（3 Agent）
-        ├── exam_agent   → Reflexion 出卷工作流（3 Agent）
-        ├── planner_agent→ 复习计划生成
-        ├── history_agent→ 历史练习分析
-        └── chitchat     → 闲聊回复
+        ├── rag_agent      → RAG Service（混合检索 + 片段检索）
+        ├── quiz_agent     → Reflexion 出题工作流（3 Agent）
+        ├── exam_agent     → Reflexion 出卷工作流（3 Agent，支持分阶段并行）
+        ├── planner_agent  → 复习计划生成
+        ├── history_agent  → 历史练习分析
+        └── chitchat       → 闲聊回复
               │
-    ┌─────────┴──────────────────────────────┐
-    │           RAG Service                   │
-    │  Query Rewrite (LLM)                    │
-    │  → BM25 + 向量 RRF 混合检索             │
-    │  → 结构化上下文拼接                      │
-    └────────────────┬───────────────────────┘
-                     │
-            ChromaDB（per session collection）
+    ┌────────┴──────────────────────────────┐
+    │           RAG Service                  │
+    │  Query Rewrite (LLM)                   │
+    │  → BM25 + 向量 RRF 混合检索           │
+    │  → 结构化上下文拼接                    │
+    └─────────────────┬────────────────────┘
+                       │
+              ChromaDB（per session collection）
 ```
 
 ### Supervisor 路由工作流
@@ -98,10 +85,10 @@ Supervisor LLM（分析意图）
    │ 输出 {"route": "rag|quiz|exam|planner|history|chitchat", "params": {...}}
    ▼
 add_conditional_edges（条件路由）
-   ├── rag      → rag_agent      → END
-   ├── quiz     → quiz_agent     → END
+   ├── rag      → rag_agent       → END
+   ├── quiz     → quiz_agent      → END
    ├── exam     → exam_agent     → END
-   ├── planner  → planner_agent  → END
+   ├── planner  → planner_agent   → END
    ├── history  → history_agent  → END
    └── chitchat → chitchat       → END
 ```
@@ -122,16 +109,35 @@ Agent 2: Critic（质疑推理链）
   - 逐条核实推理链声明 vs. 课件原文
   - 输出 approved / overall_score / reasoning_flaws / specific_issues
    │
-  需要修订？（存在可执行问题：数量/编号/高危缺陷等）
-  rounds >= 1？（试卷链路强制结束）
-  ├── 通过或已达轮次上限 → END（输出最终题目）
-  └── 需修订且未到上限 → Agent 3: Revise
+   需要修订？（存在可执行问题：数量/编号/高危缺陷等）
+   rounds >= 1？（出卷链路强制结束）
+   ├── 通过或已达轮次上限 → END（输出最终题目）
+   └── 需修订且未到上限 → Agent 3: Revise
                - 针对每条批评逐条修订
                - 输出 revised_quiz / revision_notes / addressed_issues
                └── 直接 END（不再回到 Critic）
 ```
 
 > Reflexion 核心：推理链（Chain of Thought）显式化，Critic 质疑的是推理过程而非最终输出，Revise 必须逐条回应批评并说明修改依据。
+
+### 出卷分阶段工作流
+
+出卷（exam_agent）采用分阶段并发策略，将试卷按题型分为多个 stage 并行出题：
+
+```
+题型分布 plan → stage_plan（choice / fill_judge / essay 三阶段）
+   │
+   ▼
+各 stage 并发执行（各含完整 Reflexion 链路）
+   │
+   ▼
+stage_fast_mode 控制 Critique 路径：
+   - True（默认）：格式检查通过则跳过 LLM Critique
+   - False：始终启用完整 LLM Critique（含 4 个质量门）
+   │
+   ▼
+合并各 stage 题目 → 格式化交付
+```
 
 ### 双轨记忆架构
 
@@ -148,7 +154,7 @@ trash 暂存区
 后台异步图谱提纯（asyncio.create_task，不阻塞对话）
    │
    ▼
-长期图谱记忆（知识点结构化摘要）
+长期结构化摘要记忆
    │
    └─── 下次对话时注入 Supervisor system prompt
 ```
@@ -162,41 +168,54 @@ DeepRevision/
 ├── api/
 │   ├── main.py                  # FastAPI 入口，路由挂载
 │   └── routers/
-│       ├── chat.py              # 对话 SSE（接入 Supervisor 工作流）
+│       ├── chat.py             # 对话 SSE（接入 Supervisor 工作流）
 │       ├── knowledge.py         # 文件上传 + 样卷管理
-│       └── exam_export.py       # 试卷导出 Word
+│       └── exam_export.py      # 试卷导出 Word
 │
 ├── agent/
 │   ├── tools/
-│   │   └── agent_tools.py       # RAG 缓存清理工具（clear_rag_cache）
+│   │   └── agent_tools.py      # 联网搜索、clear_rag_cache 等工具
 │   └── multi_agent/
 │       ├── supervisor.py        # Supervisor 路由 + 6 个 SubAgent 节点
-│       └── quiz_agent.py        # Reflexion 出题 + 出卷工作流（3 Agent）
+│       ├── quiz_agent.py        # Reflexion 出题 + 出卷工作流
+│       ├── quiz_quality.py      # Critique 质量门（fast path + 4 个质量门）
+│       └── quiz_normalization.py # 题目/选项正则化
 │
 ├── rag/
-│   ├── rag_service.py           # 混合检索 + Query Rewrite（可选重排）
-│   └── vector_store.py          # ChromaDB 封装 + 并发图片处理
+│   ├── rag_service.py          # 混合检索 + Query Rewrite
+│   └── vector_store.py         # ChromaDB 封装 + 并发图片处理
 │
 ├── model/
-│   └── factory.py               # LLM / Embedding / Vision 模型工厂
+│   └── factory.py              # LLM / Embedding / Vision 模型工厂
 │
 ├── utils/
-│   ├── memory_service.py        # 双轨记忆（滑窗 + 异步图谱提纯）
-│   ├── session_context.py       # ContextVar 会话隔离
-│   ├── logger_handler.py        # AOP 装饰器 + 线程安全算力统计
-│   ├── file_handler.py          # 多格式文档解析（PDF/PPT/图片/Word）
+│   ├── memory_service.py       # 双轨记忆（滑窗 + 异步图谱提纯）
+│   ├── session_context.py      # ContextVar 会话隔离
+│   ├── logger_handler.py       # AOP 装饰器 + 算力统计
+│   ├── file_handler.py         # 多格式文档解析（PDF/PPT/图片/Word）
 │   ├── config_handler.py        # YAML 配置读取
-│   └── prompt_loader.py         # 提示词加载
+│   └── prompt_loader.py        # 提示词加载（懒加载 + 缓存）
 │
 ├── config/
-│   ├── chroma.yml               # 向量库 + 分块 + 检索参数
-│   ├── rag.yml                  # 模型配置
-│   ├── agent.yml                # Agent 行为配置
-│   └── prompts.yml              # 提示词路径配置
+│   ├── chroma.yml              # 向量库 + 分块 + 检索参数
+│   ├── rag.yml                 # 模型配置
+│   ├── agent.yml               # Agent 行为配置
+│   └── prompts.yml             # 提示词路径映射
 │
-├── prompts/                     # 提示词模板
-├── react/                       # React 前端
-└── data/                        # 上传文件（按 session_id 隔离）
+├── prompts/                    # 16 个提示词模板（外置化）
+│   ├── quiz_generate_structured.txt
+│   ├── quiz_critique.txt
+│   ├── quiz_revise.txt
+│   ├── exam_generate_structured.txt
+│   ├── exam_generate_single_type.txt
+│   ├── exam_generate_reasoning.txt
+│   ├── exam_critique.txt
+│   ├── exam_revise.txt
+│   ├── exam_contract.txt
+│   └── ...（共16个）
+│
+├── react/                      # React + Tailwind CSS 前端
+└── data/                       # 上传文件（按 session_id 隔离）
     └── {session_id}/
 ```
 
@@ -206,163 +225,35 @@ DeepRevision/
 
 ### 1. Supervisor 多 Agent 路由（LangGraph）
 
-用一个 LLM 做意图分类和参数提取，输出结构化 JSON，再由 `add_conditional_edges` 分发到专业 SubAgent。Supervisor 同时注入近期对话历史，支持多轮追问的正确路由（"再出 3 道"、"换成判断题"等）。Supervisor 节点的 LLM token 不透传给用户。
-
-```python
-# supervisor_node — 注入近期对话 + 过滤路由 JSON
-history_lines = [f"{'学生' if isinstance(m, HumanMessage) else '助手'}: {m.content[:200]}"
-                 for m in state.get('chat_history', [])]
-result = await _call_llm(SUPERVISOR_PROMPT,
-    input=state['input'],
-    memory_context=state.get('memory_context', ''),
-    recent_history="\n".join(history_lines) or "（无近期对话）")
-
-# chat.py — 过滤 Supervisor 的 JSON token
-async for event in supervisor_workflow.astream_events(initial_state, version="v2"):
-    if event.get("metadata", {}).get("langgraph_node", "") == "supervisor":
-        continue   # 路由决策 JSON 不暴露给用户
-```
+用一个 LLM 做意图分类和参数提取，输出结构化 JSON，再由 `add_conditional_edges` 分发到专业 SubAgent。Supervisor 同时注入近期对话历史，支持多轮追问的正确路由（"再出 3 道"、"换成判断题"等）。
 
 ### 2. Reflexion 出题：推理链显式化
 
 传统质检只看最终输出对不对。Reflexion 要求出题者先写下推理链（每道题的知识点来源、答案依据、干扰项设计逻辑），Critic 逐条核实推理链 vs. 课件原文。
 
-```python
-# Agent 1 输出 JSON 推理链
-{
-  "quiz": "完整题目文本...",
-  "reasoning": {
-    "knowledge_points": ["第1题考察X，来源：课件原文'...'"],
-    "answer_evidence":  ["第1题答案A的依据：课件原文'...'"],
-    "distractor_design":["第1题干扰项B：容易与X混淆，因为..."]
-  }
-}
-
-# Agent 2 质疑推理链（不只看题目对错）
-{
-  "approved": false, "overall_score": 68,
-  "reasoning_flaws": [
-    {"question":"第1题","flaw":"推理链称依据是'...'，但课件原文是'...'，两者不符","severity":"high"}
-  ]
-}
-
-# Agent 3 针对批评逐条修订
-{
-  "revised_quiz": "修订后完整题目...",
-  "revision_notes": "1. 针对'第1题答案依据不准确'：将答案从B改为C，因为课件明确写道'...'"
-}
-```
-
 ### 3. Session 隔离：ContextVar 上下文穿透
 
-FastAPI async handler 与 LangGraph 节点跨越多个协程栈。用 `threading.local` 无法穿透协程，用全局变量无法隔离并发用户。
+FastAPI async handler 与 LangGraph 节点跨越多个协程栈。用 `ContextVar` 在协程粒度绑定 session_id，从请求入口一直透传到 ChromaDB Collection 选择，无需层层传参，且天然隔离并发用户。
 
-```python
-# utils/session_context.py
-current_session_id: ContextVar[str] = ContextVar("current_session_id", default="default")
+### 4. 混合检索 RRF 融合
 
-# 请求入口绑定
-current_session_id.set(session_id)
+BM25 擅长精确关键词匹配，向量检索擅长语义理解，两者互补。RRF 不依赖人工调权重，按名次倒数融合。RAG Service 分为 `retrieve_context`（只检索）和 `rag_summarize`（检索+总结），避免冗余 LLM 调用。
 
-# RAG 服务深处自动获取，无需层层传参
-class VectorStoreService:
-    def __init__(self):
-        sid = current_session_id.get()   # 自动拿到当前请求的 session
-        col = f"col_{hashlib.md5(sid.encode()).hexdigest()[:16]}"
-        self.vector_store = Chroma(collection_name=col, ...)
-```
+### 5. 提示词外置化
 
-### 4. 混合检索 RRF 融合 + 检索/回答分离
+16 个提示词模板全部外置到 `prompts/` 目录，通过 `config/prompts.yml` + `prompt_loader.py` 管理，支持懒加载和缓存复用，避免 LLM 调用时重复读取文件。
 
-BM25 擅长精确关键词匹配，向量检索擅长语义理解，两者互补。RRF 不依赖人工调权重，按名次倒数融合。
+### 6. SQLite 持久化 + 异步写入
 
-RAG Service 分为两个方法，避免 SubAgent 中产生冗余 LLM 调用：
+会话数据（对话历史、图谱节点）持久化到本地 `sessions.db`，重启不丢失。写入通过 `run_in_executor` 放入线程池，不阻塞事件循环。正常追加走单行 `INSERT`，滑动窗口触发时才全量覆写。
 
-```python
-# retrieve_context(query) — 只检索，返回原始课件片段
-# 供 rag_subagent_node 和 quiz_agent 使用：SubAgent 自己调一次 LLM 完成回答/出题
-async def retrieve_context(self, query: str) -> str:
-    expanded_query = await self.rewrite_chain.ainvoke(...)  # LLM ×1
-    docs = await self.retriever_docs(expanded_query)
-    docs = await self._rerank(expanded_query, docs)         # LLM ×1
-    return 格式化原始片段
+### 7. 异步记忆提纯
 
-# rag_summarize(query) — 检索 + 最终 LLM 总结
-# 保留用于直接调用场景（不经过 Supervisor）
-async def rag_summarize(self, query: str) -> str:
-    context = await self.retrieve_context(query)
-    return await self.chain.ainvoke({"input": query, "context": context})  # LLM ×1
-```
+图谱提纯是重操作（LLM 调用），通过 `asyncio.create_task` fire-and-forget 触发，不阻塞对话响应。
 
-```python
-# RRF 公式: score(d) = Σ 1/(k + rank(d))，k=60
-def _rrf_fuse(self, docs1, docs2):
-    for rank, doc in enumerate(docs1, 1):
-        doc_scores[key] += 1 / (self.rrf_k + rank)
-    for rank, doc in enumerate(docs2, 1):
-        doc_scores[key] += 1 / (self.rrf_k + rank)
-    return sorted by score
-```
+### 8. 分阶段出卷并发
 
-流程：Query Rewrite → BM25 + 向量并行检索 → RRF 融合（可选重排）
-
-### 5. 图片并发处理
-
-PDF/PPT 内每张图片都需要调用视觉模型。串行调用在图多时极慢（150 张 ≈ 150 次串行等待）。
-
-```python
-# vector_store.py — _enrich_images()
-async def _describe_one(blob, context, label):
-    loop = asyncio.get_event_loop()
-    # 同步视觉模型调用放入线程池，不阻塞事件循环
-    desc = await loop.run_in_executor(None, _summarize_image, blob, context)
-    return label, desc
-
-# 所有图片并发处理
-results = await asyncio.gather(*tasks, return_exceptions=True)
-```
-
-### 6. 文档按页解析
-
-自定义解析器按页生成 Document，页面边界不会被 splitter 打破，避免跨页知识点混入同一 chunk。Unstructured 作为兜底仅在自定义解析失败时启用。
-
-```python
-# 每页独立 Document → splitter 切割时天然隔离
-for page_num in range(len(doc)):
-    page = doc.load_page(page_num)
-    ...
-    documents.append(Document(page_content=..., metadata={"page": page_num+1}))
-```
-
-### 7. SQLite 持久化 + 异步写入
-
-会话数据（对话历史、图谱节点）持久化到本地 `sessions.db`，重启不丢失。写入通过 `run_in_executor` 放入线程池，不阻塞事件循环。首次启动自动迁移旧 `sessions.json` 数据。
-
-```python
-# memory_service.py — 异步写入 SQLite
-async def _persist(self, session_id: str):
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(
-        None, partial(_save_session_sync, self.db, session_id, session)
-    )
-
-# 启动时同步加载，之后所有写操作全异步
-self.store = _load_all_sync(self.db)   # __init__ 一次性加载到内存
-await self._persist(session_id)        # 每次变更异步落盘
-```
-
-### 8. 异步记忆提纯
-
-图谱提纯是重操作（LLM 调用），不能阻塞对话响应。
-
-```python
-# memory_service.py
-async def add_message(self, session_id, role, content):
-    ...
-    if len(session["trash"]) >= self.trash_threshold * 2:
-        asyncio.create_task(self._trigger_background_distillation(session_id))
-        # fire-and-forget，立即返回，不等待提纯完成
-```
+exam_agent 将试卷按题型分为 choice / fill_judge / essay 三个 stage 并行出题，各 stage 独立执行 Reflexion 链路，合并后交付。`exam_fast_mode` 参数控制 Critique 是否启用完整 LLM 质量审查。
 
 ---
 
@@ -377,10 +268,12 @@ async def add_message(self, session_id, role, content):
 | POST | `/api/chat/session` | 创建新会话 |
 | PUT | `/api/chat/session/{id}` | 重命名会话 |
 | DELETE | `/api/chat/session/{id}` | 销毁会话及知识库 |
-| GET | `/api/chat/messages` | 获取会话消息历史（调试/管理接口） |
-| GET | `/api/chat/practice/history` | 获取练习历史明细（含对错、错因） |
+| GET | `/api/chat/messages` | 获取会话消息历史 |
+| DELETE | `/api/chat/message` | 删除单条消息（按 timestamp） |
+| DELETE | `/api/chat/messages` | 清空会话消息历史 |
+| GET | `/api/chat/practice/history` | 获取练习历史明细 |
 | DELETE | `/api/chat/practice/history/item` | 删除单条练习历史 |
-| DELETE | `/api/chat/practice/history` | 清空当前会话练习历史 |
+| DELETE | `/api/chat/practice/history` | 清空练习历史 |
 | GET | `/api/chat/tokens` | 算力消耗统计 |
 
 ### 知识库
@@ -388,10 +281,10 @@ async def add_message(self, session_id, role, content):
 | 方法 | 路径 | 描述 |
 |------|------|------|
 | POST | `/api/knowledge/upload` | 上传课件（最多5个，后台向量化） |
-| GET | `/api/knowledge/list` | 已上传文件列表（含 processing/completed/failed 状态） |
-| POST | `/api/knowledge/retry-failed` | 重试当前会话中失败文件 |
-| DELETE | `/api/knowledge/file/{filename}` | 删除上传文件并同步删除其向量/状态 |
-| POST | `/api/knowledge/sample/upload` | 上传样卷（学习试卷风格） |
+| GET | `/api/knowledge/list` | 已上传文件列表（含状态） |
+| POST | `/api/knowledge/retry-failed` | 重试失败文件 |
+| DELETE | `/api/knowledge/file/{filename}` | 删除文件及向量 |
+| POST | `/api/knowledge/sample/upload` | 上传样卷 |
 | GET | `/api/knowledge/sample` | 获取样卷格式 |
 | DELETE | `/api/knowledge/sample` | 删除样卷 |
 
@@ -399,8 +292,8 @@ async def add_message(self, session_id, role, content):
 
 | 方法 | 路径 | 描述 |
 |------|------|------|
-| POST | `/api/exam/format` | 格式化试卷（添加难度、分值等元信息） |
-| POST | `/api/exam/export/docx` | 导出试卷为 Word |
+| POST | `/api/exam/format` | 格式化试卷 |
+| POST | `/api/exam/export/docx` | 导出试卷 Word |
 | POST | `/api/exam/answersheet` | 生成答案卷 Word |
 | GET | `/api/exam/download/{filename}` | 下载导出文件 |
 | GET | `/health` | 服务健康检查 |
@@ -417,36 +310,32 @@ async def add_message(self, session_id, role, content):
 
 ## 七、配置说明
 
-### `config/chroma.yml` — 检索参数（改此文件即生效）
+### `config/chroma.yml`
 
 ```yaml
 chunk_size: 1000        # 分块大小（字符数）
-chunk_overlap: 200      # 分块重叠
+chunk_overlap: 200       # 分块重叠
 k: 8                    # 向量检索 top-k
-
 retrieve_top_k: 10      # 混合检索召回数量
-rerank_final_k: 8       # 最终返回数量
-rrf_k: 60               # RRF 公式参数
-mmr_enabled: true       # 是否启用 MMR 多样性检索
-mmr_lambda: 0.5         # 0=多样性, 1=相关性
+rerank_final_k: 8      # 最终返回数量
+rrf_k: 60              # RRF 公式参数
+mmr_enabled: true      # 是否启用 MMR 多样性检索
+mmr_lambda: 0.5        # 0=多样性, 1=相关性
 ```
 
-### `config/rag.yml` — 模型配置
+### `config/rag.yml`
 
 ```yaml
 chat_model_name: MiniMax-M2.7        # 主对话模型
-light_model_name: MiniMax-M2.7       # 轻量路由模型
+light_model_name: MiniMax-M2.7      # 轻量路由模型
 embedding_model_name: text-embedding-v3
 vision_model_name: qwen-vl-max        # 图片理解模型
 max_tokens: 32768
 ```
 
-### `config/agent.yml` — Agent 行为
+### `config/prompts.yml`
 
-```yaml
-web_search:
-  enabled: true    # DuckDuckGo 联网搜索开关（agent_tools.py 中定义，按需启用）
-```
+提示词路径映射，由 `prompt_loader.py` 在首次调用时懒加载并缓存。
 
 ---
 
@@ -465,12 +354,10 @@ pip install -r requirements.txt
 ```bash
 # .env
 MINIMAX_API_KEY=your_minimax_api_key
+# 可选：Qwen API Key（同时配置则支持多模型）
 ```
 
-说明：当前实现会在启动时自动读取项目根目录 `.env`（`model/factory.py`），
-因此不需要把密钥写入系统环境变量，也不强制要求 `uvicorn --env-file`。
-
-> 使用其他模型只需修改 `model/factory.py` 中的 `ChatModelFactory`，接口兼容 OpenAI 标准。
+> 项目根目录 `.env` 会在启动时自动读取（`model/factory.py`）。使用其他模型只需修改 `model/factory.py` 中的模型工厂，接口兼容 OpenAI 标准。
 
 ### 3. 启动服务
 
@@ -492,51 +379,31 @@ cd react && npm install && npm run dev
 
 **Q: 多轮对话中追问如何正确路由？**
 
-Supervisor prompt 注入 `{recent_history}`（最近 N 条对话格式化为"学生/助手"文本）。追问"再出 3 道"时 Supervisor 能看到上一轮是出题请求，从而正确路由到 quiz 而非 rag。每条消息截断 200 字防止 prompt 过长。
+Supervisor prompt 注入 `{recent_history}`（最近 N 条对话格式化为"学生/助手"文本）。追问"再出 3 道"时 Supervisor 能看到上一轮是出题请求，从而正确路由到 quiz 而非 rag。
 
 **Q: RAG 路径有几次 LLM 调用？**
 
-当前默认链路中，`retrieve_context` 只做 Query Rewrite + 混合检索 + 上下文拼接，不再执行 LLM Rerank；RAG 问答由 SubAgent 再调用一次 LLM 生成最终回答。`rag_summarize` 保留为“检索+总结”接口。
-
-**Q: SQLite 写入策略？**
-
-正常追加消息走单行 `INSERT`（`_append_message_sync`），不重写历史。只有滑动窗口触发（recent → trash 的 bucket 迁移）时才全量覆写，保证 bucket 状态一致。图谱提纯后的新节点也是追加写。
-
-**Q: 怎么知道 Reflexion 是否真的有效？**
-
-`critique_quiz_node` 在 `reflection_rounds==0` 时把首轮评分存入 `initial_score`。最终日志输出 `评分变化=65 → 82 (+17)`，可逐次积累判断 Reflexion 修订有无实质提升，还是 Critic 大多直接放行（轮次=0 占比高）。
-
-**Q: 持久化怎么做的？**
-
-会话数据存 SQLite（stdlib `sqlite3`，无额外依赖）。启动时同步加载全量数据到内存 `store` 字典作为读缓存，每次变更通过 `run_in_executor` 异步写回 SQLite，不阻塞事件循环。ChromaDB 向量库自带持久化。首次启动自动检测并迁移旧 JSON 数据。
-
-**Q: 整体架构是什么？**
-
-两层 LangGraph 工作流。外层：Supervisor 节点分析意图，`add_conditional_edges` 路由到 6 个 SubAgent（RAG/出题/出卷/规划/历史分析/闲聊）。内层（出题/出卷）：Reflexion 架构，Generate+推理链 → Critic质疑推理 → Revise修订，最多 2 轮。
+`retrieve_context` 只做 Query Rewrite + 混合检索 + 上下文拼接，不再执行 LLM Rerank；RAG 问答由 SubAgent 再调用一次 LLM 生成最终回答。`rag_summarize` 保留为"检索+总结"接口。
 
 **Q: Reflexion 与普通质检有什么区别？**
 
-普通质检只看输出对不对（"答案是否来自课件"）。Reflexion 要求 Agent 1 先显式写出推理链，Critic 质疑的是推理链声明是否成立，Revise 必须逐条回应批评并给出修改说明。这样使 Agent 的内部推理过程变得可审计、可批评、可改进。
+普通质检只看输出对不对。Reflexion 要求 Agent 1 先显式写出推理链，Critic 质疑的是推理链声明是否成立，Revise 必须逐条回应批评并给出修改说明。这样使 Agent 的内部推理过程变得可审计、可批评、可改进。
 
-**Q: 如何防止大模型幻觉？**
+**Q: 怎么知道 Reflexion 是否真的有效？**
 
-两层防御：① Supervisor 路由到 RAG SubAgent 时，系统 prompt 强制"只能基于课件回答"；② Reflexion Critic 专门核实每道题的推理链引用是否与课件原文一致，发现引用错误触发 Revise 修订循环。
+`critique_quiz_node` 在首轮（`reflection_rounds==0`）执行后将评分存入 `initial_score`。最终日志输出评分变化，可逐次积累判断 Reflexion 修订有无实质提升。
 
 **Q: Session 隔离怎么实现的？**
 
-`ContextVar` 在协程粒度绑定 session_id，从请求入口一直透传到 ChromaDB Collection 选择，无需层层传参，且天然隔离并发用户。Supervisor SubAgent 节点在调用 RAG 前都会显式 `current_session_id.set(sid)` 确保在新协程栈中也能正确拿到。
+`ContextVar` 在协程粒度绑定 session_id，从请求入口一直透传到 ChromaDB Collection 选择，无需层层传参，且天然隔离并发用户。
 
-**Q: SSE 流式输出中如何处理 Supervisor 的路由 JSON？**
+**Q: 出题/出卷结果如何渲染到前端？**
 
-当前实现使用 `supervisor_workflow.ainvoke()` 拿到最终结构化结果，再通过统一消息协议输出 SSE 事件：`start / delta / complete`。前端只消费协议字段，不再暴露 Supervisor 原始路由 JSON。
+SubAgent 返回结构化对象（`kind/render_mode/payload/text`），后端通过 `api/message_protocol.py` 组装后在 `complete` 事件下发，前端据 `kind` 渲染为题卡（quiz_set）或试卷画布（exam_paper）。
 
-**Q: 出题/出卷结果如何从 SSE 输出？**
+**Q: exam_fast_mode 是什么？**
 
-出题/出卷 SubAgent 返回结构化对象（`kind/render_mode/payload/text`），后端通过 `api/message_protocol.py` 组装后在 `complete` 事件一次下发，前端据 `kind` 渲染为题卡或试卷画布；普通聊天仍通过 `delta` 做伪流式输出。
-
-**Q: 多 Agent 出题系统 LLM 调用次数？**
-
-最优路径：2 次（Generate × 1 + Critique × 1，直接通过）。最多：6 次（Generate × 1 + Critique × 3 + Revise × 2，走满 2 轮修订后第 3 次 Critique 因 rounds≥2 强制结束）。触发修订的条件是三选一：`overall_score < 70`、存在 high severity 推理缺陷、或 `approved=False`，避免不必要的循环。
+控制出卷链路中 Critique 的路径：开启时（默认）仅做格式检查，通过则跳过 LLM Critique；关闭时始终启用完整 LLM Critique（含 4 个质量门：总分偏差、难度梯度、长度方差、简答考点多样性）。
 
 **Q: 如何扩展到更大规模？**
 
@@ -546,77 +413,3 @@ Supervisor prompt 注入 `{recent_history}`（最近 N 条对话格式化为"学
 | ChromaDB | 换用 Milvus / Qdrant |
 | 单进程 FastAPI | Gunicorn 多 Worker + Nginx |
 | 模型费用 | 接入语义缓存 + 小模型做 Supervisor 路由 |
-
----
-
-## 十、已知待改进点
-
-> 以下问题真实存在于当前代码中，列出便于后续迭代。
-
-### 1. ~~Supervisor 路由不感知多轮对话~~ ✅ 已修复
-
-`SUPERVISOR_PROMPT` 现已注入 `{recent_history}`，将最近 N 条对话格式化为"学生/助手"文本传入。追问如"再出 3 道"、"换成判断题"能被正确感知并路由。
-
-### 2. ~~RAG SubAgent 存在冗余 LLM 调用~~ ✅ 已修复
-
-新增 `RagSummarizeService.retrieve_context(query)` 方法，只做检索（Query Rewrite + RRF + Rerank），返回格式化原始课件片段，不做最终 LLM 总结。`rag_subagent_node` 和 `quiz_agent` 的 `get_rag_context` 均改用此方法，RAG 路径从 4 次 LLM 调用减为 2 次（Query Rewrite + Rerank），最终回答由 SubAgent 的一次 LLM 调用完成。
-
-### 3. ~~并发图片处理无速率限制~~ ✅ 已修复
-
-`asyncio.gather(*tasks)` 对文档中所有图片同时发起视觉模型 API 请求，无并发上限。图片密集的课件（如每页含多张图的 PPT）会在短时间内打出大量并发请求，容易触发 API rate limit 报错。
-
-**修复方案：** `VectorStoreService` 类添加 `MAX_CONCURRENT_IMAGES = 5` 属性，`__init__` 中创建 `asyncio.Semaphore`，`_describe_one` 内部用 `async with self._image_semaphore` 控制并发。现在 100 张图片会排队处理，最多 5 个同时请求 API。
-
-### 4. ~~SQLite 全量覆写~~ ✅ 已修复
-
-`add_message` 在正常追加场景改为单行 `INSERT`（`_append_message_sync`），只在滑动窗口触发（消息 bucket 发生迁移）时才全量覆写。写放大从"每条消息 O(n)"降为"仅在窗口滑动时 O(n)"。
-
-### 5. ~~无法验证 Reflexion 循环的实际效果~~ ✅ 已修复
-
-`critique_quiz_node` / `critique_exam_node` 在首轮（`reflection_rounds==0`）执行后将评分存入 `initial_score` 字段。最终日志格式为：
-
-```
-[Reflexion统计] topic=XX | 修订轮次=1 | 评分变化=65 → 82 (+17) | 高危缺陷=0 | 使用修订版=True
-```
-
-积累若干样本后可定量评估 Reflexion 的实际提升幅度。
-
-### 6. "图谱记忆"命名与实现不符
-
-代码中的长期记忆是 LLM 把对话历史提炼为结构化三元组（subject / relation / object），以列表形式存储。没有图结构、没有节点间的边关系查询、没有路径搜索。对外介绍时称"知识图谱"会引起误解。
-
-实际上它是**结构化摘要记忆**，表达能力介于纯文本摘要和真正的知识图谱之间。
-
-### 7. ~~用户输入无长度限制~~ ✅ 已修复
-
-极长输入可能超出模型 context 限制。
-
-**修复方案：** `chat.py` 入口处 `query = query[:2000]` 截断超长输入。
-
-### 8. ~~session_id 路径穿越风险~~ ✅ 已修复
-
-`session_id` 由前端传入用于构建路径，若包含 `../` 存在路径穿越风险。
-
-**修复方案：** 入口正则校验 `^[a-zA-Z0-9_\-]{1,64}$`，不合规返回 400。
-
-### 9. ~~PPT 标题为 None 时崩溃~~ ✅ 已修复
-
-`slide.shapes.title` 为 None 时访问 `.text` 抛 `AttributeError`。
-
-**修复方案：** 提前获取 `title_text = title_shape.text if title_shape else ""`。
-
-### 10. ~~SQLite 缺索引和 WAL~~ ✅ 已修复
-
-`messages` 和 `graph_nodes` 表按 `session_id` 查询无索引，默认日志模式并发性能差。
-
-**修复方案：** `_create_tables()` 添加 `PRAGMA journal_mode=WAL` 和 `CREATE INDEX`。
-
-### 11. ~~文件上传无去重~~ ✅ 已实现
-
-`load_document()` 已有 `chunk_md5_hex()` 和 `save_md5_hex()` 函数，入库前检查 MD5 存在则跳过。
-
-### 12. ~~缺少已上传文件删除 API~~ ✅ 已修复
-
-`knowledge.py` 已提供 `DELETE /api/knowledge/file/{filename}`，会同时清理文件、向量映射和状态记录。
-
----
