@@ -70,6 +70,17 @@ interface SimilarQuestion {
   question_id: string;
 }
 
+interface PracticeHistoryRecord {
+  id: number;
+  question_content: string;
+  knowledge_point?: string;
+  user_answer?: string;
+  correct_answer?: string;
+  is_correct: boolean;
+  wrong_reason?: string;
+  created_at: number;
+}
+
 interface Message {
   id: string;
   role: "user" | "assistant";
@@ -1001,63 +1012,59 @@ function SessionHistoryPanel({
   sessionId,
   isOpen,
   onClose,
-  onMessagesChanged,
 }: {
   sessionId: string;
   isOpen: boolean;
   onClose: () => void;
-  onMessagesChanged: () => void;
 }) {
-  const [historyMessages, setHistoryMessages] = useState<Message[]>([]);
+  const [practiceHistory, setPracticeHistory] = useState<PracticeHistoryRecord[]>([]);
   const [loading, setLoading] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
 
-  // Fetch messages when panel opens
+  // Fetch practice history when panel opens
   useEffect(() => {
     if (!isOpen || !sessionId) return;
     setLoading(true);
-    fetch(`/api/chat/messages?session_id=${encodeURIComponent(sessionId)}`)
+    fetch(`/api/chat/practice/history?session_id=${encodeURIComponent(sessionId)}&limit=300`)
       .then(res => res.json())
       .then(data => {
         if (data.code === 200 && Array.isArray(data.data)) {
-          setHistoryMessages(data.data);
+          setPracticeHistory(data.data);
         } else {
-          setHistoryMessages([]);
+          setPracticeHistory([]);
         }
       })
-      .catch(() => setHistoryMessages([]))
+      .catch(() => setPracticeHistory([]))
       .finally(() => setLoading(false));
   }, [isOpen, sessionId]);
 
-  const handleDeleteMessage = async (timestamp: number) => {
-    setDeletingId(String(timestamp));
+  const handleDeleteRecord = async (recordId: number) => {
+    setDeletingId(String(recordId));
     try {
-      const res = await fetch("/api/chat/message", {
+      const res = await fetch("/api/chat/practice/history/item", {
         method: "DELETE",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId, timestamp }),
+        body: JSON.stringify({ session_id: sessionId, record_id: recordId }),
       });
       const data = await res.json();
       if (data.code === 200) {
-        setHistoryMessages(prev => prev.filter(m => m.timestamp !== timestamp));
-        onMessagesChanged();
+        setPracticeHistory(prev => prev.filter(r => r.id !== recordId));
       }
     } catch { /* ignore */ }
     setDeletingId(null);
   };
 
   const handleClearAll = async () => {
-    if (!confirm("确定清空当前会话的所有历史记录？此操作不可恢复。")) return;
+    if (!confirm("确定清空当前会话的所有练习历史？此操作不可恢复。")) return;
     setClearing(true);
     try {
-      const res = await fetch(`/api/chat/messages?session_id=${encodeURIComponent(sessionId)}`, {
+      const res = await fetch(`/api/chat/practice/history?session_id=${encodeURIComponent(sessionId)}`, {
         method: "DELETE",
       });
       const data = await res.json();
       if (data.code === 200) {
-        setHistoryMessages([]);
-        onMessagesChanged();
+        setPracticeHistory([]);
       }
     } catch { /* ignore */ }
     setClearing(false);
@@ -1071,11 +1078,11 @@ function SessionHistoryPanel({
         {/* Header */}
         <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50 flex-shrink-0">
           <div>
-            <h3 className="text-sm font-bold text-slate-900">历史记录</h3>
-            <p className="text-xs text-slate-400 font-mono mt-0.5">{historyMessages.length} 条消息</p>
+            <h3 className="text-sm font-bold text-slate-900">练习历史</h3>
+            <p className="text-xs text-slate-400 font-mono mt-0.5">{practiceHistory.length} 条记录</p>
           </div>
           <div className="flex items-center gap-2">
-            {historyMessages.length > 0 && (
+            {practiceHistory.length > 0 && (
               <button
                 onClick={handleClearAll}
                 disabled={clearing}
@@ -1092,48 +1099,47 @@ function SessionHistoryPanel({
           </div>
         </div>
 
-        {/* Message list */}
+        {/* Practice history list */}
         <div className="flex-1 overflow-y-auto p-4">
           {loading ? (
             <div className="text-center py-8 text-xs text-slate-400">加载中...</div>
-          ) : historyMessages.length === 0 ? (
+          ) : practiceHistory.length === 0 ? (
             <div className="text-center py-8">
               <div className="w-10 h-10 mx-auto mb-3 rounded-full bg-slate-100 flex items-center justify-center">
                 <svg className="w-5 h-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                 </svg>
               </div>
-              <p className="text-xs text-slate-500">暂无历史消息</p>
+              <p className="text-xs text-slate-500">暂无练习记录</p>
             </div>
           ) : (
             <div className="space-y-2">
-              {[...historyMessages].reverse().map((msg) => (
+              {practiceHistory.map((rec) => (
                 <div
-                  key={msg.timestamp}
+                  key={rec.id}
                   className={`group relative rounded-lg border px-3 py-2.5 transition-all ${
-                    msg.role === "user"
-                      ? "bg-blue-50 border-blue-100"
-                      : "bg-white border-slate-200"
+                    rec.is_correct ? "bg-emerald-50 border-emerald-100" : "bg-amber-50 border-amber-100"
                   }`}
                 >
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-2 min-w-0 flex-1">
                       <span className={`flex-shrink-0 text-xs font-bold px-1.5 py-0.5 rounded ${
-                        msg.role === "user"
-                          ? "bg-blue-200 text-blue-800"
-                          : "bg-teal-100 text-teal-800"
+                        rec.is_correct ? "bg-emerald-200 text-emerald-800" : "bg-amber-200 text-amber-800"
                       }`}>
-                        {msg.role === "user" ? "我" : "AI"}
+                        {rec.is_correct ? "正确" : "错题"}
                       </span>
                       <span className="text-[11px] font-mono text-slate-400 flex-shrink-0">
-                        {new Date(msg.timestamp).toLocaleString()}
+                        {new Date(rec.created_at * 1000).toLocaleString()}
                       </span>
+                      {rec.knowledge_point && (
+                        <span className="text-[11px] text-slate-500 truncate max-w-[180px]">{rec.knowledge_point}</span>
+                      )}
                     </div>
                     <button
-                      onClick={() => handleDeleteMessage(msg.timestamp)}
-                      disabled={deletingId === String(msg.timestamp)}
+                      onClick={() => handleDeleteRecord(rec.id)}
+                      disabled={deletingId === String(rec.id)}
                       className="flex-shrink-0 p-1 text-slate-300 hover:text-red-500 rounded transition-all opacity-0 group-hover:opacity-100 disabled:opacity-50"
-                      title="删除此消息"
+                      title="删除此记录"
                     >
                       <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
@@ -1141,8 +1147,15 @@ function SessionHistoryPanel({
                     </button>
                   </div>
                   <p className="text-xs text-slate-700 mt-1.5 line-clamp-2 leading-relaxed">
-                    {msg.content.slice(0, 200)}{msg.content.length > 200 ? "..." : ""}
+                    {String(rec.question_content || "").slice(0, 200)}
+                    {String(rec.question_content || "").length > 200 ? "..." : ""}
                   </p>
+                  <div className="mt-1 text-[11px] text-slate-500">
+                    你的答案：{rec.user_answer || "未填写"} | 正确答案：{rec.correct_answer || "未知"}
+                  </div>
+                  {!rec.is_correct && rec.wrong_reason && (
+                    <div className="mt-1 text-[11px] text-amber-700">错因：{rec.wrong_reason}</div>
+                  )}
                 </div>
               ))}
             </div>
@@ -1579,10 +1592,16 @@ export default function ChatPage() {
     }]);
 
     try {
+      const requestBody = {
+        query: outgoingText,
+        session_id: currentSession,
+        exam_fast_mode: examFastMode, // 隐式透传，不在前端回复中展示
+        ...(extraBody || {}),
+      };
       const response = await fetch("/api/chat/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: outgoingText, session_id: currentSession, ...(extraBody || {}) })
+        body: JSON.stringify(requestBody)
       });
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
@@ -2009,7 +2028,14 @@ export default function ChatPage() {
             上传课件
           </button>
           <button
-            onClick={() => { setExamFastMode(f => !f); showToast(examFastMode ? "已关闭快速模式，将启用完整 LLM Critique" : "已开启快速模式，跳过内容质量审查", "info"); }}
+            onClick={() => {
+              const wasFast = examFastMode;
+              setExamFastMode(f => !f);
+              showToast(wasFast
+                ? "已关闭快速模式，将启用完整 LLM Critique"
+                : "已开启完整模式，将启用完整 LLM Critique",
+                "info");
+            }}
             title={examFastMode ? "快速模式：跳过内容审查" : "完整模式：启用 LLM Critique"}
             className={`group relative px-3 py-1.5 text-xs font-medium border rounded-md transition-all ease-out duration-200 ${
               examFastMode
@@ -2362,10 +2388,6 @@ export default function ChatPage() {
         sessionId={currentSession}
         isOpen={showHistoryPanel}
         onClose={() => setShowHistoryPanel(false)}
-        onMessagesChanged={() => {
-          setMessages([]);
-          loadSessionMessages(currentSession);
-        }}
       />
       <ToastContainer />
 
