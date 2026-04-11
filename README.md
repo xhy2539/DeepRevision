@@ -22,7 +22,7 @@
 | 📥 多格式课件摄入 | PDF / Word / PPT / TXT / 图片，按页解析，图片内容通过多模态模型并发理解 |
 | 🔍 混合检索 | Query Rewrite + BM25 + 向量检索 RRF 融合（支持可选重排） |
 | 🤖 Supervisor 多 Agent | LangGraph Supervisor 分析意图 → 路由到专业 SubAgent（RAG / 出题 / 出卷 / 规划 / 历史分析 / 闲聊） |
-| 📝 Reflexion 出题 | LangGraph Reflexion 架构：出题 + 推理链 → Critic 质疑推理 → Revise 针对批评修订（最多 2 轮） |
+| 📝 Reflexion 出题 | LangGraph Reflexion 架构：出题 + 推理链 → Critic 标记问题 → Revise 修订并交付（试卷默认最多 1 轮修订） |
 | 🧠 双轨记忆 | 短期滑窗 + 后台异步图谱提纯，SQLite 本地持久化，重启不丢失 |
 | 📄 试卷导出 | 生成完整试卷并导出 Word |
 | 🗂️ 多科目隔离 | ContextVar + ChromaDB Collection，每科目独立知识库 |
@@ -34,6 +34,12 @@
 - 出卷链路默认并发上限为 2，并加入结构化失败时的分批文本补题兜底，避免单批超时导致整卷空白。
 - 知识库上传状态改为持久化 `ingest_status.json`（`processing/completed/failed`），并支持失败文件一键重试。
 - 新增健康检查接口：`GET /health`。
+
+### 最近更新（2026-04-11）
+
+- 前端“快速/完整”开关已隐式透传 `exam_fast_mode` 到所有聊天请求（含手动输入），不在用户回复中额外展示模式字段。
+- 前端“历史”面板已切换为**练习历史管理**（不再是会话消息管理），可查看对错、知识点、错因，并支持删除单条/清空练习记录。
+- 试卷 Reflexion 链路已放宽为 `generate -> critique -> revise -> end`，去除 `revise -> critique` 回环；Critique 以“标记需修订”为主，减少硬阻断导致的长等待。
 
 ---
 
@@ -116,13 +122,13 @@ Agent 2: Critic（质疑推理链）
   - 逐条核实推理链声明 vs. 课件原文
   - 输出 approved / overall_score / reasoning_flaws / specific_issues
    │
-  需要修订？（满足任一：overall_score<70 / 存在high severity缺陷 / approved=False）
-  rounds >= 2？（强制结束）
-  ├── 通过或已达2轮 → END（输出最终题目）
-  └── 需修订且未到2轮 → Agent 3: Revise
+  需要修订？（存在可执行问题：数量/编号/高危缺陷等）
+  rounds >= 1？（试卷链路强制结束）
+  ├── 通过或已达轮次上限 → END（输出最终题目）
+  └── 需修订且未到上限 → Agent 3: Revise
                - 针对每条批评逐条修订
                - 输出 revised_quiz / revision_notes / addressed_issues
-               └── 回到 Critic（最多 2 轮）
+               └── 直接 END（不再回到 Critic）
 ```
 
 > Reflexion 核心：推理链（Chain of Thought）显式化，Critic 质疑的是推理过程而非最终输出，Revise 必须逐条回应批评并说明修改依据。
@@ -371,7 +377,10 @@ async def add_message(self, session_id, role, content):
 | POST | `/api/chat/session` | 创建新会话 |
 | PUT | `/api/chat/session/{id}` | 重命名会话 |
 | DELETE | `/api/chat/session/{id}` | 销毁会话及知识库 |
-| GET | `/api/chat/messages` | 获取会话消息历史 |
+| GET | `/api/chat/messages` | 获取会话消息历史（调试/管理接口） |
+| GET | `/api/chat/practice/history` | 获取练习历史明细（含对错、错因） |
+| DELETE | `/api/chat/practice/history/item` | 删除单条练习历史 |
+| DELETE | `/api/chat/practice/history` | 清空当前会话练习历史 |
 | GET | `/api/chat/tokens` | 算力消耗统计 |
 
 ### 知识库
