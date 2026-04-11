@@ -292,6 +292,15 @@ const quizTypeStyles: Record<string, { tag: string; border: string; bg: string }
   "简答题": { tag: "quiz-tag-short", border: "border-l-purple-500", bg: "bg-purple-50" },
 };
 
+function stripChoiceOptionPrefix(text: string): string {
+  let s = String(text || "");
+  // 第一遍：去掉开头的前缀标记（字母+分隔符，可重复）
+  s = s.replace(/^([A-D][.、．:：)\s]+)+/i, "");
+  // 第二遍：处理残留的 "A xxx" 格式（上一个 replace 没处理干净的情况）
+  s = s.replace(/^[A-D][.、．:：)\s]+/i, "");
+  return s.trim();
+}
+
 function QuizCard({
   questions,
   defaultShowAnswers = false,
@@ -350,7 +359,7 @@ function QuizCard({
                     <span className="w-5 h-5 rounded bg-slate-100 flex items-center justify-center text-xs font-medium text-slate-500 flex-shrink-0">
                       {String.fromCharCode(65 + optIdx)}
                     </span>
-                    <span>{opt.replace(/^[A-D][.、\s]+/, "")}</span>
+                    <span>{stripChoiceOptionPrefix(opt)}</span>
                   </div>
                 ))}
               </div>
@@ -427,42 +436,7 @@ function MarkdownContent({
       ? payload.questions
       : parsedQuiz.questions;
     if (questions.length > 0) {
-      // 转换为 ExamCanvas 格式，支持练习模式
-      const examData: QuizExamData = {
-        title: payload?.title || "练习题",
-        subtitle: "",
-        total_score: questions.reduce((sum, q) => sum + (typeof q.score === "string" ? parseInt(q.score, 10) || 0 : q.score || 0), 0),
-        total_questions: questions.length,
-        question_types: {},
-        questions: questions.map((q, idx) => {
-          const normalizedOptions = (q.options || []).map((opt, i) => {
-            const text = String(opt || "").trim();
-            if (/^[A-D][.、]\s*/.test(text)) return text;
-            return `${String.fromCharCode(65 + i)}. ${text}`;
-          });
-          return {
-            number: idx + 1,
-            type: q.type,
-            content: normalizedOptions.length > 0
-              ? q.question + "\n" + normalizedOptions.join("\n")
-              : q.question,
-            answer: q.answer || "",
-            analysis: q.explanation || "",
-            score: typeof q.score === "string" ? parseInt(q.score, 10) || 2 : q.score || 2,
-            difficulty: q.difficulty || "中等",
-          };
-        }),
-      };
-      return (
-        <ExamCanvas
-          examContent=""
-          examDataOverride={examData}
-          courseName={payload?.title || "练习"}
-          onRequestAnswers={onRequestAnswers}
-          similarQuestions={similarQuestions}
-          onPracticeComplete={onPracticeComplete}
-        />
-      );
+      return <QuizCard questions={questions} />;
     }
   }
 
