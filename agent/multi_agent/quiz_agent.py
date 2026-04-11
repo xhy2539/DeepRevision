@@ -9,6 +9,7 @@ import json
 import re
 import asyncio
 import time
+import random
 from typing import Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel
 
@@ -432,8 +433,19 @@ def _extract_topics_from_rag_context(context: str, limit: int = 20) -> List[str]
             return False
         if t in GENERIC_TOPIC_STOPWORDS:
             return False
+        # 过滤“叙述句式开头”的残片，如“如何作为用户与内核之”
+        bad_prefixes = (
+            "这些", "这是", "那个", "这个", "如何", "记住", "表示", "实现", "支持",
+            "用于", "提供", "决定", "作为", "通过", "可以", "能够", "需要", "负责",
+        )
+        if t.startswith(bad_prefixes):
+            return False
         # 考点名称需在 3-12 字之间（太短如"进程"无区分度，太长如完整句子）
         if len(t) < 3 or len(t) > 12:
+            return False
+        # 过滤明显半截短语尾巴（常见于上下文被截断）
+        bad_suffixes = ("之", "的", "和", "与", "及", "等", "最", "中", "上", "下", "该", "其", "之间")
+        if t.endswith(bad_suffixes):
             return False
         # 过滤纯句子残片/连接词残片
         if re.search(r'(这些|那个|这个|其中|因此|所以|负责|支持|构成|作为|之间的|系统的)$', t):
@@ -498,11 +510,20 @@ def _build_dynamic_exam_topics(base_topics: List[str], context: str, total_quest
             continue
         seen.add(t)
         merged.append(t)
-        if len(merged) >= required:
-            break
+    # 可控随机：保留前部高相关考点，打散后部候选，避免每次几乎同一考点池
+    if merged:
+        rng = random.Random(f"{current_session_id.get() or 'default'}:{time.time_ns()}:{len(context)}:{total_questions}")
+        stable_head_size = min(max(4, required // 4), len(merged))
+        head = merged[:stable_head_size]
+        tail = merged[stable_head_size:]
+        rng.shuffle(tail)
+        merged = (head + tail)[:required]
 
     if len(merged) < 6:
-        for t in _default_comprehensive_topics():
+        defaults = list(_default_comprehensive_topics())
+        rng2 = random.Random(f"defaults:{current_session_id.get() or 'default'}:{time.time_ns()}")
+        rng2.shuffle(defaults)
+        for t in defaults:
             if t not in seen:
                 merged.append(t)
                 seen.add(t)
@@ -517,7 +538,10 @@ def _is_generic_topic_request(topic: str) -> bool:
     if not keywords:
         return True
     # 仅包含高度通用词时视为泛化请求
-    generic_signals = ["核心知识点", "课件", "练习题", "出题", "试卷", "综合测试"]
+    generic_signals = [
+        "核心知识点", "课件", "练习题", "出题", "试卷", "综合测试",
+        "本课程重点知识点",   # 回退 topic，直接跳过 relevance check
+    ]
     if any(sig in text for sig in generic_signals) and len(keywords) <= 1:
         return True
     return False
@@ -554,6 +578,23 @@ def _extract_courseware_evidence(context: str, max_items: int = 8) -> List[str]:
         return []
     matches = re.findall(r'\[参考资料\d+\]:参考资料:(.*?)\|参考元数据:', context, flags=re.DOTALL)
     snippets: List[str] = []
+
+    def _truncate_on_sentence_boundary(text: str, limit: int = 120) -> str:
+        src = str(text or "").strip()
+        if len(src) <= limit:
+            return src
+        head = src[:limit]
+        # 优先回退到最近句末，避免“句子腰斩”污染后续考点抽取
+        end_marks = [head.rfind(ch) for ch in ["。", "；", "！", "？", ".", ";", "!", "?"]]
+        cut = max(end_marks) if end_marks else -1
+        if cut >= 24:
+            return head[: cut + 1].strip()
+        # 次优：回退到逗号
+        comma_cut = max(head.rfind("，"), head.rfind(","))
+        if comma_cut >= 20:
+            return head[:comma_cut].strip()
+        return head.strip()
+
     for raw in matches:
         cleaned = re.sub(r'\s+', ' ', str(raw)).strip()
         # 过滤页码线、markdown 表格残片、无意义分隔符
@@ -573,7 +614,7 @@ def _extract_courseware_evidence(context: str, max_items: int = 8) -> List[str]:
             continue
         if not re.search(r'[\u4e00-\u9fa5A-Za-z]{6,}', cleaned):
             continue
-        cleaned = cleaned[:120]
+        cleaned = _truncate_on_sentence_boundary(cleaned, limit=120)
         if cleaned not in snippets:
             snippets.append(cleaned)
         if len(snippets) >= max_items:
@@ -906,17 +947,28 @@ async def _ensure_single_type_questions(
     if shared_topic_usage is not None:
         for t in topic_pool:
             local_usage[t] = int(shared_topic_usage.get(t, 0))
+    topic_rng = random.Random(
+        f"{current_session_id.get() or 'default'}:{quiz_type}:{start_num}:{num}:{time.time_ns()}"
+    )
 
     async def pick_batch_topics(batch_num: int) -> str:
         if not topic_pool:
             return topics
 
         async def _select_with_usage(usage: Dict[str, int]) -> str:
-            ordered = sorted(topic_pool, key=lambda x: (usage.get(x, 0), len(x)))
+            # 按使用次数分层，并在同层内随机打散，兼顾覆盖与随机性
+            buckets: Dict[int, List[str]] = {}
+            for item in topic_pool:
+                buckets.setdefault(int(usage.get(item, 0)), []).append(item)
+            ordered: List[str] = []
+            for level in sorted(buckets.keys()):
+                bucket = list(buckets[level])
+                topic_rng.shuffle(bucket)
+                ordered.extend(bucket)
             # 每题至少一个新考点优先：本批先拿 usage=0 的考点
             must_new_count = min(max(1, batch_num), sum(1 for t in ordered if usage.get(t, 0) == 0))
             must_new = [t for t in ordered if usage.get(t, 0) == 0][:must_new_count]
-            candidates = (must_new + ordered)[:max(batch_num + 2, 6)]
+            candidates = (must_new + ordered)[:max(batch_num + 3, 8)]
             # 预占用（调度层），保证并发阶段也能轮到新考点
             for t in must_new:
                 usage[t] = int(usage.get(t, 0)) + 1
@@ -2265,10 +2317,15 @@ async def critique_exam_node(state: ExamPaperState) -> ExamPaperState:
             "flaw": f"题目数量不足：你只生成了{actual['total']}道题，距离要求的{expected}道题还差{expected - actual['total']}道。{_shortage_str}。请补全所有题目！",
             "severity": "high"
         })
-        # 强制 set approved = False
-        critique["approved"] = False
-        if critique.get("overall_score", 100) > 70:
-            critique["overall_score"] = 65
+        critique.setdefault("specific_issues", []).append({
+            "question": "试卷整体",
+            "issue": f"题量或题型分布不达标：{_shortage_str}",
+            "suggestion": "优先补齐缺失题型，再检查编号连续性和总分。",
+        })
+        # 不在 Critique 阶段硬阻断，改为标记需修订并放宽扣分
+        critique["needs_revision"] = True
+        if critique.get("overall_score", 100) > 82:
+            critique["overall_score"] = 78
 
     score = critique.get('overall_score', 80)
     logger.info(f"[Agent2-Critic-试卷] approved={critique.get('approved')}, score={score}, quantity_valid={is_valid}")
@@ -2534,6 +2591,34 @@ def _exam_structural_only_issues(critique: dict) -> bool:
     return len(non_structural_high_flaws) == 0
 
 
+def _exam_needs_revision_relaxed(critique: dict) -> bool:
+    """
+    宽松修订判定：
+    - 不以分数作为硬阻断；
+    - 仅在存在明确可执行问题时进入一次修订。
+    """
+    if not isinstance(critique, dict):
+        return False
+    if bool(critique.get("needs_revision")):
+        return True
+    quantity_check = critique.get("quantity_check", {}) or {}
+    numbering_check = critique.get("numbering_check", {}) or {}
+    if not bool(quantity_check.get("is_valid", True)):
+        return True
+    if not bool(numbering_check.get("is_continuous", True)):
+        return True
+    if critique.get("approved") is False:
+        return True
+    high_flaws = [
+        f for f in (critique.get("reasoning_flaws", []) or [])
+        if str((f or {}).get("severity", "")).lower() == "high"
+    ]
+    if high_flaws:
+        return True
+    issues = critique.get("specific_issues", []) or []
+    return len(issues) > 0
+
+
 def should_revise_quiz(state: QuizState) -> str:
     """最多 2 轮反思；多条件交叉验证决定是否修订"""
     if state.get('reflection_rounds', 0) >= 2:
@@ -2550,7 +2635,8 @@ def should_revise_quiz(state: QuizState) -> str:
 
 
 def should_revise_exam(state: ExamPaperState) -> str:
-    if state.get('reflection_rounds', 0) >= 2:
+    # 试卷链路放宽：最多 1 轮修订，避免 revise->critique 长循环
+    if state.get('reflection_rounds', 0) >= 1:
         return "end"
     if state.get("degrade_reason") in {"budget_exhausted", "revise_timeout", "structural_retry"}:
         return "end"
@@ -2562,7 +2648,7 @@ def should_revise_exam(state: ExamPaperState) -> str:
     critique = state.get('critique', {})
     if _exam_is_usable_without_revision(critique):
         return "end"
-    if _critique_needs_revision(critique):
+    if _exam_needs_revision_relaxed(critique):
         return "revise"
     return "end"
 
@@ -2604,7 +2690,8 @@ def build_exam_graph() -> StateGraph:
         should_revise_exam,
         {"revise": "revise", "end": END}
     )
-    graph.add_edge("revise", "critique")
+    # 放宽链路：修订后直接结束，不再进入二次 Critique 阻断
+    graph.add_edge("revise", END)
 
     return graph.compile()
 
