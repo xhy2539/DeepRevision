@@ -21,6 +21,26 @@ interface QuizQuestion {
   difficulty?: string;
 }
 
+interface StreamSectionAction {
+  name?: string;
+  status?: string;
+  detail?: string;
+  cost_ms?: number;
+}
+
+interface StreamSectionCitation {
+  index?: number;
+  source?: string;
+  quote?: string;
+}
+
+interface StreamSections {
+  reasoning: string;
+  actions: StreamSectionAction[];
+  citations: StreamSectionCitation[];
+  progress: string[];
+}
+
 interface AssistantPayload {
   title?: string;
   show_answers_default?: boolean;
@@ -28,6 +48,7 @@ interface AssistantPayload {
   questions?: QuizQuestion[];
   exam_data?: unknown;
   messageId?: string;
+  stream_sections?: StreamSections;
 }
 
 interface QuizExamData {
@@ -142,6 +163,12 @@ interface RuntimeStreamMetrics {
   stream_error_total: number;
 }
 
+interface RuntimeMetricItem {
+  label: string;
+  value: string;
+  valueClassName?: string;
+}
+
 interface SSEFrame {
   event?: string;
   id?: string;
@@ -194,6 +221,41 @@ function parseSSEFrames(buffer: string): { frames: SSEFrame[]; rest: string } {
   return { frames, rest };
 }
 
+function createEmptyStreamSections(): StreamSections {
+  return {
+    reasoning: "",
+    actions: [],
+    citations: [],
+    progress: [],
+  };
+}
+
+function normalizeStreamSections(value: unknown): StreamSections {
+  if (!value || typeof value !== "object") return createEmptyStreamSections();
+  const raw = value as Record<string, unknown>;
+  const reasoning = typeof raw.reasoning === "string" ? raw.reasoning : "";
+  const actions = Array.isArray(raw.actions)
+    ? raw.actions.filter((item): item is StreamSectionAction => !!item && typeof item === "object")
+    : [];
+  const citations = Array.isArray(raw.citations)
+    ? raw.citations.filter((item): item is StreamSectionCitation => !!item && typeof item === "object")
+    : [];
+  const progress = Array.isArray(raw.progress)
+    ? raw.progress.map((item) => String(item || "")).filter((item) => item.trim().length > 0)
+    : [];
+  return { reasoning, actions, citations, progress };
+}
+
+function hasStreamSections(sections: StreamSections | undefined): boolean {
+  if (!sections) return false;
+  return Boolean(
+    sections.reasoning.trim() ||
+    sections.actions.length > 0 ||
+    sections.citations.length > 0 ||
+    sections.progress.length > 0
+  );
+}
+
 const SESSION_ID_REGEX = /^[\u4e00-\u9fa5a-zA-Z0-9_-]{1,64}$/;
 const isValidSessionId = (sid: string) => SESSION_ID_REGEX.test((sid || "").trim());
 
@@ -227,6 +289,55 @@ function ThoughtChain({ thoughts }: { thoughts: string[] }) {
           <span className="leading-relaxed">{thought}</span>
         </div>
       ))}
+    </div>
+  );
+}
+
+function StreamSectionsPanel({ sections }: { sections: StreamSections }) {
+  if (!hasStreamSections(sections)) return null;
+  return (
+    <div className="mt-3 space-y-2">
+      {sections.reasoning.trim() && (
+        <details className="rounded-lg border border-teal-200 bg-teal-50/40 px-3 py-2" open>
+          <summary className="cursor-pointer text-xs font-semibold text-teal-700">推理摘要</summary>
+          <div className="mt-2 text-xs leading-relaxed text-teal-900 whitespace-pre-wrap">{sections.reasoning}</div>
+        </details>
+      )}
+      {sections.actions.length > 0 && (
+        <details className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+          <summary className="cursor-pointer text-xs font-semibold text-slate-700">执行轨迹</summary>
+          <div className="mt-2 space-y-1 text-xs text-slate-600">
+            {sections.actions.map((action, idx) => (
+              <div key={`${action.name || "action"}-${idx}`}>
+                {`${action.name || "action"} · ${action.status || "running"}${action.detail ? ` · ${action.detail}` : ""}${typeof action.cost_ms === "number" ? ` · ${action.cost_ms}ms` : ""}`}
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+      {sections.citations.length > 0 && (
+        <details className="rounded-lg border border-amber-200 bg-amber-50/40 px-3 py-2">
+          <summary className="cursor-pointer text-xs font-semibold text-amber-700">引用依据</summary>
+          <div className="mt-2 space-y-2 text-xs text-amber-900">
+            {sections.citations.map((citation, idx) => (
+              <div key={`${citation.source || "source"}-${idx}`} className="rounded border border-amber-200 bg-white px-2 py-1">
+                <div className="font-medium">{citation.source || `参考资料${idx + 1}`}</div>
+                {citation.quote ? <div className="mt-1 text-amber-800">{citation.quote}</div> : null}
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+      {sections.progress.length > 0 && (
+        <details className="rounded-lg border border-sky-200 bg-sky-50/40 px-3 py-2">
+          <summary className="cursor-pointer text-xs font-semibold text-sky-700">流程进度</summary>
+          <div className="mt-2 space-y-1 text-xs text-sky-900">
+            {sections.progress.map((item, idx) => (
+              <div key={`progress-${idx}`}>{item}</div>
+            ))}
+          </div>
+        </details>
+      )}
     </div>
   );
 }
@@ -1980,6 +2091,7 @@ export default function ChatPage() {
       timestamp: Date.now(),
       kind: "chat",
       render_mode: "markdown",
+      payload: { stream_sections: createEmptyStreamSections() },
     }]);
 
     let fullContent = "";
@@ -1990,12 +2102,126 @@ export default function ChatPage() {
     let ttftMs: number | null = null;
     let firstDeltaMs: number | null = null;
     let seenNonPendingStart = false;
+    let seenTextDeltaEvent = false;
+    let shouldDrainRenderQueue = true;
+    let renderedContent = "";
+    let liveSections = createEmptyStreamSections();
+    const renderQueue: string[] = [];
+    let renderTimer: ReturnType<typeof setTimeout> | null = null;
+    let drainResolver: (() => void) | null = null;
+
+    const appendAssistantContent = (content: string) => {
+      setMessages(prev => prev.map(m =>
+        m.id === assistantMessageId ? { ...m, content } : m
+      ));
+    };
+
+    const updateAssistantSections = (sections: StreamSections) => {
+      setMessages(prev => prev.map(m => {
+        if (m.id !== assistantMessageId) return m;
+        const payload = (m.payload || {}) as AssistantPayload;
+        return {
+          ...m,
+          payload: {
+            ...payload,
+            stream_sections: sections,
+          },
+        };
+      }));
+    };
 
     const markTtft = () => {
       // TTFT 只取首个有效时刻，避免后续事件覆盖。
       if (ttftMs === null) {
         ttftMs = Date.now() - startTime;
       }
+    };
+
+    const resolveDrainIfIdle = () => {
+      if (renderQueue.length === 0 && renderTimer === null && drainResolver) {
+        const resolver = drainResolver;
+        drainResolver = null;
+        resolver();
+      }
+    };
+
+    const appendRenderedContent = (delta: string) => {
+      if (!delta) return;
+      renderedContent += delta;
+      appendAssistantContent(renderedContent);
+    };
+
+    const forceFlushRenderQueue = (commitRemaining: boolean) => {
+      if (renderTimer !== null) {
+        clearTimeout(renderTimer);
+        renderTimer = null;
+      }
+      if (commitRemaining && renderQueue.length > 0) {
+        const tail = renderQueue.join("");
+        renderQueue.length = 0;
+        appendRenderedContent(tail);
+      } else {
+        renderQueue.length = 0;
+      }
+      resolveDrainIfIdle();
+    };
+
+    const scheduleRenderTick = () => {
+      if (renderTimer !== null) return;
+      renderTimer = setTimeout(() => {
+        renderTimer = null;
+        if (abortController.signal.aborted) {
+          forceFlushRenderQueue(false);
+          return;
+        }
+        if (renderQueue.length === 0) {
+          resolveDrainIfIdle();
+          return;
+        }
+
+        const frameBudget = 32;
+        let remainingBudget = frameBudget;
+        let chunk = "";
+        while (remainingBudget > 0 && renderQueue.length > 0) {
+          const head = renderQueue[0];
+          const take = Math.min(head.length, remainingBudget);
+          chunk += head.slice(0, take);
+          remainingBudget -= take;
+          if (take === head.length) {
+            renderQueue.shift();
+          } else {
+            renderQueue[0] = head.slice(take);
+          }
+          if (/[，。！？.!?\n]$/.test(chunk) && chunk.length >= 12) {
+            break;
+          }
+        }
+
+        appendRenderedContent(chunk);
+        if (renderQueue.length > 0) {
+          scheduleRenderTick();
+        } else {
+          resolveDrainIfIdle();
+        }
+      }, 16);
+    };
+
+    const queueTextForRender = (text: string) => {
+      if (!text) return;
+      renderQueue.push(text);
+      scheduleRenderTick();
+    };
+
+    const drainRenderQueue = async () => {
+      if (renderQueue.length === 0 && renderTimer === null) return;
+      await new Promise<void>((resolve) => {
+        const prevResolver = drainResolver;
+        drainResolver = () => {
+          if (prevResolver) prevResolver();
+          resolve();
+        };
+        scheduleRenderTick();
+      });
     };
 
     try {
@@ -2028,12 +2254,6 @@ export default function ChatPage() {
       let sseBuffer = "";
       let streamErrored = false;
 
-      const appendAssistantContent = (content: string) => {
-        setMessages(prev => prev.map(m =>
-          m.id === assistantMessageId ? { ...m, content } : m
-        ));
-      };
-
       const processSSEData = (data: string, eventName?: string) => {
         // 统一处理后端标准事件与代理透传事件。
         if (!data || data === "[DONE]") return;
@@ -2043,6 +2263,10 @@ export default function ChatPage() {
           const semanticEvent =
             (typeof parsed.event === "string" ? parsed.event : eventName) || "";
           const errorValue = parsed.error;
+          const parsedPayload =
+            parsed.payload && typeof parsed.payload === "object"
+              ? (parsed.payload as Record<string, unknown>)
+              : null;
 
           // 心跳用于观测链路是否活着，不参与消息渲染。
           if (semanticEvent === "heartbeat") {
@@ -2050,18 +2274,28 @@ export default function ChatPage() {
             return;
           }
           if (semanticEvent === "done") {
-            if (typeof parsed.status === "string" && parsed.status.trim()) {
-              streamTerminationReason = parsed.status.trim();
+            const doneStatus =
+              typeof parsed.status === "string"
+                ? parsed.status
+                : typeof parsedPayload?.status === "string"
+                  ? parsedPayload.status
+                  : "";
+            if (doneStatus.trim()) {
+              streamTerminationReason = doneStatus.trim();
             }
             return;
           }
 
           if (semanticEvent === "error" || errorValue !== undefined) {
             streamErrored = true;
+            shouldDrainRenderQueue = false;
             const errorText = typeof errorValue === "string" ? errorValue : "服务暂时不可用";
             streamTerminationReason =
               /超时|timeout/i.test(errorText) ? "timeout" : "error";
             markTtft();
+            forceFlushRenderQueue(false);
+            renderedContent = `[系统提示: ${errorText}]`;
+            fullContent = renderedContent;
             setMessages(prev => prev.map(m =>
               m.id === assistantMessageId
                 ? { ...m, content: `[系统提示: ${errorText}]`, meta: { error: true, error_message: errorText } }
@@ -2073,7 +2307,9 @@ export default function ChatPage() {
           const parsedMessage =
             parsed.message && typeof parsed.message === "object"
               ? (parsed.message as Record<string, unknown>)
-              : null;
+              : parsedPayload?.message && typeof parsedPayload.message === "object"
+                ? (parsedPayload.message as Record<string, unknown>)
+                : null;
 
           if (semanticEvent === "start" && parsedMessage) {
             const parsedMeta =
@@ -2099,7 +2335,17 @@ export default function ChatPage() {
           }
 
           const parsedText = typeof parsed.text === "string" ? parsed.text : "";
-          if (semanticEvent === "delta" && parsedText) {
+          const parsedDeltaText =
+            parsedText ||
+            (typeof parsedPayload?.text === "string" ? parsedPayload.text : "");
+          if (semanticEvent === "text_delta") {
+            seenTextDeltaEvent = true;
+          }
+          // V2 灰度期后端可能镜像 legacy delta；前端优先消费 text_delta，避免正文重复。
+          if (semanticEvent === "delta" && seenTextDeltaEvent) {
+            return;
+          }
+          if ((semanticEvent === "delta" || semanticEvent === "text_delta") && parsedDeltaText) {
             // 只统计“业务正文 delta”的首包延迟，排除 pending 占位。
             if (seenNonPendingStart && firstDeltaMs === null) {
               firstDeltaMs = Date.now() - startTime;
@@ -2107,27 +2353,113 @@ export default function ChatPage() {
             if (seenNonPendingStart) {
               markTtft();
             }
-            fullContent += parsedText;
-            appendAssistantContent(fullContent);
+            fullContent += parsedDeltaText;
+            queueTextForRender(parsedDeltaText);
+            return;
+          }
+
+          if (semanticEvent === "reasoning_delta") {
+            const text = typeof parsedPayload?.text === "string" ? parsedPayload.text : "";
+            if (text) {
+              liveSections = { ...liveSections, reasoning: `${liveSections.reasoning}${text}` };
+              updateAssistantSections(liveSections);
+            }
+            return;
+          }
+
+          if (semanticEvent === "progress") {
+            const progressText =
+              typeof parsedPayload?.message === "string" ? parsedPayload.message : "";
+            if (progressText) {
+              liveSections = {
+                ...liveSections,
+                progress: [...liveSections.progress, progressText],
+              };
+              updateAssistantSections(liveSections);
+            }
+            return;
+          }
+
+          if (semanticEvent === "citation") {
+            const citation = parsedPayload || parsed;
+            liveSections = {
+              ...liveSections,
+              citations: [...liveSections.citations, citation as StreamSectionCitation],
+            };
+            updateAssistantSections(liveSections);
+            return;
+          }
+
+          if (semanticEvent === "action" || semanticEvent === "action_result") {
+            const action = parsedPayload || parsed;
+            liveSections = {
+              ...liveSections,
+              actions: [...liveSections.actions, action as StreamSectionAction],
+            };
+            updateAssistantSections(liveSections);
             return;
           }
 
           if (semanticEvent === "complete" && parsedMessage) {
+            const messageKind = (parsedMessage.kind as MessageKind) || "chat";
             const messageContent =
               typeof parsedMessage.content === "string" ? parsedMessage.content : fullContent;
             fullContent = messageContent || fullContent;
-            setMessages(prev => prev.map(m =>
-              m.id === assistantMessageId
-                ? {
-                    ...m,
-                    content: messageContent || fullContent,
-                    kind: (parsedMessage.kind as MessageKind) || "chat",
-                    render_mode: (parsedMessage.render_mode as Message["render_mode"]) || "markdown",
-                    payload: parsedMessage.payload as AssistantPayload | undefined,
-                    meta: parsedMessage.meta as Record<string, unknown> | undefined,
-                  }
-                : m
-            ));
+            const parsedPayloadObj =
+              parsedMessage.payload && typeof parsedMessage.payload === "object"
+                ? (parsedMessage.payload as AssistantPayload)
+                : undefined;
+            const completeSections = normalizeStreamSections(parsedPayloadObj?.stream_sections);
+            if (hasStreamSections(completeSections)) {
+              liveSections = completeSections;
+            }
+            if (messageKind === "chat") {
+              setMessages(prev => prev.map(m =>
+                m.id === assistantMessageId
+                  ? {
+                      ...m,
+                      kind: messageKind,
+                      render_mode: (parsedMessage.render_mode as Message["render_mode"]) || "markdown",
+                      payload: parsedPayloadObj
+                        ? {
+                            ...parsedPayloadObj,
+                            stream_sections: hasStreamSections(completeSections) ? completeSections : liveSections,
+                          }
+                        : {
+                            stream_sections: liveSections,
+                          },
+                      meta: parsedMessage.meta as Record<string, unknown> | undefined,
+                    }
+                  : m
+              ));
+
+              if (messageContent) {
+                if (messageContent.startsWith(renderedContent)) {
+                  const remain = messageContent.slice(renderedContent.length);
+                  if (remain) queueTextForRender(remain);
+                } else {
+                  forceFlushRenderQueue(false);
+                  renderedContent = "";
+                  queueTextForRender(messageContent);
+                }
+              }
+            } else {
+              // 结构化消息（quiz/exam）直接整块落地，避免半包解析闪烁。
+              forceFlushRenderQueue(false);
+              renderedContent = messageContent || fullContent;
+              setMessages(prev => prev.map(m =>
+                m.id === assistantMessageId
+                  ? {
+                      ...m,
+                      content: renderedContent,
+                      kind: messageKind,
+                      render_mode: (parsedMessage.render_mode as Message["render_mode"]) || "markdown",
+                      payload: parsedPayloadObj,
+                      meta: parsedMessage.meta as Record<string, unknown> | undefined,
+                    }
+                  : m
+              ));
+            }
             return;
           }
 
@@ -2145,14 +2477,20 @@ export default function ChatPage() {
               }
             } else {
               fullContent += parsedText;
-              appendAssistantContent(fullContent);
+              queueTextForRender(parsedText);
             }
             return;
           }
 
           // 有 event 但 data 里不是标准对象时忽略，保持前向兼容
         } catch {
-          if (eventName === "delta" && data) {
+          if (eventName === "text_delta") {
+            seenTextDeltaEvent = true;
+          }
+          if (eventName === "delta" && seenTextDeltaEvent) {
+            return;
+          }
+          if ((eventName === "delta" || eventName === "text_delta") && data) {
             // 兼容纯文本 delta
             if (seenNonPendingStart && firstDeltaMs === null) {
               firstDeltaMs = Date.now() - startTime;
@@ -2161,15 +2499,19 @@ export default function ChatPage() {
               markTtft();
             }
             fullContent += data;
-            appendAssistantContent(fullContent);
+            queueTextForRender(data);
             return;
           }
           if (eventName === "error") {
             streamErrored = true;
+            shouldDrainRenderQueue = false;
             const errorText = data || "服务暂时不可用";
             streamTerminationReason =
               /超时|timeout/i.test(errorText) ? "timeout" : "error";
             markTtft();
+            forceFlushRenderQueue(false);
+            renderedContent = `[系统提示: ${errorText}]`;
+            fullContent = renderedContent;
             setMessages(prev => prev.map(m =>
               m.id === assistantMessageId
                 ? { ...m, content: `[系统提示: ${errorText}]`, meta: { error: true, error_message: errorText } }
@@ -2211,7 +2553,7 @@ export default function ChatPage() {
 
         if (!streamErrored && !fullContent.trim()) {
           setMessages(prev => prev.map(m =>
-            m.id === assistantMessageId && !m.payload
+            m.id === assistantMessageId && !String(m.content || "").trim()
               ? { ...m, content: "服务已返回空内容，请重试一次。" }
               : m
           ));
@@ -2221,6 +2563,8 @@ export default function ChatPage() {
           await reader.cancel();
         } catch {}
       } else {
+        shouldDrainRenderQueue = false;
+        forceFlushRenderQueue(false);
         setMessages(prev => prev.map(m =>
           m.id === assistantMessageId ? { ...m, content: "流式连接不可用，请稍后重试。" } : m
         ));
@@ -2232,17 +2576,23 @@ export default function ChatPage() {
         (error instanceof DOMException && error.name === "AbortError");
       if (aborted) {
         streamTerminationReason = "client_cancelled";
+        shouldDrainRenderQueue = false;
+        forceFlushRenderQueue(false);
+        const visibleContent = renderedContent.trim();
         setMessages(prev => prev.map(m =>
           m.id === assistantMessageId
             ? {
                 ...m,
-                content: fullContent.trim() ? fullContent : "已停止生成。",
+                content: visibleContent || "已停止生成。",
                 meta: { ...(m.meta || {}), cancelled: true },
               }
             : m
         ));
+        fullContent = visibleContent;
       } else {
         streamTerminationReason = "error";
+        shouldDrainRenderQueue = false;
+        forceFlushRenderQueue(false);
         console.error("Chat error:", error);
         const errorMessage = error instanceof Error ? error.message : String(error);
         setMessages(prev => prev.map(m =>
@@ -2250,8 +2600,14 @@ export default function ChatPage() {
             ? { ...m, content: `请求失败: ${errorMessage}`, meta: { error: true, error_message: errorMessage } }
             : m
         ));
+        fullContent = `请求失败: ${errorMessage}`;
       }
     } finally {
+      if (shouldDrainRenderQueue) {
+        await drainRenderQueue();
+      } else {
+        forceFlushRenderQueue(false);
+      }
       const finalDurationMs = Date.now() - startTime;
       setResponseTime(finalDurationMs / 1000);
       setTotalTokens(prev => prev + Math.ceil(fullContent.length / 4));
@@ -2514,8 +2870,83 @@ export default function ChatPage() {
     }
   };
 
+  /** 将毫秒值转为可读文本，空值时输出占位符。 */
+  const formatMsMetric = (value: number | null): string => (value !== null ? `${value}ms` : "--");
+
+  /** 数值使用本地化分组，避免长数字难以扫描。 */
+  const formatCountMetric = (value: number): string => value.toLocaleString("zh-CN");
+
+  const terminationValueClassName =
+    streamDiagnostics.termination_reason === "success"
+      ? "text-emerald-600"
+      : ["error", "timeout", "client_cancel", "client_cancelled"].includes(streamDiagnostics.termination_reason)
+        ? "text-rose-600"
+        : "text-amber-600";
+
+  const primaryRuntimeMetrics: RuntimeMetricItem[] = [
+    { label: "Tokens", value: formatCountMetric(totalTokens), valueClassName: "text-slate-800" },
+    { label: "延迟", value: `${responseTime.toFixed(2)}s`, valueClassName: "text-cyan-700" },
+    { label: "TTFT", value: formatMsMetric(streamDiagnostics.ttft_ms), valueClassName: "text-emerald-700" },
+    { label: "终止", value: streamDiagnostics.termination_reason, valueClassName: terminationValueClassName },
+  ];
+
+  const detailRuntimeMetrics: RuntimeMetricItem[] = [
+    { label: "首 Delta", value: formatMsMetric(streamDiagnostics.first_delta_ms), valueClassName: "text-slate-700" },
+    { label: "流时长", value: `${streamDiagnostics.stream_duration_ms}ms`, valueClassName: "text-slate-700" },
+    { label: "心跳数", value: `${streamDiagnostics.heartbeat_count}`, valueClassName: "text-slate-700" },
+    {
+      label: "TTFT P95",
+      value: runtimeStreamMetrics ? `${runtimeStreamMetrics.stream_ttft_p95_ms}ms` : "--",
+      valueClassName: "text-violet-700",
+    },
+    {
+      label: "流时长 P95",
+      value: runtimeStreamMetrics ? `${runtimeStreamMetrics.stream_duration_p95_ms}ms` : "--",
+      valueClassName: "text-violet-700",
+    },
+  ];
+
+  /** 切换出题模式并给出轻提示。 */
+  const toggleExamMode = () => {
+    const wasFast = examFastMode;
+    setExamFastMode(prev => !prev);
+    showToast(
+      wasFast
+        ? "已关闭快速模式，将启用完整 LLM Critique"
+        : "已开启快速模式，将跳过内容审查",
+      "info"
+    );
+  };
+
+  /** 组装综合测试卷提示词，统一命题口径并提升输出质量。 */
+  const buildComprehensiveExamPrompt = (sampleHint: string): string => {
+    return `你是资深课程命题教师，请基于已上传课件生成一套“综合测试卷”。
+
+命题目标：
+- 覆盖课件核心知识点，检验理解、应用与综合分析能力。
+- 题目表述清晰，避免歧义、重复和超纲内容。
+
+试卷结构要求：
+1. 试卷标题与考试说明（建议作答时长、总分）。
+2. 题型与数量：
+   - 选择题 10 道
+   - 判断题 5 道
+   - 填空题 5 道
+   - 简答题 3 道
+3. 难度梯度建议：基础 60%，提升 30%，挑战 10%。
+4. 每道题都要给出：题干、标准答案、解析（解析点明对应知识点/考点）。
+
+命题约束：
+- 术语与结论优先采用课件原有表述。
+- 如果课件信息不足，不要编造；用“依据不足”并给出保守表达。
+${sampleHint}
+
+输出顺序（必须）：
+先输出完整试卷题目，再单独输出“答案与解析”部分，编号一一对应。`;
+  };
+
   return (
-    <div className="h-screen w-full flex flex-col bg-slate-50 overflow-hidden font-sans">
+    <div className="chat-shell h-screen w-full flex flex-col bg-slate-50 overflow-hidden font-sans">
       {/* 后端未连接警告 */}
       {!isBackendConnected && (
         <div className="bg-amber-500 text-white text-center py-2 text-sm font-medium">
@@ -2524,7 +2955,7 @@ export default function ChatPage() {
       )}
 
       {/* ============== 顶部导航栏 ============== */}
-      <header className="flex-none px-6 py-3 flex items-center justify-between border-b border-slate-200 bg-white z-20">
+      <header className="flex-none px-4 md:px-6 py-3 flex items-center justify-between border-b border-slate-200/80 bg-white/75 backdrop-blur-xl z-20 shadow-[0_10px_30px_rgba(15,23,42,0.04)]">
         {/* Logo */}
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 bg-slate-900 text-white rounded flex items-center justify-center font-mono font-bold text-sm shadow-sm ring-1 ring-slate-900">
@@ -2534,62 +2965,47 @@ export default function ChatPage() {
             <h1 className="text-sm font-bold tracking-tight text-slate-900 uppercase">
               Deep<span className="text-teal-600">Revision</span>
             </h1>
-            <p className="text-[0.65rem] font-mono text-slate-400 uppercase tracking-widest">RAG 引擎运行中</p>
           </div>
         </div>
 
         {/* 算力核心统计 */}
-        <div className="hidden md:flex items-center gap-3 px-4 py-1.5 bg-slate-900 rounded-full shadow-sm ring-1 ring-slate-800 transition-all duration-300 hover:shadow-md">
-          <div className="flex items-center gap-1.5">
-            <span className="w-1.5 h-1.5 rounded-full bg-teal-500 animate-pulse shadow-[0_0_8px_rgba(20,184,166,0.8)]"></span>
-            <span className="text-[0.65rem] font-mono text-slate-300 uppercase tracking-widest">算力核心</span>
-          </div>
-          <div className="h-3 w-px bg-slate-700"></div>
-          <div className="flex items-center gap-4 text-[0.7rem] font-mono text-slate-50 flex-wrap">
-            <div className="flex items-baseline gap-1">
-              <span className="text-slate-400">总消耗 Tokens</span>
-              <span className="font-bold text-white tracking-tight">{totalTokens}</span>
+        <div className="hidden xl:flex flex-1 mx-4 max-w-2xl">
+          <div className="group relative w-full rounded-xl border border-slate-200/90 bg-white/90 px-3 py-2 shadow-[0_8px_20px_rgba(15,23,42,0.06)] backdrop-blur-sm">
+            <div className="flex items-center gap-3">
+              <span className="w-1.5 h-1.5 rounded-full bg-teal-500 animate-pulse"></span>
+              <div className="grid flex-1 grid-cols-4 gap-x-2">
+                {primaryRuntimeMetrics.map(metric => (
+                  <div key={metric.label} className="min-w-0">
+                    <p className="truncate text-[0.56rem] font-mono uppercase tracking-wide text-slate-400">{metric.label}</p>
+                    <p className={`truncate text-[0.72rem] font-semibold font-mono tracking-tight ${metric.valueClassName ?? "text-slate-700"}`}>
+                      {metric.value}
+                    </p>
+                  </div>
+                ))}
+              </div>
+              <button
+                type="button"
+                aria-label="查看运行指标详情"
+                className="h-6 w-6 rounded-md border border-slate-200 text-slate-400 transition-colors hover:text-slate-600 hover:border-slate-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/40"
+              >
+                <svg className="mx-auto h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+              </button>
             </div>
-            <div className="flex items-baseline gap-1">
-              <span className="text-slate-400">响应延迟</span>
-              <span className="font-bold text-teal-400 tracking-tight">{responseTime.toFixed(2)}s</span>
+            <div className="pointer-events-none absolute right-0 top-[calc(100%+8px)] z-30 w-[330px] translate-y-1 rounded-xl border border-slate-200 bg-white/95 p-3 opacity-0 shadow-[0_16px_30px_rgba(15,23,42,0.12)] backdrop-blur-sm transition-all duration-150 group-hover:translate-y-0 group-hover:opacity-100 group-focus-within:translate-y-0 group-focus-within:opacity-100">
+              <p className="mb-2 text-[0.62rem] font-mono uppercase tracking-[0.14em] text-slate-500">详细指标</p>
+              <div className="grid grid-cols-2 gap-x-3 gap-y-2">
+                {detailRuntimeMetrics.map(metric => (
+                  <div key={metric.label} className="min-w-0">
+                    <p className="truncate text-[0.58rem] font-mono uppercase tracking-wide text-slate-400">{metric.label}</p>
+                    <p className={`truncate text-[0.7rem] font-semibold font-mono ${metric.valueClassName ?? "text-slate-700"}`}>
+                      {metric.value}
+                    </p>
+                  </div>
+                ))}
+              </div>
             </div>
-            <div className="flex items-baseline gap-1">
-              <span className="text-slate-400">TTFT</span>
-              <span className="font-bold text-emerald-400 tracking-tight">
-                {streamDiagnostics.ttft_ms !== null ? `${streamDiagnostics.ttft_ms}ms` : "--"}
-              </span>
-            </div>
-            <div className="flex items-baseline gap-1">
-              <span className="text-slate-400">首Delta</span>
-              <span className="font-bold text-emerald-300 tracking-tight">
-                {streamDiagnostics.first_delta_ms !== null ? `${streamDiagnostics.first_delta_ms}ms` : "--"}
-              </span>
-            </div>
-            <div className="flex items-baseline gap-1">
-              <span className="text-slate-400">流时长</span>
-              <span className="font-bold text-cyan-300 tracking-tight">{streamDiagnostics.stream_duration_ms}ms</span>
-            </div>
-            <div className="flex items-baseline gap-1">
-              <span className="text-slate-400">终止</span>
-              <span className="font-bold text-amber-300 tracking-tight">{streamDiagnostics.termination_reason}</span>
-            </div>
-            <div className="flex items-baseline gap-1">
-              <span className="text-slate-400">心跳</span>
-              <span className="font-bold text-sky-300 tracking-tight">{streamDiagnostics.heartbeat_count}</span>
-            </div>
-            {runtimeStreamMetrics && (
-              <>
-                <div className="flex items-baseline gap-1">
-                  <span className="text-slate-400">TTFT P95</span>
-                  <span className="font-bold text-violet-300 tracking-tight">{runtimeStreamMetrics.stream_ttft_p95_ms}ms</span>
-                </div>
-                <div className="flex items-baseline gap-1">
-                  <span className="text-slate-400">流时长 P95</span>
-                  <span className="font-bold text-violet-200 tracking-tight">{runtimeStreamMetrics.stream_duration_p95_ms}ms</span>
-                </div>
-              </>
-            )}
           </div>
         </div>
 
@@ -2609,32 +3025,6 @@ export default function ChatPage() {
             className="group relative px-4 py-1.5 text-xs font-medium text-slate-600 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-md transition-all ease-out duration-200"
           >
             上传课件
-          </button>
-          <button
-            onClick={() => {
-              const wasFast = examFastMode;
-              setExamFastMode(f => !f);
-              showToast(wasFast
-                ? "已关闭快速模式，将启用完整 LLM Critique"
-                : "已开启完整模式，将启用完整 LLM Critique",
-                "info");
-            }}
-            title={examFastMode ? "快速模式：跳过内容审查" : "完整模式：启用 LLM Critique"}
-            className={`group relative px-3 py-1.5 text-xs font-medium border rounded-md transition-all ease-out duration-200 ${
-              examFastMode
-                ? "text-amber-700 bg-amber-50 border-amber-200 hover:bg-amber-100"
-                : "text-emerald-700 bg-emerald-50 border-emerald-200 hover:bg-emerald-100"
-            }`}
-          >
-            <span className="flex items-center gap-1.5">
-              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                {examFastMode
-                  ? <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                  : <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
-                }
-              </svg>
-              {examFastMode ? "快速" : "完整"}
-            </span>
           </button>
           <button
             onClick={() => setShowHistoryPanel(true)}
@@ -2658,12 +3048,10 @@ export default function ChatPage() {
                   const sampleRes = await fetch(`/api/knowledge/sample?session_id=${encodeURIComponent(currentSession)}`);
                   const sampleData = await sampleRes.json();
                   if (sampleData.code === 200 && sampleData.data?.has_sample) {
-                    sampleInfo = "\n\n【重要】请参考已上传的样卷格式出题，包括题型分布、分值、编号风格等。";
+                    sampleInfo = "- 参考已上传样卷的题型分布、分值设置与编号风格。";
                   }
                 } catch (e) {}
-                const prompt = `请出一套综合测试卷题目，选择10道，判断5道，填空5道，简答3道。根据已上传的课件内容生成，考点范围请从课件中提取关键知识点。${sampleInfo}
-
-请生成完整试卷，包含题目、答案和解析。`;
+                const prompt = buildComprehensiveExamPrompt(sampleInfo);
                 await sendMessage(prompt, { exam_stage_plan: true, exam_fast_mode: examFastMode });
               }}
               className="px-4 py-1.5 text-xs font-medium text-teal-700 bg-teal-50 hover:bg-teal-100 border border-teal-200 rounded-md transition-all flex items-center gap-1"
@@ -2684,12 +3072,12 @@ export default function ChatPage() {
       </header>
 
       {/* ============== 主内容区 ============== */}
-      <main className="flex-1 w-full relative overflow-hidden flex">
+      <main className="chat-main flex-1 w-full relative overflow-hidden flex">
         {/* 聊天区域 */}
-        <div className="flex-1 flex flex-col overflow-hidden">
+        <div className="flex-1 flex flex-col overflow-hidden relative z-10">
           {/* 消息列表 */}
-          <div className="flex-1 overflow-y-auto p-4 md:p-8">
-            <div className="max-w-4xl mx-auto">
+          <div className="flex-1 overflow-y-auto p-4 md:p-8 lg:p-10">
+            <div className="max-w-5xl mx-auto conversation-lane">
               {messages.length === 0 && (
                 <div className="w-full flex items-start gap-4 animate-slideUp">
                   <div className="w-6 h-6 rounded bg-teal-100 text-teal-700 flex items-center justify-center flex-shrink-0 mt-1 border border-teal-200">
@@ -2710,7 +3098,7 @@ export default function ChatPage() {
               {messages.map((message, idx) => (
                 <div
                   key={`${message.id}-${idx}`}
-                  className={`w-full flex items-start gap-4 message-enter ${message.role === "user" ? "flex-row-reverse" : ""}`}
+                  className={`w-full flex items-start gap-4 message-enter message-row ${message.role === "user" ? "flex-row-reverse" : ""}`}
                   style={{ animationDelay: `${idx * 0.05}s` }}
                 >
                   {/* Avatar - 精致圆形头像 */}
@@ -2755,7 +3143,7 @@ export default function ChatPage() {
                       <ThoughtChain thoughts={thoughts} />
                     )}
 
-                    <div className={`inline-block px-5 py-3.5 rounded-2xl shadow-sm ${
+                    <div className={`inline-block px-5 py-3.5 rounded-2xl shadow-sm message-bubble ${
                       message.role === "user"
                         ? "rounded-tr-md"
                         : "rounded-tl-md border"
@@ -2785,6 +3173,11 @@ export default function ChatPage() {
                           void sendMessage("请给出上面试卷的答案和解析");
                         }}
                       />
+                      {message.role === "assistant" && (message.kind ?? "chat") === "chat" && (
+                        <StreamSectionsPanel
+                          sections={normalizeStreamSections((message.payload as AssistantPayload | undefined)?.stream_sections)}
+                        />
+                      )}
                     </div>
                     {message.role === "assistant" && (
                       <div className="mt-2 flex items-center gap-2">
@@ -2888,16 +3281,9 @@ export default function ChatPage() {
           </div>
 
           {/* 输入框 - 精致日式风格 */}
-          <div className="flex-none w-full pb-6 pt-4 px-4" style={{ background: 'linear-gradient(to top, rgba(251,250,245,0.95), rgba(251,250,245,0))' }}>
+          <div className="flex-none w-full pb-6 pt-4 px-4 composer-wrap">
             <div className="max-w-3xl mx-auto w-full relative">
-              <div className="relative flex items-end gap-3 rounded-2xl transition-all duration-300"
-                style={{
-                  background: 'rgba(255,255,255,0.7)',
-                  backdropFilter: 'blur(20px)',
-                  border: '1px solid rgba(180,170,150,0.2)',
-                  boxShadow: '0 4px 30px rgba(180,170,150,0.1), inset 0 1px 0 rgba(255,255,255,0.8)'
-                }}
-              >
+              <div className="relative flex items-end gap-3 rounded-2xl transition-all duration-300 composer-shell">
                 <div className="flex-1 relative">
                   <textarea
                     id="user-input"
@@ -2950,16 +3336,37 @@ export default function ChatPage() {
                   )}
                 </button>
               </div>
-              <div className="flex items-center justify-center gap-4 mt-3" style={{ color: '#b0b0b0', fontSize: '11px' }}>
-                <span>Enter 发送</span>
-                <span style={{ opacity: 0.5 }}>·</span>
-                <span>Shift + Enter 换行</span>
-                {isLoading && (
-                  <>
-                    <span style={{ opacity: 0.5 }}>·</span>
-                    <span>点击红色按钮停止</span>
-                  </>
-                )}
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 px-1 text-[11px] text-slate-400">
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={examFastMode}
+                  aria-label={examFastMode ? "当前快速模式，点击切换完整模式" : "当前完整模式，点击切换快速模式"}
+                  onClick={toggleExamMode}
+                  title={examFastMode ? "快速模式：跳过内容审查" : "完整模式：启用 LLM Critique"}
+                  className={`relative h-5 w-9 rounded-full border p-0.5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/30 ${
+                    examFastMode
+                      ? "border-teal-400/70 bg-teal-500/85"
+                      : "border-slate-300 bg-slate-200"
+                  }`}
+                >
+                  <span
+                    className={`absolute left-0.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 rounded-full bg-white shadow-[0_1px_2px_rgba(15,23,42,0.25)] transition-transform ${
+                      examFastMode ? "translate-x-[18px]" : "translate-x-0"
+                    }`}
+                  />
+                </button>
+                <div className="flex items-center gap-3">
+                  <span>Enter 发送</span>
+                  <span className="opacity-50">·</span>
+                  <span>Shift + Enter 换行</span>
+                  {isLoading && (
+                    <>
+                      <span className="opacity-50">·</span>
+                      <span>点击红色按钮停止</span>
+                    </>
+                  )}
+                </div>
               </div>
             </div>
           </div>

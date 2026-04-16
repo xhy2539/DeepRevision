@@ -23,6 +23,7 @@ from langchain_core.messages import HumanMessage
 
 from model.factory import chat_model, backup_chat_model, light_chat_model, backup_light_chat_model
 from agent.tools.agent_tools import get_rag_service
+from agent.tools.history_action_parser import parse_history_action
 from utils.logger_handler import logger
 from utils.session_context import current_session_id
 from utils.rag_metrics import rag_inc
@@ -44,6 +45,7 @@ class SupervisorState(TypedDict):
     route: str              # "rag" | "quiz" | "exam" | "planner" | "chitchat"
     route_reason: str       # 路由原因（用于日志）
     route_params: dict      # 从用户输入中提取的参数
+    supervisor_precomputed: bool  # 外层已完成路由判定时跳过重复 supervisor 调用
     # SubAgent 结果
     subagent_result: str    # SubAgent 原始输出
     final_answer: str       # 最终回答（透传给调用方）
@@ -674,6 +676,24 @@ async def supervisor_node(state: SupervisorState) -> SupervisorState:
     """Supervisor: 分析意图，输出路由决策（Query重写+意图识别一次完成）"""
     logger.info("[Supervisor] 分析用户意图...")
 
+    # 允许外层先做一次路由判定，然后在 workflow 内复用，避免 quiz/exam 回退路径重复调用 LLM 路由。
+    if bool(state.get("supervisor_precomputed", False)):
+        precomputed_route = str(state.get("route", "") or "").strip()
+        valid_routes = {"rag", "quiz", "exam", "planner", "history", "chitchat"}
+        if precomputed_route in valid_routes:
+            precomputed_reason = str(state.get("route_reason", "") or "预路由命中")
+            precomputed_params = state.get("route_params", {}) if isinstance(state.get("route_params"), dict) else {}
+            rewritten_query = str(state.get("input", "") or "").strip() or str(state.get("input", "") or "")
+            logger.info(
+                f"[Supervisor] 复用预路由结果 route={precomputed_route}, reason={precomputed_reason}"
+            )
+            return {
+                "route": precomputed_route,
+                "route_reason": precomputed_reason,
+                "route_params": precomputed_params,
+                "input": rewritten_query,
+            }
+
     # 预检：打招呼直接走 chitchat，不调用 LLM
     greeting_keywords = ['你好', 'hi', 'hello', '嗨', '您好', 'hi there', 'hey']
     input_lower = state['input'].lower().strip()
@@ -1024,6 +1044,61 @@ async def chitchat_node(state: SupervisorState) -> SupervisorState:
     return {"subagent_result": result, "final_answer": result}
 
 
+def _format_practice_history_rows(history: list[dict], limit: int = 20) -> str:
+    """格式化错题记录，输出可操作的 ID。"""
+    if not history:
+        return "暂无练习记录"
+
+    safe_limit = max(1, min(int(limit or 20), 200))
+    rows = history[:safe_limit]
+    lines = [f"【练习历史（最近 {len(rows)} 条）】"]
+    for i, rec in enumerate(rows, 1):
+        status = "✅" if rec.get("is_correct") else "❌"
+        rec_id = rec.get("id")
+        kp = rec.get("knowledge_point") or "未标注"
+        q_content = str(rec.get("question_content") or "").strip().replace("\n", " ")
+        lines.append(f"{i}. [ID:{rec_id}] {status} [{kp}] {q_content[:80]}")
+    return "\n".join(lines)
+
+
+def _format_message_rows(messages: list[dict], limit: int = 30) -> tuple[str, list[dict]]:
+    """格式化对话历史，按“最新在前”展示并返回同序列表。"""
+    if not messages:
+        return "暂无历史对话记录", []
+
+    safe_limit = max(1, min(int(limit or 30), 200))
+    ordered = list(reversed(messages[-safe_limit:]))
+    lines = [f"【历史对话（最近 {len(ordered)} 条，最新在前）】"]
+    for i, msg in enumerate(ordered, 1):
+        role = "学生" if msg.get("role") == "human" else "助手"
+        timestamp = msg.get("timestamp", 0)
+        content = str(msg.get("content", "")).strip().replace("\n", " ")
+        lines.append(f"{i}. [TS:{timestamp}] {role}: {content[:120]}")
+    return "\n".join(lines), ordered
+
+
+def _resolve_practice_id_by_index(history: list[dict], index: int) -> int | None:
+    """把“第N条错题”映射为实际 record_id。"""
+    if index <= 0:
+        return None
+    pos = index - 1
+    if pos < 0 or pos >= len(history):
+        return None
+    rec_id = history[pos].get("id")
+    return int(rec_id) if rec_id is not None else None
+
+
+def _resolve_message_ts_by_index(ordered_messages: list[dict], index: int) -> int | None:
+    """把“第N条消息”映射为 timestamp。"""
+    if index <= 0:
+        return None
+    pos = index - 1
+    if pos < 0 or pos >= len(ordered_messages):
+        return None
+    ts = ordered_messages[pos].get("timestamp")
+    return int(ts) if ts is not None else None
+
+
 async def history_subagent_node(state: SupervisorState) -> SupervisorState:
     """History SubAgent: 查看练习历史、答题记录、错题分析（由LLM理解用户意图并回答）"""
     from utils.memory_service import memory_manager
@@ -1035,6 +1110,64 @@ async def history_subagent_node(state: SupervisorState) -> SupervisorState:
 
     params = state.get('route_params', {})
     limit = params.get('limit', 20)
+
+    # 先执行可确定的管理动作（查/删/清空），避免再走 LLM 推断。
+    action = parse_history_action(state.get("input", ""))
+    action_name = action.get("action", "none")
+    if action_name != "none":
+        if action_name == "list_practice":
+            history = memory_manager.get_practice_history(sid, max(1, min(int(limit or 20), 200)))
+            text = _format_practice_history_rows(history, limit=limit)
+            return {"subagent_result": text, "final_answer": text}
+
+        if action_name == "delete_practice":
+            history = memory_manager.get_practice_history(sid, 200)
+            record_id = action.get("record_id")
+            if record_id is None and action.get("record_index") is not None:
+                record_id = _resolve_practice_id_by_index(history, int(action.get("record_index")))
+            if record_id is None:
+                text = "请提供要删除的错题 ID，或说“删除第N条错题”。"
+                return {"subagent_result": text, "final_answer": text}
+            deleted = memory_manager.delete_practice_record(sid, int(record_id))
+            if not deleted:
+                text = f"未找到错题记录 ID={record_id}，删除失败。"
+                return {"subagent_result": text, "final_answer": text}
+            latest = memory_manager.get_practice_history(sid, max(1, min(int(limit or 10), 50)))
+            text = f"已删除错题记录 ID={record_id}\n\n{_format_practice_history_rows(latest, limit=min(int(limit or 10), 20))}"
+            return {"subagent_result": text, "final_answer": text}
+
+        if action_name == "clear_practice":
+            deleted_count = memory_manager.clear_practice_history(sid)
+            text = f"已清空错题记录，共删除 {deleted_count} 条。"
+            return {"subagent_result": text, "final_answer": text}
+
+        if action_name == "list_messages":
+            messages = memory_manager.get_messages(sid)
+            text, _ = _format_message_rows(messages, limit=limit)
+            return {"subagent_result": text, "final_answer": text}
+
+        if action_name == "delete_message":
+            messages = memory_manager.get_messages(sid)
+            text_rows, ordered_messages = _format_message_rows(messages, limit=200)
+            timestamp = action.get("timestamp")
+            if timestamp is None and action.get("message_index") is not None:
+                timestamp = _resolve_message_ts_by_index(ordered_messages, int(action.get("message_index")))
+            if timestamp is None:
+                text = "请提供要删除的消息 timestamp，或说“删除第N条消息”。"
+                return {"subagent_result": text, "final_answer": text}
+            deleted = memory_manager.delete_message(sid, int(timestamp))
+            if not deleted:
+                text = f"未找到消息 TS={timestamp}，删除失败。\n\n{text_rows}"
+                return {"subagent_result": text, "final_answer": text}
+            latest_messages = memory_manager.get_messages(sid)
+            latest_text, _ = _format_message_rows(latest_messages, limit=min(int(limit or 20), 50))
+            text = f"已删除消息 TS={timestamp}\n\n{latest_text}"
+            return {"subagent_result": text, "final_answer": text}
+
+        if action_name == "clear_messages":
+            success = memory_manager.clear_messages(sid)
+            text = "已清空历史对话记录。" if success else "清空失败：会话不存在。"
+            return {"subagent_result": text, "final_answer": text}
 
     # 获取统计数据和历史记录
     stats = memory_manager.get_knowledge_point_stats(sid)

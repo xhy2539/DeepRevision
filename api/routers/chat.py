@@ -2,24 +2,26 @@ import json
 import asyncio
 import re
 import time
+import hashlib
 from contextlib import suppress
 from functools import lru_cache
 from fastapi import APIRouter, Body, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Set
 
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-from agent.tools.agent_tools import clear_rag_cache
-from agent.multi_agent.supervisor import supervisor_workflow
+from agent.tools.agent_tools import clear_rag_cache, get_rag_service
+from agent.multi_agent.supervisor import supervisor_workflow, supervisor_node, CHITCHAT_PROMPT
 from api.message_protocol import build_assistant_message
 from utils.logger_handler import logger, update_token_stats, get_system_stats
 from utils.memory_service import memory_manager
 from utils.session_context import current_session_id
-from utils.rag_metrics import rag_get_metrics_snapshot
+from utils.rag_metrics import rag_get_metrics_snapshot, rag_inc
+from utils.config_handler import chroma_conf
 from rag.vector_store import VectorStoreService
 from model.factory import light_chat_model, backup_light_chat_model, chat_model
 
@@ -70,6 +72,9 @@ RUNTIME_METRICS: Dict[str, Any] = {
         "client_cancelled": 0,
         "cancelled": 0,
     },
+    "stream_v2_requests_total": 0,
+    "stream_v2_activated_total": 0,
+    "stream_event_counts_by_type": {},
 }
 
 
@@ -418,6 +423,147 @@ def _format_sse(payload: Any, event_name: Optional[str] = None) -> str:
     return f"data: {body}\n\n"
 
 
+def _parse_stream_v2_routes(raw_value: Any) -> Set[str]:
+    """解析 stream_v2 路由配置，支持 list 与逗号分隔字符串。"""
+    default_routes = {"rag", "chitchat"}
+    if isinstance(raw_value, list):
+        routes = {str(item).strip().lower() for item in raw_value if str(item).strip()}
+        return routes or default_routes
+    if isinstance(raw_value, str):
+        parts = [part.strip().lower() for part in raw_value.split(",") if part.strip()]
+        return set(parts) or default_routes
+    return default_routes
+
+
+def _stable_bucket_100(session_id: str) -> int:
+    """按 session_id 稳定映射到 0-99 桶，用于灰度开关。"""
+    sid = str(session_id or "default")
+    digest = hashlib.md5(sid.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % 100
+
+
+def _stream_v2_config() -> Dict[str, Any]:
+    """读取 stream_v2 灰度配置。"""
+    enabled = bool(chroma_conf.get("stream_v2_enabled", False))
+    routes = _parse_stream_v2_routes(chroma_conf.get("stream_v2_routes", ["rag", "chitchat"]))
+    rollout_percent = max(0, min(100, int(chroma_conf.get("stream_v2_rollout_percent", 0))))
+    emit_sections = bool(chroma_conf.get("stream_v2_emit_sections", True))
+    legacy_delta_mirror = bool(chroma_conf.get("stream_v2_legacy_delta_mirror", True))
+    return {
+        "enabled": enabled,
+        "routes": routes,
+        "rollout_percent": rollout_percent,
+        "emit_sections": emit_sections,
+        "legacy_delta_mirror": legacy_delta_mirror,
+    }
+
+
+def _should_attempt_stream_v2(session_id: str, cfg: Dict[str, Any]) -> bool:
+    """是否命中 stream_v2 灰度。"""
+    if not bool(cfg.get("enabled", False)):
+        return False
+    bucket = _stable_bucket_100(session_id)
+    return bucket < int(cfg.get("rollout_percent", 0))
+
+
+def _record_stream_event(event_name: str):
+    """统计流式事件类型分布，用于诊断首包/断流。"""
+    try:
+        counts = RUNTIME_METRICS.setdefault("stream_event_counts_by_type", {})
+        counts[event_name] = int(counts.get(event_name, 0)) + 1
+    except Exception:
+        pass
+
+
+def _build_v2_event(
+    *,
+    event: str,
+    message_id: str,
+    seq: int,
+    route: str,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """构建 stream_v2 统一事件结构。"""
+    return {
+        "event": event,
+        "message_id": message_id,
+        "seq": seq,
+        "ts": int(time.time() * 1000),
+        "route": route,
+        "payload": payload,
+    }
+
+
+def _format_recent_history_for_prompt(chat_history: List[Any], max_chars: int = 600) -> str:
+    """将近期对话压缩成 prompt 可用文本，避免上下文过长。"""
+    if not chat_history:
+        return "（无近期对话）"
+    lines: List[str] = []
+    used = 0
+    for msg in reversed(chat_history):
+        role = "学生" if isinstance(msg, HumanMessage) else "助手"
+        content = str(getattr(msg, "content", "") or "").strip()
+        if not content:
+            continue
+        line = f"{role}: {content}"
+        if used + len(line) > max_chars:
+            remain = max_chars - used - len(f"{role}: ")
+            if remain > 32:
+                lines.insert(0, f"{role}: {content[:remain]}...")
+            break
+        lines.insert(0, line)
+        used += len(line)
+        if used >= max_chars:
+            break
+    return "\n".join(lines) if lines else "（无近期对话）"
+
+
+def _extract_citations_from_context(context: str, limit: int = 6) -> List[Dict[str, Any]]:
+    """
+    从 retrieve_context 结果中提取可展示引用（best-effort）。
+    仅用于前端分区展示，不参与业务判定。
+    """
+    text = str(context or "")
+    if not text:
+        return []
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for match in re.finditer(
+        r"\[参考资料(\d+)\]:参考资料:(.*?)\|参考元数据:(\{.*?\})(?:\n|$)",
+        text,
+        flags=re.DOTALL,
+    ):
+        idx = int(match.group(1))
+        snippet = re.sub(r"\s+", " ", str(match.group(2) or "")).strip()
+        snippet = snippet[:120]
+        metadata_text = str(match.group(3) or "").strip()
+        source = f"参考资料{idx}"
+        try:
+            parsed_meta = json.loads(metadata_text.replace("'", '"'))
+            if isinstance(parsed_meta, dict):
+                source = str(parsed_meta.get("source_filename") or parsed_meta.get("source") or source)
+        except Exception:
+            pass
+        key = f"{source}|{snippet}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "index": idx,
+                "source": source,
+                "quote": snippet,
+            }
+        )
+        if len(out) >= limit:
+            break
+    return out
+
+
+class _StreamV2Handled(Exception):
+    """内部控制流异常：标记 stream_v2 已完成并跳过 legacy 主流程。"""
+
+
 @router.post("/stream")
 async def chat_stream_endpoint(request: Request):
     """
@@ -467,6 +613,10 @@ async def chat_stream_endpoint(request: Request):
         """
         _safe_inc("total_requests")
         _safe_inc("stream_requests_total")
+        stream_v2_cfg = _stream_v2_config()
+        attempt_stream_v2 = _should_attempt_stream_v2(session_id, stream_v2_cfg)
+        if attempt_stream_v2:
+            _safe_inc("stream_v2_requests_total")
         initial_state = {
             "input": query,
             "chat_history": chat_history,
@@ -480,6 +630,7 @@ async def chat_stream_endpoint(request: Request):
             "route": "",
             "route_reason": "",
             "route_params": {},
+            "supervisor_precomputed": False,
             "subagent_result": "",
             "final_answer": "",
         }
@@ -495,6 +646,19 @@ async def chat_stream_endpoint(request: Request):
         stream_ttft_ms: Optional[int] = None
         stream_first_delta_ms: Optional[int] = None
         workflow_task: Optional[asyncio.Task] = None
+        route_task: Optional[asyncio.Task] = None
+        stream_v2_message_id = f"{session_id}-{int(stream_start * 1000)}"
+        stream_v2_seq = 0
+        stream_v2_route = "pending"
+        stream_v2_enabled_for_this_round = False
+        stream_v2_completed = False
+        route = "chitchat"
+        route_params: Dict[str, Any] = {}
+        route_reason = ""
+        fallback_used = False
+        stream_sections: Dict[str, Any] = {"reasoning": "", "actions": [], "citations": [], "progress": []}
+        rag_citations: List[Dict[str, Any]] = []
+        v2_text_stream_started = False
 
         def _mark_ttft_if_needed():
             """在首次可见有效事件时标记 TTFT（仅记录一次）。"""
@@ -502,16 +666,345 @@ async def chat_stream_endpoint(request: Request):
             if stream_ttft_ms is None:
                 stream_ttft_ms = int((time.time() - stream_start) * 1000)
 
+        def _next_v2_seq() -> int:
+            nonlocal stream_v2_seq
+            stream_v2_seq += 1
+            return stream_v2_seq
+
         try:
             # 先发送一个占位消息，避免长耗时任务期间前端完全空白
+            _record_stream_event("start")
             yield _format_sse(
-                {'event': 'start', 'message': {'kind': 'chat', 'render_mode': 'markdown', 'meta': {'route': 'pending'}}},
+                {
+                    'event': 'start',
+                    'message': {'kind': 'chat', 'render_mode': 'markdown', 'meta': {'route': 'pending'}},
+                    'message_id': stream_v2_message_id,
+                    'seq': 0,
+                    'ts': int(time.time() * 1000),
+                    'route': 'pending',
+                    'payload': {'kind': 'chat', 'render_mode': 'markdown', 'meta': {'route': 'pending'}},
+                },
                 event_name="start",
             )
+            _record_stream_event("delta")
             yield _format_sse(
                 {'event': 'delta', 'text': '正在生成内容，请稍候...\n'},
                 event_name="delta",
             )
+
+            if attempt_stream_v2:
+                supervisor_timeout_s = 45.0
+                heartbeat_interval_s = 8.0
+                deadline = time.time() + supervisor_timeout_s
+                last_heartbeat_at = time.time()
+                route_task = asyncio.create_task(
+                    supervisor_node(
+                        {
+                            "input": query,
+                            "chat_history": chat_history,
+                            "memory_context": graph_context,
+                            "session_id": session_id,
+                            "route": "",
+                            "route_reason": "",
+                            "route_params": {},
+                            "subagent_result": "",
+                            "final_answer": "",
+                        }
+                    )
+                )
+                route_state = None
+                while True:
+                    if await request.is_disconnected():
+                        client_disconnected = True
+                        route_task.cancel()
+                        raise asyncio.CancelledError()
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        route_task.cancel()
+                        raise asyncio.TimeoutError()
+                    try:
+                        route_state = await asyncio.wait_for(asyncio.shield(route_task), timeout=min(1.0, remaining))
+                        break
+                    except asyncio.TimeoutError:
+                        now = time.time()
+                        if now - last_heartbeat_at >= heartbeat_interval_s:
+                            _safe_inc("stream_heartbeat_sent_total")
+                            _record_stream_event("heartbeat")
+                            yield _format_sse(
+                                {
+                                    "event": "heartbeat",
+                                    "status": "routing",
+                                    "elapsed_ms": int((now - stream_start) * 1000),
+                                },
+                                event_name="heartbeat",
+                            )
+                            last_heartbeat_at = now
+
+                route = str((route_state or {}).get("route", "chitchat") or "chitchat")
+                route_params = (route_state or {}).get("route_params", {}) or {}
+                route_reason = str((route_state or {}).get("route_reason", "") or "")
+                rewritten_query = str((route_state or {}).get("input", query) or query).strip() or query
+                stream_v2_route = route
+
+                if route in {"rag", "chitchat"} and route in set(stream_v2_cfg.get("routes", set())):
+                    stream_v2_enabled_for_this_round = True
+                    _safe_inc("stream_v2_activated_total")
+                    emit_sections = bool(stream_v2_cfg.get("emit_sections", True))
+                    try:
+                        _mark_ttft_if_needed()
+                        _record_stream_event("start")
+                        start_meta = {"route": route, "route_reason": route_reason, "stream_version": "v2"}
+                        yield _format_sse(
+                            {
+                                "event": "start",
+                                "message": {"kind": "chat", "render_mode": "markdown", "meta": start_meta},
+                                "message_id": stream_v2_message_id,
+                                "seq": _next_v2_seq(),
+                                "ts": int(time.time() * 1000),
+                                "route": route,
+                                "payload": {"kind": "chat", "render_mode": "markdown", "meta": start_meta},
+                            },
+                            event_name="start",
+                        )
+                        if emit_sections:
+                            _record_stream_event("progress")
+                            stream_sections["progress"].append("已完成意图识别")
+                            yield _format_sse(
+                                _build_v2_event(
+                                    event="progress",
+                                    message_id=stream_v2_message_id,
+                                    seq=_next_v2_seq(),
+                                    route=route,
+                                    payload={"stage": "route", "status": "completed", "message": "已完成意图识别"},
+                                ),
+                                event_name="progress",
+                            )
+
+                        stream_model = chat_model or light_chat_model or backup_light_chat_model
+                        if stream_model is None:
+                            raise RuntimeError("当前未配置可用于流式输出的模型")
+
+                        if route == "rag":
+                            topic = str(route_params.get("topic") or rewritten_query).strip() or rewritten_query
+                            if emit_sections:
+                                _record_stream_event("action")
+                                stream_sections["actions"].append({"name": "retrieve_context", "status": "running", "detail": topic})
+                                yield _format_sse(
+                                    _build_v2_event(
+                                        event="action",
+                                        message_id=stream_v2_message_id,
+                                        seq=_next_v2_seq(),
+                                        route=route,
+                                        payload={"name": "retrieve_context", "status": "running", "detail": topic},
+                                    ),
+                                    event_name="action",
+                                )
+                            retrieve_start = time.time()
+                            rag = await get_rag_service()
+                            context = await rag.retrieve_context(topic, mode="rag_chat")
+                            if not context or not str(context).strip():
+                                logger.warning("[StreamV2-RAG] 检索结果为空，注入友好提示上下文")
+                                context = "【提示】当前知识库为空，请先上传课件后再提问。你可以通过点击「上传课件」按钮来添加复习资料。"
+                            rag_citations = _extract_citations_from_context(context)
+                            retrieve_cost_ms = int((time.time() - retrieve_start) * 1000)
+                            if emit_sections:
+                                _record_stream_event("action_result")
+                                stream_sections["actions"].append(
+                                    {"name": "retrieve_context", "status": "completed", "cost_ms": retrieve_cost_ms}
+                                )
+                                yield _format_sse(
+                                    _build_v2_event(
+                                        event="action_result",
+                                        message_id=stream_v2_message_id,
+                                        seq=_next_v2_seq(),
+                                        route=route,
+                                        payload={"name": "retrieve_context", "status": "completed", "cost_ms": retrieve_cost_ms},
+                                    ),
+                                    event_name="action_result",
+                                )
+                                for citation in rag_citations:
+                                    _record_stream_event("citation")
+                                    stream_sections["citations"].append(citation)
+                                    yield _format_sse(
+                                        _build_v2_event(
+                                            event="citation",
+                                            message_id=stream_v2_message_id,
+                                            seq=_next_v2_seq(),
+                                            route=route,
+                                            payload=citation,
+                                        ),
+                                        event_name="citation",
+                                    )
+                                reasoning_hint = "已完成课件检索，正在组织答案。"
+                                _record_stream_event("reasoning_delta")
+                                stream_sections["reasoning"] += reasoning_hint
+                                yield _format_sse(
+                                    _build_v2_event(
+                                        event="reasoning_delta",
+                                        message_id=stream_v2_message_id,
+                                        seq=_next_v2_seq(),
+                                        route=route,
+                                        payload={"text": reasoning_hint},
+                                    ),
+                                    event_name="reasoning_delta",
+                                )
+                            chain = (
+                                PromptTemplate.from_template(
+                                    "你是复习助手，请严格基于检索资料回答学生问题。\n"
+                                    "要求：直接回答，不要输出思考过程；若资料不足请明确说明“根据当前检索资料”。\n"
+                                    "【长期记忆】\n{memory_context}\n\n"
+                                    "【近期对话】\n{recent_history}\n\n"
+                                    "【检索资料】\n{context}\n\n"
+                                    "【学生问题】\n{input}\n"
+                                )
+                                | stream_model
+                                | StrOutputParser()
+                            )
+                            stream_inputs = {
+                                "memory_context": graph_context,
+                                "recent_history": _format_recent_history_for_prompt(chat_history),
+                                "context": context,
+                                "input": rewritten_query,
+                            }
+                        else:
+                            if emit_sections:
+                                reasoning_hint = "已加载近期对话上下文，正在生成回复。"
+                                _record_stream_event("reasoning_delta")
+                                stream_sections["reasoning"] += reasoning_hint
+                                yield _format_sse(
+                                    _build_v2_event(
+                                        event="reasoning_delta",
+                                        message_id=stream_v2_message_id,
+                                        seq=_next_v2_seq(),
+                                        route=route,
+                                        payload={"text": reasoning_hint},
+                                    ),
+                                    event_name="reasoning_delta",
+                                )
+                            chain = PromptTemplate.from_template(CHITCHAT_PROMPT) | stream_model | StrOutputParser()
+                            stream_inputs = {
+                                "input": rewritten_query,
+                                "context": (
+                                    f"【近期对话】\n{_format_recent_history_for_prompt(chat_history)}\n\n"
+                                    f"【知识点备忘】\n{graph_context}"
+                                ).strip(),
+                            }
+
+                        async for chunk in chain.astream(stream_inputs):
+                            if await request.is_disconnected():
+                                client_disconnected = True
+                                raise asyncio.CancelledError()
+                            chunk_text = str(chunk or "")
+                            if not chunk_text:
+                                continue
+                            v2_text_stream_started = True
+                            if stream_first_delta_ms is None:
+                                stream_first_delta_ms = int((time.time() - stream_start) * 1000)
+                            _mark_ttft_if_needed()
+                            answer += chunk_text
+                            sent_content += chunk_text
+                            _record_stream_event("text_delta")
+                            yield _format_sse(
+                                {
+                                    "event": "text_delta",
+                                    "text": chunk_text,
+                                    "message_id": stream_v2_message_id,
+                                    "seq": _next_v2_seq(),
+                                    "ts": int(time.time() * 1000),
+                                    "route": route,
+                                    "payload": {"text": chunk_text},
+                                },
+                                event_name="text_delta",
+                            )
+                            if bool(stream_v2_cfg.get("legacy_delta_mirror", True)):
+                                _record_stream_event("delta")
+                                yield _format_sse({"event": "delta", "text": chunk_text}, event_name="delta")
+
+                        answer = _clean_answer(answer)
+                        if not answer and sent_content.strip():
+                            answer = sent_content.strip()
+                        rag_grounded_evidence: List[Dict[str, str]] = []
+                        rag_grounding_reason = ""
+                        if route == "rag":
+                            for citation in rag_citations:
+                                source = str(citation.get("source", "参考资料"))
+                                quote = str(citation.get("quote", "")).strip()
+                                if not quote:
+                                    continue
+                                if quote in answer:
+                                    rag_grounded_evidence.append({"source": source, "quote": quote})
+                            if answer and rag_grounded_evidence:
+                                rag_inc("rag_grounded_pass_count", 1)
+                                rag_grounding_reason = "pass"
+                            elif answer:
+                                rag_inc("rag_grounded_partial_count", 1)
+                                rag_grounding_reason = "partial"
+                            else:
+                                rag_inc("rag_grounded_fail_count", 1)
+                                rag_grounding_reason = "fail"
+                                answer = (
+                                    "根据当前检索结果，我暂时无法提取到可核验的课件依据。"
+                                    "为避免误导，请换个更具体的问题，或补充相关课件后再试。"
+                                )
+                        if answer:
+                            message = build_assistant_message(route, answer, session_id, route_params, structured_result=None)
+                            payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
+                            if bool(stream_v2_cfg.get("emit_sections", True)):
+                                payload = {**payload, "stream_sections": stream_sections}
+                            message["payload"] = payload
+                            meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+                            if route == "rag":
+                                meta = {
+                                    **meta,
+                                    "grounding_mode": "stream_v2_citation_match",
+                                    "grounded_evidence_count": len(rag_grounded_evidence),
+                                    "grounded_reason": rag_grounding_reason or ("pass" if rag_grounded_evidence else "partial"),
+                                }
+                            message["meta"] = {**meta, "stream_version": "v2", "route_reason": route_reason}
+                            _record_stream_event("complete")
+                            yield _format_sse(
+                                {
+                                    "event": "complete",
+                                    "message": message,
+                                    "message_id": stream_v2_message_id,
+                                    "seq": _next_v2_seq(),
+                                    "ts": int(time.time() * 1000),
+                                    "route": route,
+                                    "payload": {"message": message},
+                                },
+                                event_name="complete",
+                            )
+                        if route in RUNTIME_METRICS["routes"]:
+                            RUNTIME_METRICS["routes"][route] += 1
+                        stream_v2_completed = True
+                        raise _StreamV2Handled()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as stream_v2_error:
+                        if v2_text_stream_started:
+                            logger.exception("[StreamV2] 流式已开始输出正文，无法无损回退到 V1", exc_info=stream_v2_error)
+                            raise
+                        logger.exception("[StreamV2] 执行失败，回退到 V1 工作流", exc_info=stream_v2_error)
+                        stream_v2_enabled_for_this_round = False
+                        stream_v2_route = "pending"
+                        answer = ""
+                        sent_content = ""
+                        message = None
+                        rag_citations = []
+                        stream_sections = {"reasoning": "", "actions": [], "citations": [], "progress": []}
+                        fallback_used = True
+
+                if route_state is not None:
+                    # 回退到 workflow 前复用已完成的路由判定，避免 quiz/exam 再次调用 supervisor LLM。
+                    initial_state.update(
+                        {
+                            "input": rewritten_query,
+                            "route": route,
+                            "route_reason": route_reason,
+                            "route_params": route_params,
+                            "supervisor_precomputed": True,
+                        }
+                    )
 
             workflow_timeout_s = 660.0  # 外层略大于 10 分钟出卷预算，避免前后层超时打架
             heartbeat_interval_s = 8.0
@@ -538,6 +1031,7 @@ async def chat_stream_endpoint(request: Request):
                     now = time.time()
                     if now - last_heartbeat_at >= heartbeat_interval_s:
                         _safe_inc("stream_heartbeat_sent_total")
+                        _record_stream_event("heartbeat")
                         yield _format_sse(
                             {
                                 "event": "heartbeat",
@@ -573,6 +1067,7 @@ async def chat_stream_endpoint(request: Request):
                     structured_result = {**structured_result, "text": answer}
                 message = build_assistant_message(route, answer, session_id, route_params, structured_result)
                 _mark_ttft_if_needed()
+                _record_stream_event("start")
                 yield _format_sse(
                     {'event': 'start', 'message': {'kind': message['kind'], 'render_mode': message['render_mode'], 'meta': message['meta']}},
                     event_name="start",
@@ -588,10 +1083,12 @@ async def chat_stream_endpoint(request: Request):
                         logger.info(f"[Stream] line{i}: {line}")
                         if stream_first_delta_ms is None:
                             stream_first_delta_ms = int((time.time() - stream_start) * 1000)
+                        _record_stream_event("delta")
                         yield _format_sse({'event': 'delta', 'text': line}, event_name="delta")
                         sent_content += line
                         await asyncio.sleep(0.03)
 
+                _record_stream_event("complete")
                 yield _format_sse({'event': 'complete', 'message': message}, event_name="complete")
                 if route == "exam" and message.get("kind") == "exam_paper":
                     exam_data = (message.get("payload") or {}).get("exam_data", {})
@@ -700,6 +1197,8 @@ async def chat_stream_endpoint(request: Request):
                 )
                 logger.info(f"[Latency] supervisor_workflow_ms={workflow_latency_ms}")
 
+        except _StreamV2Handled:
+            pass
         except asyncio.CancelledError:
             if client_disconnected:
                 termination_reason = "client_cancelled"
@@ -711,6 +1210,7 @@ async def chat_stream_endpoint(request: Request):
                 error_text = "请求已取消，请稍后重试"
                 RUNTIME_METRICS["last_error"] = error_text
                 _mark_ttft_if_needed()
+                _record_stream_event("error")
                 yield _format_sse({'event': 'error', 'error': error_text}, event_name="error")
         except asyncio.TimeoutError:
             termination_reason = "timeout"
@@ -720,6 +1220,7 @@ async def chat_stream_endpoint(request: Request):
             RUNTIME_METRICS["last_error"] = error_text
             logger.info(f"[Latency] supervisor_workflow_failed_ms={int((time.time()-stream_start)*1000)}")
             _mark_ttft_if_needed()
+            _record_stream_event("error")
             yield _format_sse({'event': 'error', 'error': error_text}, event_name="error")
         except Exception as e:
             termination_reason = "error"
@@ -729,8 +1230,13 @@ async def chat_stream_endpoint(request: Request):
             RUNTIME_METRICS["last_error"] = error_text
             logger.info(f"[Latency] supervisor_workflow_failed_ms={int((time.time()-stream_start)*1000)}")
             _mark_ttft_if_needed()
+            _record_stream_event("error")
             yield _format_sse({'event': 'error', 'error': error_text}, event_name="error")
         finally:
+            if route_task is not None and not route_task.done():
+                route_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await route_task
             if workflow_task is not None and not workflow_task.done():
                 workflow_task.cancel()
                 with suppress(asyncio.CancelledError, Exception):
@@ -755,10 +1261,25 @@ async def chat_stream_endpoint(request: Request):
             _safe_inc("stream_error_total")
 
         if not client_disconnected:
-            yield _format_sse(
-                {"event": "done", "status": termination_reason},
-                event_name="done",
-            )
+            _record_stream_event("done")
+            if stream_v2_enabled_for_this_round:
+                yield _format_sse(
+                    {
+                        "event": "done",
+                        "status": termination_reason,
+                        "message_id": stream_v2_message_id,
+                        "seq": _next_v2_seq(),
+                        "ts": int(time.time() * 1000),
+                        "route": stream_v2_route or route,
+                        "payload": {"status": termination_reason},
+                    },
+                    event_name="done",
+                )
+            else:
+                yield _format_sse(
+                    {"event": "done", "status": termination_reason},
+                    event_name="done",
+                )
             # 兼容旧前端：保留 [DONE] 终止标记
             yield "data: [DONE]\n\n"
 
@@ -778,6 +1299,7 @@ async def chat_stream_endpoint(request: Request):
                     **ai_meta,
                     "cancelled": True,
                     "termination_reason": "client_cancelled",
+                    "stream_version": "v2" if stream_v2_enabled_for_this_round else "v1",
                 }
                 await memory_manager.add_message(
                     session_id,
@@ -797,7 +1319,11 @@ async def chat_stream_endpoint(request: Request):
                 ai_meta = {}
             if error_text:
                 ai_meta = {**ai_meta, "error": True, "error_message": error_text}
-            ai_meta = {**ai_meta, "termination_reason": termination_reason}
+            ai_meta = {
+                **ai_meta,
+                "termination_reason": termination_reason,
+                "stream_version": "v2" if stream_v2_enabled_for_this_round else "v1",
+            }
             await memory_manager.add_message(
                 session_id,
                 "ai",
@@ -816,7 +1342,12 @@ async def chat_stream_endpoint(request: Request):
                 kind="chat",
                 render_mode="markdown",
                 payload=None,
-                meta={"error": True, "error_message": error_text, "termination_reason": termination_reason},
+                meta={
+                    "error": True,
+                    "error_message": error_text,
+                    "termination_reason": termination_reason,
+                    "stream_version": "v2" if stream_v2_enabled_for_this_round else "v1",
+                },
                 timestamp=now + 1,
             )
 
@@ -1048,6 +1579,11 @@ async def get_runtime_metrics():
     stream_error_total = int(RUNTIME_METRICS.get("stream_error_total", 0))
     stream_client_cancel_total = int(RUNTIME_METRICS.get("stream_client_cancel_total", 0))
     stream_timeout_total = int(RUNTIME_METRICS.get("stream_timeout_total", 0))
+    stream_v2_requests_total = int(RUNTIME_METRICS.get("stream_v2_requests_total", 0))
+    stream_v2_activated_total = int(RUNTIME_METRICS.get("stream_v2_activated_total", 0))
+    stream_event_counts_by_type = RUNTIME_METRICS.get("stream_event_counts_by_type", {}) or {}
+    if not isinstance(stream_event_counts_by_type, dict):
+        stream_event_counts_by_type = {}
     rag_metrics = rag_get_metrics_snapshot()
     rag_calls = int(rag_metrics.get("rag_retrieve_calls", 0))
     rag_cache_eligible = int(rag_metrics.get("rag_cache_eligible_calls", 0))
@@ -1100,6 +1636,9 @@ async def get_runtime_metrics():
             "stream_error_rate": round((stream_error_total / stream_requests_total) * 100, 2) if stream_requests_total > 0 else 0.0,
             "stream_client_cancel_rate": round((stream_client_cancel_total / stream_requests_total) * 100, 2) if stream_requests_total > 0 else 0.0,
             "stream_timeout_rate": round((stream_timeout_total / stream_requests_total) * 100, 2) if stream_requests_total > 0 else 0.0,
+            "stream_v2_activation_rate": round((stream_v2_activated_total / stream_requests_total) * 100, 2) if stream_requests_total > 0 else 0.0,
+            "stream_v2_hit_rate": round((stream_v2_activated_total / stream_v2_requests_total) * 100, 2) if stream_v2_requests_total > 0 else 0.0,
+            "stream_event_counts_by_type": stream_event_counts_by_type,
             "rag_cache_hit_rate": round((rag_hits / rag_cache_eligible) * 100, 2) if rag_cache_eligible > 0 else 0.0,
             "rag_empty_context_rate": round((rag_empty / rag_calls) * 100, 2) if rag_calls > 0 else 0.0,
             "rag_retrieve_avg_ms": rag_latency_avg,

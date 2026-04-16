@@ -252,6 +252,82 @@ h1, h2, h3, .font-serif {
   background: linear-gradient(180deg, rgba(13, 148, 136, 0.65), rgba(15, 118, 110, 0.2));
 }
 
+/* 聊天主画布氛围层 */
+.chat-shell {
+  position: relative;
+  isolation: isolate;
+}
+
+.chat-shell::before,
+.chat-shell::after {
+  content: "";
+  position: absolute;
+  border-radius: 999px;
+  pointer-events: none;
+  filter: blur(50px);
+  opacity: 0.35;
+  z-index: 0;
+}
+
+.chat-shell::before {
+  width: 340px;
+  height: 340px;
+  top: -120px;
+  left: -80px;
+  background: radial-gradient(circle at center, rgba(20, 184, 166, 0.35), rgba(20, 184, 166, 0));
+}
+
+.chat-shell::after {
+  width: 320px;
+  height: 320px;
+  right: -90px;
+  bottom: 130px;
+  background: radial-gradient(circle at center, rgba(245, 158, 11, 0.24), rgba(245, 158, 11, 0));
+}
+
+.chat-main {
+  position: relative;
+  z-index: 1;
+}
+
+.conversation-lane {
+  position: relative;
+}
+
+.message-row {
+  margin-bottom: 1.1rem;
+}
+
+.message-bubble {
+  position: relative;
+  border: 1px solid rgba(15, 118, 110, 0.12);
+  box-shadow:
+    0 10px 26px rgba(15, 23, 42, 0.06),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9);
+}
+
+.composer-wrap {
+  background: linear-gradient(to top, rgba(251, 250, 245, 0.96), rgba(251, 250, 245, 0));
+}
+
+.composer-shell {
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.88), rgba(255, 255, 255, 0.66));
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  box-shadow:
+    0 14px 36px rgba(15, 23, 42, 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.85);
+}
+
+@media (max-width: 768px) {
+  .chat-shell::before,
+  .chat-shell::after {
+    filter: blur(36px);
+    opacity: 0.28;
+  }
+}
+
 /* 滚动条美化 */
 ::-webkit-scrollbar {
   width: 6px;

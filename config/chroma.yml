@@ -40,6 +40,13 @@ hyde_trigger_min_docs: 3   # 命中数低于该阈值时触发 HyDE
 hyde_max_chars: 180   # HyDE 假设段落最大长度
 comprehensive_retrieve_parallelism: 2   # 综合检索并发上限
 
+# ============== 流式链路 V2（灰度） ==============
+stream_v2_enabled: true   # 是否启用 stream_v2 主开关
+stream_v2_rollout_percent: 100   # 按 session_id hash 命中灰度比例（0-100）
+stream_v2_routes: ["rag", "chitchat"]   # 允许走 stream_v2 的路由
+stream_v2_emit_sections: true   # 是否输出 reasoning/action/citation 分区事件
+stream_v2_legacy_delta_mirror: true   # 是否镜像旧版 delta 事件，兼容旧前端
+
 # MMR 多样性参数 (可选)
 mmr_enabled: true    # 是否启用 MMR 多样性检索
 mmr_lambda: 0.5       # 0=多样性, 1=相关性（降低以增加多样性）
