@@ -149,6 +149,10 @@ interface SSEFrame {
   data: string;
 }
 
+/**
+ * 解析 SSE 缓冲区，支持 event/id/retry 及多行 data 拼接。
+ * 返回已完成帧与剩余半包字符串（供下一轮拼接）。
+ */
 function parseSSEFrames(buffer: string): { frames: SSEFrame[]; rest: string } {
   const normalized = buffer.replace(/\r\n/g, "\n");
   const blocks = normalized.split("\n\n");
@@ -207,6 +211,7 @@ interface KnowledgeFile {
 // 青色品牌色: #14b8a6 (teal-500)
 
 // ============== 思考链组件 ==============
+/** 展示系统思考片段的轻量面板，仅用于可视化反馈。 */
 function ThoughtChain({ thoughts }: { thoughts: string[] }) {
   if (thoughts.length === 0) return null;
 
@@ -227,6 +232,10 @@ function ThoughtChain({ thoughts }: { thoughts: string[] }) {
 }
 
 // ============== Markdown 渲染组件 ==============
+/**
+ * 从聊天文本中提取题目结构（兼容新旧两种题目格式）。
+ * 解析失败时返回 isQuiz=false，回退为普通 markdown 渲染。
+ */
 function parseQuizContent(content: string): {
   isQuiz: boolean;
   questions: QuizQuestion[];
@@ -375,6 +384,7 @@ const quizTypeStyles: Record<string, { tag: string; border: string; bg: string }
   "简答题": { tag: "quiz-tag-short", border: "border-l-purple-500", bg: "bg-purple-50" },
 };
 
+/** 清理选项前缀（A./A、 等），用于统一展示与判分。 */
 function stripChoiceOptionPrefix(text: string): string {
   let s = String(text || "");
   // 第一遍：去掉开头的前缀标记（字母+分隔符，可重复）
@@ -402,6 +412,7 @@ function QuizCard({
   ) => void;
   messageId?: string;
 }) {
+  // 题卡内部维护“练习模式/作答状态”，与外层消息流状态解耦。
   const [showAnswers, setShowAnswers] = useState(defaultShowAnswers);
   const [practiceMode, setPracticeMode] = useState(false);
   const [selectedAnswers, setSelectedAnswers] = useState<Record<number, string>>({});
@@ -681,6 +692,12 @@ function QuizCard({
   );
 }
 
+/**
+ * 统一消息渲染入口：
+ * - exam_paper => ExamCanvas
+ * - quiz_set  => QuizCard
+ * - 其他      => Markdown
+ */
 function MarkdownContent({
   content,
   kind,
@@ -829,6 +846,7 @@ function MarkdownContent({
 }
 
 // ============== 知识库面板组件 ==============
+/** 课件上传与样卷管理面板。 */
 function KnowledgePanel({
   sessionId,
   isOpen,
@@ -1264,6 +1282,7 @@ function KnowledgePanel({
 }
 
 // ============== 历史记录管理面板 ==============
+/** 练习历史与薄弱点统计面板。 */
 function SessionHistoryPanel({
   sessionId,
   isOpen,
@@ -1503,6 +1522,7 @@ function SessionHistoryPanel({
 }
 
 // ============== 会话管理模态框 ==============
+/** 会话创建/重命名/分支化管理面板。 */
 function SessionModal({
   isOpen,
   onClose,
@@ -1700,6 +1720,7 @@ function SessionModal({
 }
 
 // ============== 主页面组件 ==============
+/** 聊天主页：会话管理 + SSE 流式对话 + 练习闭环入口。 */
 export default function ChatPage() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [currentSession, setCurrentSession] = useState<string>("default");
@@ -1736,12 +1757,14 @@ export default function ChatPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
 
+  // 主动停止按钮：中止当前流式请求（前后端 cancel 链路联动）。
   const stopStreaming = useCallback(() => {
     if (streamAbortRef.current) {
       streamAbortRef.current.abort();
     }
   }, []);
 
+  // 缺省知识点提取：优先后端返回，其次题干首行降级。
   const inferKnowledgePoint = (question: ExamPracticeQuestion): string => {
     if (question.knowledge_point && question.knowledge_point.trim()) {
       return question.knowledge_point.trim();
@@ -1758,6 +1781,7 @@ export default function ChatPage() {
     wrongAnswers: ExamPracticeQuestion[],
     userAnswers: Record<number, string>
   ) => {
+    // 练习提交闭环：先存作答记录，再补拉相似题用于二次复练。
     if (!currentSession) return;
 
     try {
@@ -1919,6 +1943,7 @@ export default function ChatPage() {
 
   // 发送消息
   const sendMessage = async (overrideText?: string, extraBody?: Record<string, unknown>) => {
+    // 入口保护：空输入/非法会话/重复发送均直接返回。
     const outgoingText = (overrideText ?? input).trim();
     if (!outgoingText || !currentSession || isLoading) return;
     if (!isValidSessionId(currentSession)) {
@@ -1967,6 +1992,7 @@ export default function ChatPage() {
     let seenNonPendingStart = false;
 
     const markTtft = () => {
+      // TTFT 只取首个有效时刻，避免后续事件覆盖。
       if (ttftMs === null) {
         ttftMs = Date.now() - startTime;
       }
@@ -2009,6 +2035,7 @@ export default function ChatPage() {
       };
 
       const processSSEData = (data: string, eventName?: string) => {
+        // 统一处理后端标准事件与代理透传事件。
         if (!data || data === "[DONE]") return;
 
         try {
@@ -2017,6 +2044,7 @@ export default function ChatPage() {
             (typeof parsed.event === "string" ? parsed.event : eventName) || "";
           const errorValue = parsed.error;
 
+          // 心跳用于观测链路是否活着，不参与消息渲染。
           if (semanticEvent === "heartbeat") {
             heartbeatCount += 1;
             return;
@@ -2072,6 +2100,7 @@ export default function ChatPage() {
 
           const parsedText = typeof parsed.text === "string" ? parsed.text : "";
           if (semanticEvent === "delta" && parsedText) {
+            // 只统计“业务正文 delta”的首包延迟，排除 pending 占位。
             if (seenNonPendingStart && firstDeltaMs === null) {
               firstDeltaMs = Date.now() - startTime;
             }
@@ -2156,6 +2185,7 @@ export default function ChatPage() {
           const { done, value } = await reader.read();
           if (done) break;
 
+          // 按帧解析，避免“按行解析”在多行 data 场景下丢内容。
           sseBuffer += decoder.decode(value, { stream: true });
           const parsed = parseSSEFrames(sseBuffer);
           sseBuffer = parsed.rest;

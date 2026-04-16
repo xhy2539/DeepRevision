@@ -3,6 +3,7 @@ import { NextRequest } from 'next/server';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
+// 统一 SSE 头，尽量降低中间层缓存/缓冲对流式实时性的影响。
 const STREAM_HEADERS: Record<string, string> = {
   'Content-Type': 'text/event-stream; charset=utf-8',
   'Cache-Control': 'no-cache, no-transform',
@@ -11,6 +12,7 @@ const STREAM_HEADERS: Record<string, string> = {
 };
 
 function sseErrorResponse(message: string, status: number): Response {
+  // 代理层错误也保持 SSE 协议，前端复用同一解析逻辑。
   const payload = JSON.stringify({ event: 'error', error: message });
   return new Response(`event: error\ndata: ${payload}\n\ndata: [DONE]\n\n`, {
     status,
@@ -19,6 +21,7 @@ function sseErrorResponse(message: string, status: number): Response {
 }
 
 export async function POST(request: NextRequest) {
+  // 读取原始 body 直传后端，避免代理层改写请求结构。
   const body = await request.text();
   const backendCandidates = [
     process.env.BACKEND_API_BASE?.trim(),
@@ -65,6 +68,7 @@ export async function POST(request: NextRequest) {
     let closed = false;
     let readerCancelled = false;
 
+    // 单路径关闭，避免 cancel/finally 并发触发导致二次 close。
     const safeClose = () => {
       if (closed) return;
       closed = true;
@@ -75,6 +79,7 @@ export async function POST(request: NextRequest) {
       }
     };
 
+    // 上游 reader 取消也做幂等，避免噪声异常。
     const safeCancelReader = async () => {
       if (readerCancelled) return;
       readerCancelled = true;
@@ -87,6 +92,7 @@ export async function POST(request: NextRequest) {
       async start(controller) {
         streamController = controller;
         try {
+          // 直接透传后端 chunk，不做解析重组，减少代理层开销。
           while (true) {
             if (upstreamAbort.signal.aborted || closed) break;
             const { done, value } = await reader.read();
@@ -102,6 +108,7 @@ export async function POST(request: NextRequest) {
         }
       },
       async cancel() {
+        // 当前端主动停止时，把取消信号传递到上游后端链路。
         upstreamAbort.abort();
         safeClose();
         await safeCancelReader();

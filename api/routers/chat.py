@@ -258,6 +258,7 @@ def _deduplicate_response(text: str) -> str:
 
 
 def _safe_inc(metric_key: str, delta: int = 1):
+    """安全累加运行指标；任何异常都吞掉，避免影响主流程。"""
     try:
         RUNTIME_METRICS[metric_key] = int(RUNTIME_METRICS.get(metric_key, 0)) + delta
     except Exception:
@@ -265,6 +266,7 @@ def _safe_inc(metric_key: str, delta: int = 1):
 
 
 def _record_exam_latency(latency_ms: int):
+    """记录出卷端到端耗时样本（保留最近 200 条）。"""
     try:
         samples = RUNTIME_METRICS.setdefault("exam_latency_samples_ms", [])
         samples.append(int(latency_ms))
@@ -276,6 +278,7 @@ def _record_exam_latency(latency_ms: int):
 
 
 def _record_quiz_latency(latency_ms: int):
+    """记录练习/小测端到端耗时样本（保留最近 200 条）。"""
     try:
         samples = RUNTIME_METRICS.setdefault("quiz_latency_samples_ms", [])
         samples.append(int(latency_ms))
@@ -286,6 +289,7 @@ def _record_quiz_latency(latency_ms: int):
 
 
 def _record_exam_stage_latency(latency_ms: int):
+    """记录分阶段出卷的阶段耗时样本（保留最近 500 条）。"""
     try:
         samples = RUNTIME_METRICS.setdefault("exam_stage_latency_ms", [])
         samples.append(int(latency_ms))
@@ -296,6 +300,7 @@ def _record_exam_stage_latency(latency_ms: int):
 
 
 def _record_runtime_sample(metric_key: str, value: int, max_len: int = 500):
+    """通用样本记录器，用于 TTFT/首个 delta/流时长等序列指标。"""
     try:
         samples = RUNTIME_METRICS.setdefault(metric_key, [])
         samples.append(int(value))
@@ -306,6 +311,7 @@ def _record_runtime_sample(metric_key: str, value: int, max_len: int = 500):
 
 
 def _record_stream_termination(reason: str):
+    """按终止原因统计流式结束次数（success/error/timeout/...）。"""
     try:
         counts = RUNTIME_METRICS.setdefault("stream_termination_reason_counts", {})
         counts[reason] = int(counts.get(reason, 0)) + 1
@@ -314,6 +320,7 @@ def _record_stream_termination(reason: str):
 
 
 def _calc_p95(values: List[int]) -> int:
+    """对样本序列计算近似 p95（空序列返回 0）。"""
     if not values:
         return 0
     arr = sorted(int(v) for v in values)
@@ -322,12 +329,14 @@ def _calc_p95(values: List[int]) -> int:
 
 
 def _validate_session_id(session_id: str) -> str:
+    """统一校验 session_id，防止非法字符进入存储或路径逻辑。"""
     if not _VALID_SESSION_ID.match(session_id):
         raise HTTPException(status_code=400, detail="非法 session_id")
     return session_id
 
 
 def _extract_kp_rule(raw_kp: str, question_content: str) -> str:
+    """基于规则提取考点短语，作为题库统计与检索的统一 key。"""
     s = str(raw_kp or "").strip() or str(question_content or "").strip()
     if not s:
         return "未标注"
@@ -362,6 +371,7 @@ def _extract_kp_rule(raw_kp: str, question_content: str) -> str:
 
 @lru_cache(maxsize=256)
 def _kp_polish_prompt_template() -> PromptTemplate:
+    """考点润色提示模板（缓存后复用，减少重复构建开销）。"""
     return PromptTemplate.from_template(
         "你是课程考点提炼器。请把输入内容提炼为一个“名词性考点短语”，用于题库检索。"
         "\n要求："
@@ -375,6 +385,10 @@ def _kp_polish_prompt_template() -> PromptTemplate:
 
 
 async def _polish_knowledge_point(raw_kp: str, question_content: str) -> str:
+    """
+    先规则提取，再按需调用轻量模型润色考点。
+    仅在规则结果不理想时触发 LLM，控制提交练习记录时的额外延迟。
+    """
     base = _extract_kp_rule(raw_kp, question_content)
     # 规则已较好时直接返回，避免额外延迟
     if 4 <= len(base) <= 16 and not re.search(r"(下列|以下|哪一项|请|如何|是否)", base):
@@ -445,6 +459,12 @@ async def chat_stream_endpoint(request: Request):
     graph_context = memory_manager.get_memory_context(session_id)
 
     async def event_stream():
+        """
+        SSE 主循环：
+        1) 启动 supervisor 工作流并定期发 heartbeat
+        2) 将工作流输出转成 start/delta/complete/done 事件
+        3) 记录流式分段指标并按终止状态落库
+        """
         _safe_inc("total_requests")
         _safe_inc("stream_requests_total")
         initial_state = {
@@ -477,6 +497,7 @@ async def chat_stream_endpoint(request: Request):
         workflow_task: Optional[asyncio.Task] = None
 
         def _mark_ttft_if_needed():
+            """在首次可见有效事件时标记 TTFT（仅记录一次）。"""
             nonlocal stream_ttft_ms
             if stream_ttft_ms is None:
                 stream_ttft_ms = int((time.time() - stream_start) * 1000)
@@ -1092,6 +1113,7 @@ async def get_runtime_metrics():
 
 @router.delete("/session/{session_id}")
 async def delete_session(session_id: str):
+    """删除会话及其知识库，并清理对应 RAG 缓存。"""
     _validate_session_id(session_id)
     current_session_id.set(session_id)
     try:
@@ -1112,6 +1134,7 @@ class RenameRequest(BaseModel):
 
 @router.put("/session/{session_id}")
 async def rename_session(session_id: str, req: RenameRequest = Body(...)):
+    """重命名会话展示名（session_id 本身不变）。"""
     _validate_session_id(session_id)
     success = memory_manager.rename_session(session_id, req.new_name)
     if success:
@@ -1131,6 +1154,7 @@ class SessionCleanupRequest(BaseModel):
 
 @router.post("/session")
 async def register_session(req: SessionCreateRequest = Body(...)):
+    """创建/注册新会话，用于前端会话树管理。"""
     _validate_session_id(req.session_id)
     memory_manager.register_session(req.session_id, req.name, req.parent_id)
     return {"code": 200, "message": "会话注册成功"}
@@ -1169,6 +1193,7 @@ async def cleanup_legacy_session(req: SessionCleanupRequest = Body(...)):
 
 @router.get("/sessions")
 async def get_all_sessions():
+    """返回全部会话列表（含层级关系字段）。"""
     sessions = memory_manager.get_all_sessions()
     return {"code": 200, "data": sessions}
 
@@ -1229,6 +1254,7 @@ async def clear_messages(session_id: str):
 
 @router.get("/tokens")
 async def get_tokens():
+    """返回全局 token 使用统计，供前端状态栏展示。"""
     try:
         stats = get_system_stats()
         return {"code": 200, "data": stats}

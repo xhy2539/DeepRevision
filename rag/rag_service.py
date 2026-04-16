@@ -214,6 +214,12 @@ class RRFRetriever(Runnable):
 
 class RagSummarizeService:
     def __init__(self):
+        """
+        RAG 主服务初始化：
+        - 组装向量检索/BM25/RRF
+        - 加载缓存与检索参数
+        - 准备 Query Rewrite 与最终总结链
+        """
         self.vector_store_service = VectorStoreService()
         self.vector_retriever = self.vector_store_service.get_retriever()
         self.bm25_retriever = None
@@ -327,10 +333,12 @@ class RagSummarizeService:
         self.chain = self._init_chain()
 
     def _init_chain(self):
+        """最终问答总结链：把检索上下文交给主模型生成回答。"""
         chain = self.prompt_template | self.model | StrOutputParser()
         return chain
 
     async def retriever_docs(self, query: str, profile: str = "full") -> list[Document]:
+        """按检索档位调用 retriever（`fast` 或 `full`）。"""
         retriever = self.retriever_full if profile == "full" else self.retriever_fast
         return await retriever.ainvoke(query)
 
@@ -386,6 +394,7 @@ class RagSummarizeService:
 
     @staticmethod
     def _is_generic_query(query: str) -> bool:
+        """判断是否为泛化提问（出题/随机练习类），用于随机化与兜底策略。"""
         text = str(query or "").strip()
         if not text:
             return True
@@ -397,15 +406,18 @@ class RagSummarizeService:
 
     @staticmethod
     def _normalize_query(query: str) -> str:
+        """统一 query 归一化（空白合并 + 小写），用于缓存键稳定。"""
         return re.sub(r"\s+", " ", str(query or "").strip().lower())
 
     def _build_context_cache_key(self, query: str, mode: str) -> str:
+        """构造检索上下文缓存键：`session + mode + normalized_query`。"""
         sid = current_session_id.get() or "default"
         norm = self._normalize_query(query)
         key_src = f"{sid}|{mode}|{norm}"
         return hashlib.md5(key_src.encode("utf-8")).hexdigest()
 
     def _get_cached_context(self, query: str, mode: str) -> Optional[str]:
+        """读取检索上下文缓存（仅 `rag_chat` 模式生效，带 TTL 过期）。"""
         if mode != "rag_chat":
             return None
         key = self._build_context_cache_key(query, mode)
@@ -419,6 +431,7 @@ class RagSummarizeService:
         return str(item.get("context", "") or "")
 
     def _set_cached_context(self, query: str, mode: str, context: str) -> None:
+        """写入检索上下文缓存，并做轻量 LRU 式裁剪。"""
         if mode != "rag_chat":
             return
         if not context or not str(context).strip():
@@ -469,6 +482,7 @@ class RagSummarizeService:
         return False
 
     def _rewrite_guard(self, query: str, expanded_query: str) -> str:
+        """改写保护：若重写后丢失关键锚点，把原 query 关键词补回。"""
         base = str(query or "").strip()
         expanded = str(expanded_query or "").strip()
         if self._looks_invalid_rewrite(expanded):
@@ -490,10 +504,12 @@ class RagSummarizeService:
         return guarded
 
     def _select_profile(self, query: str) -> str:
+        """检索档位选择：当前默认先 `fast`，召回不足再升级 `full`。"""
         # 延迟优先：默认先走 fast，召回不足再在 retrieve_context 中升级 full
         return "fast"
 
     def _profile_limits(self, profile: str) -> tuple[int, int]:
+        """返回档位对应的召回上限与最终保留上限。"""
         if profile == "full":
             return self.full_retrieve_top_k, self.full_final_top_k
         return self.fast_retrieve_top_k, self.fast_final_top_k
@@ -503,6 +519,7 @@ class RagSummarizeService:
         ranked_lists: List[tuple[List[Document], float]],
         rrf_k: int = 60,
     ) -> List[Document]:
+        """多路候选文档按加权 RRF 融合，常用于 HyDE 补召回后重排。"""
         scores: Dict[str, float] = {}
         doc_map: Dict[str, Document] = {}
         kk = max(1, int(rrf_k or 60))
@@ -518,6 +535,7 @@ class RagSummarizeService:
         return [doc_map[k] for k, _ in sorted_keys]
 
     async def _generate_hyde_query(self, user_query: str, expanded_query: str) -> str:
+        """生成 HyDE 假设性教材片段，仅用于向量检索补召回。"""
         model = light_chat_model or chat_model
         if model is None:
             return ""
@@ -558,6 +576,7 @@ class RagSummarizeService:
         return str(meta.get("source_filename") or meta.get("source") or "unknown")
 
     def _apply_source_cap(self, docs: List[Document], final_limit: int, per_source_cap: int = 2) -> List[Document]:
+        """来源均衡：限制单文件命中条数，提升最终上下文的来源多样性。"""
         if not docs:
             return []
         picked: List[Document] = []
@@ -647,6 +666,7 @@ class RagSummarizeService:
         retrieve_start = time.time()
         rag_inc("rag_retrieve_calls", 1)
         cache_eligible = (mode == "rag_chat")
+        # 仅 rag_chat 走上下文缓存：quiz/exam 侧通常希望实时检索，不复用旧上下文。
         if cache_eligible:
             rag_inc("rag_cache_eligible_calls", 1)
         cached_context = self._get_cached_context(query, mode)
@@ -664,6 +684,7 @@ class RagSummarizeService:
                 self.rewrite_chain.ainvoke({"question": query}),
                 timeout=3.0,
             )
+            # 改写后再过 guard，防止关键词“改飞”导致召回偏移。
             expanded_query = self._rewrite_guard(query, rewritten)
             if self._normalize_query(expanded_query) != self._normalize_query(str(rewritten or "")):
                 logger.info(f"[RAG] rewrite_guard 生效，补齐关键锚点。query={str(query)[:80]}")
@@ -724,6 +745,7 @@ class RagSummarizeService:
                     pass
 
         if self.hyde_enabled and len(context_docs) < self.hyde_trigger_min_docs:
+            # 仅低召回触发 HyDE，避免每次都增加额外延迟。
             rag_inc("hyde_trigger_count", 1)
             hyde_query = await self._generate_hyde_query(query, expanded_query)
             if hyde_query:
@@ -771,6 +793,7 @@ class RagSummarizeService:
         return context
 
     async def rag_summarize(self, query: str) -> str:
+        """完整 RAG 问答链（检索 + 总结），会写入语义缓存。"""
         session_id = current_session_id.get() or "default"
 
         cached = await self.semantic_cache.get(query, session_id)

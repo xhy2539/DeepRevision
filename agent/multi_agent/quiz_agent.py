@@ -157,6 +157,7 @@ async def _get_or_build_courseware_warmup(rag: Any, force: bool = False) -> Dict
     sid = current_session_id.get() or "default"
     lock = _WARMUP_LOCKS.setdefault(sid, asyncio.Lock())
     async with lock:
+        # 使用文件清单 fingerprint 作为缓存版本号，文件不变则直接复用。
         session_data_path = getattr(getattr(rag, "vector_store_service", None), "session_data_path", "")
         manifest = _build_courseware_manifest(session_data_path)
         files = manifest.get("files", [])
@@ -239,6 +240,7 @@ async def _get_comprehensive_rag_context(seed_topic: str = "") -> str:
         f"{base} 内存管理 虚拟内存 页面置换".strip(),
         f"{base} 文件系统 I/O 设备管理 网络通信".strip(),
     ]
+    # 4 路子查询并行覆盖不同知识域，降低“只命中一章”概率。
     # 请求级去重并按归一化 key 稳定排序，减少缓存 key 抖动
     dedup_pairs: List[Tuple[str, str]] = []
     seen = set()
@@ -1857,6 +1859,7 @@ async def generate_with_reasoning_node(state: QuizState) -> QuizState:
     except Exception as e:
         logger.warning(f"[Agent1-出题] 原生结构化输出失败，回退到文本结构化链路: {e}")
 
+    # 回退路径分三层：结构化 -> 正则抽取 -> 纯文本兜底，优先保证可交付。
     # 使用结构化输出，彻底杜绝 Markdown 混排
     try:
         result = await call_llm_structured(
@@ -1913,6 +1916,7 @@ async def critique_quiz_node(state: QuizState) -> QuizState:
 
     fast = _quick_quiz_quality_check(state)
     if fast is not None:
+        # 快速本地评审通过时跳过 LLM Critic，显著降低链路时延。
         score = fast.get("overall_score", 80)
         logger.info(f"[Agent2-Critic] 本地快速质检通过，跳过 LLM Critic，score={score}")
         update: dict = {"critique": fast}
@@ -2138,6 +2142,10 @@ async def generate_exam_with_reasoning_node(state: ExamPaperState) -> ExamPaperS
         topic_usage.setdefault(t, 0)
     topic_usage_lock = asyncio.Lock()
 
+    # 并发策略：
+    # - 题型间并发=2：平衡吞吐与模型稳定性
+    # - 题型内并发=2：避免单题型批量请求挤爆额度
+    # 目标是整体端到端更快，而不是局部峰值并发最大化。
     # 同题型并发生成（题型间并发上限=2，题型内并发上限=2）
     type_semaphore = asyncio.Semaphore(2)
     question_semaphore = asyncio.Semaphore(2)  # 题型内并发上限
@@ -2262,6 +2270,7 @@ async def critique_exam_node(state: ExamPaperState) -> ExamPaperState:
 
     if stage_fast_mode:
         # 阶段模式下，Critic 只做本地快速评审，避免 LLM 评审拖慢整链路。
+        # 这是“快速模式”在评审侧的核心行为。
         fast_critique = _build_fast_exam_critique(state, exam_paper)
         if fast_critique is not None:
             critique = fast_critique
@@ -2815,6 +2824,7 @@ async def run_quiz_agent(
     流程：出题+推理链 → Critic质疑推理链 → Revise针对批评修订（最多2轮）
     """
     quiz_started_at = time.monotonic()
+    # 检索入口策略：泛化请求走综合检索，具体考点走常规检索。
     if _is_generic_topic_request(topic):
         rag_context = await _get_comprehensive_rag_context(topic)
     else:
@@ -2873,6 +2883,7 @@ async def run_quiz_agent(
     }
     use_web = False
     gate_reason = "courseware_sufficient"
+    # 预算足够时才评估是否联网补证据，优先守住整体时延。
     if _quiz_budget_left_seconds(gate_state) > 35:
         use_web, gate_reason = await _decide_need_web_context(topic, rag_context)
     else:
@@ -3398,7 +3409,7 @@ async def run_exam_agent(
 
     logger.info(f"[Exam Agent] 校验后参数: quiz_types={quiz_types}, total_questions={total_questions}, quantity_dist={quantity_dist}")
 
-    # 如果没有样卷，联网搜索试卷格式参考
+    # 如果没有样卷，联网搜索试卷“格式参考”（用于样式，不替代课件知识证据）
     online_format_context = ""
     if not sample_paper_context or sample_paper_context.strip() == "":
         logger.info("[Exam Agent] 无样卷，联网搜索试卷格式和考点参考...")
@@ -3430,7 +3441,7 @@ async def run_exam_agent(
     else:
         logger.info("[Exam Agent] 使用本地样卷格式")
 
-    # 试卷生成只使用单份 context，避免多 topic 串行检索造成长时间阻塞
+    # 试卷生成使用单份 merged context，避免多 topic 串行检索造成长时间阻塞
     merged_topic_query = "；".join([t for t in topics if t][:6]) if topics else "本课程重点知识点"
     if _is_generic_topic_request(merged_topic_query):
         merged_context = await _get_comprehensive_rag_context(merged_topic_query)
