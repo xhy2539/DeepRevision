@@ -3,6 +3,21 @@ import { NextRequest } from 'next/server';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
+const STREAM_HEADERS: Record<string, string> = {
+  'Content-Type': 'text/event-stream; charset=utf-8',
+  'Cache-Control': 'no-cache, no-transform',
+  Connection: 'keep-alive',
+  'X-Accel-Buffering': 'no',
+};
+
+function sseErrorResponse(message: string, status: number): Response {
+  const payload = JSON.stringify({ event: 'error', error: message });
+  return new Response(`event: error\ndata: ${payload}\n\ndata: [DONE]\n\n`, {
+    status,
+    headers: STREAM_HEADERS,
+  });
+}
+
 export async function POST(request: NextRequest) {
   const body = await request.text();
   const backendCandidates = [
@@ -10,6 +25,9 @@ export async function POST(request: NextRequest) {
     'http://127.0.0.1:8001',
     'http://127.0.0.1:8000',
   ].filter((v): v is string => Boolean(v));
+  const upstreamAbort = new AbortController();
+  const onClientAbort = () => upstreamAbort.abort();
+  request.signal.addEventListener('abort', onClientAbort);
 
   try {
     let response: Response | null = null;
@@ -21,6 +39,7 @@ export async function POST(request: NextRequest) {
             'Content-Type': 'application/json; charset=utf-8',
           },
           body: body,
+          signal: upstreamAbort.signal,
         });
         if (response.ok) {
           break;
@@ -31,56 +50,74 @@ export async function POST(request: NextRequest) {
     }
 
     if (!response) {
-      return new Response(`data: {"error": "Backend unreachable"}\n\n`, {
-        status: 502,
-        headers: { 'Content-Type': 'text/event-stream' },
-      });
+      return sseErrorResponse('Backend unreachable', 502);
     }
 
     if (!response.ok) {
-      return new Response(`data: {"error": "Backend error"}\n\n`, {
-        status: response.status,
-        headers: { 'Content-Type': 'text/event-stream' },
-      });
+      return sseErrorResponse('Backend error', response.status);
     }
 
-    // 直接转发流，不做处理
+    const reader = response.body?.getReader();
+    if (!reader) {
+      return sseErrorResponse('Backend stream unavailable', 502);
+    }
+    let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+    let closed = false;
+    let readerCancelled = false;
+
+    const safeClose = () => {
+      if (closed) return;
+      closed = true;
+      if (streamController) {
+        try {
+          streamController.close();
+        } catch {}
+      }
+    };
+
+    const safeCancelReader = async () => {
+      if (readerCancelled) return;
+      readerCancelled = true;
+      try {
+        await reader.cancel();
+      } catch {}
+    };
+
     const stream = new ReadableStream({
       async start(controller) {
-        let isClosed = false;
-        const reader = response.body?.getReader();
-        if (!reader) {
-          controller.close();
-          return;
-        }
+        streamController = controller;
         try {
           while (true) {
+            if (upstreamAbort.signal.aborted || closed) break;
             const { done, value } = await reader.read();
             if (done) break;
+            if (closed) break;
             controller.enqueue(value);
           }
-        } catch (e) {
-          // 流读取中断，但前端会收到 [DONE] 终止
+        } catch {
+          // 上游中断或客户端取消时直接结束流
         } finally {
-          if (!isClosed) {
-            controller.close();
-            isClosed = true;
-          }
+          safeClose();
+          await safeCancelReader();
         }
+      },
+      async cancel() {
+        upstreamAbort.abort();
+        safeClose();
+        await safeCancelReader();
       },
     });
 
     return new Response(stream, {
       status: response.status,
-      headers: {
-        'Content-Type': 'text/event-stream',
-        'Transfer-Encoding': 'chunked',
-      },
+      headers: STREAM_HEADERS,
     });
-  } catch (error) {
-    return new Response(`data: {"error": "Proxy error"}\n\n`, {
-      status: 500,
-      headers: { 'Content-Type': 'text/event-stream' },
-    });
+  } catch {
+    if (upstreamAbort.signal.aborted) {
+      return sseErrorResponse('Client cancelled', 499);
+    }
+    return sseErrorResponse('Proxy error', 500);
+  } finally {
+    request.signal.removeEventListener('abort', onClientAbort);
   }
 }

@@ -27,6 +27,7 @@ interface AssistantPayload {
   show_analysis_default?: boolean;
   questions?: QuizQuestion[];
   exam_data?: unknown;
+  messageId?: string;
 }
 
 interface QuizExamData {
@@ -81,6 +82,23 @@ interface PracticeHistoryRecord {
   created_at: number;
 }
 
+interface KnowledgePointStat {
+  total: number;
+  correct: number;
+  accuracy: number;
+  weak: boolean;
+}
+
+interface PracticeStatsData {
+  session_id: string;
+  total_attempts: number;
+  wrong_attempts: number;
+  accuracy: number;
+  retry_rate: number;
+  weak_points: string[];
+  knowledge_point_stats: Record<string, KnowledgePointStat>;
+}
+
 interface Message {
   id: string;
   role: "user" | "assistant";
@@ -105,6 +123,71 @@ interface Session {
   id: string;
   name: string;
   parent_id?: string;
+}
+
+interface StreamDiagnostics {
+  ttft_ms: number | null;
+  first_delta_ms: number | null;
+  stream_duration_ms: number;
+  termination_reason: string;
+  heartbeat_count: number;
+}
+
+interface RuntimeStreamMetrics {
+  stream_ttft_p95_ms: number;
+  stream_first_delta_p95_ms: number;
+  stream_duration_p95_ms: number;
+  stream_client_cancel_total: number;
+  stream_timeout_total: number;
+  stream_error_total: number;
+}
+
+interface SSEFrame {
+  event?: string;
+  id?: string;
+  retry?: number;
+  data: string;
+}
+
+function parseSSEFrames(buffer: string): { frames: SSEFrame[]; rest: string } {
+  const normalized = buffer.replace(/\r\n/g, "\n");
+  const blocks = normalized.split("\n\n");
+  const rest = blocks.pop() || "";
+  const frames: SSEFrame[] = [];
+
+  for (const block of blocks) {
+    if (!block.trim()) continue;
+
+    const frame: SSEFrame = { data: "" };
+    const dataLines: string[] = [];
+    const lines = block.split("\n");
+
+    for (const rawLine of lines) {
+      if (!rawLine || rawLine.startsWith(":")) continue; // comment/heartbeat 注释行
+      const colonIndex = rawLine.indexOf(":");
+      const field = colonIndex >= 0 ? rawLine.slice(0, colonIndex) : rawLine;
+      let value = colonIndex >= 0 ? rawLine.slice(colonIndex + 1) : "";
+      if (value.startsWith(" ")) value = value.slice(1);
+
+      if (field === "event") {
+        frame.event = value;
+      } else if (field === "id") {
+        frame.id = value;
+      } else if (field === "retry") {
+        const parsed = Number.parseInt(value, 10);
+        if (Number.isFinite(parsed)) frame.retry = parsed;
+      } else if (field === "data") {
+        dataLines.push(value);
+      }
+    }
+
+    frame.data = dataLines.join("\n");
+    if (frame.data || frame.event || frame.id || frame.retry !== undefined) {
+      frames.push(frame);
+    }
+  }
+
+  return { frames, rest };
 }
 
 const SESSION_ID_REGEX = /^[\u4e00-\u9fa5a-zA-Z0-9_-]{1,64}$/;
@@ -304,26 +387,131 @@ function stripChoiceOptionPrefix(text: string): string {
 function QuizCard({
   questions,
   defaultShowAnswers = false,
+  onPracticeComplete,
+  messageId,
 }: {
   questions: QuizQuestion[];
   defaultShowAnswers?: boolean;
+  onPracticeComplete?: (
+    messageId: string,
+    score: number,
+    total: number,
+    records: PracticeRecordItem[],
+    wrongAnswers: ExamPracticeQuestion[],
+    userAnswers: Record<number, string>
+  ) => void;
+  messageId?: string;
 }) {
   const [showAnswers, setShowAnswers] = useState(defaultShowAnswers);
+  const [practiceMode, setPracticeMode] = useState(false);
+  const [selectedAnswers, setSelectedAnswers] = useState<Record<number, string>>({});
+  const [submitted, setSubmitted] = useState(false);
+  const [score, setScore] = useState(0);
+
+  const normalizeAnswer = (a: string) => a.trim().replace(/\s+/g, " ").toUpperCase();
+
+  const startPractice = () => {
+    setPracticeMode(true);
+    setSelectedAnswers({});
+    setSubmitted(false);
+    setScore(0);
+    setShowAnswers(false);
+  };
+
+  const submitPractice = () => {
+    let correctCount = 0;
+    const wrongAnswers: ExamPracticeQuestion[] = [];
+    const records: PracticeRecordItem[] = [];
+
+    questions.forEach((q, idx) => {
+      const userAnswer = normalizeAnswer(selectedAnswers[idx] || "");
+      const correctAnswer = normalizeAnswer(q.answer);
+      const isCorrect = userAnswer === correctAnswer;
+
+      if (isCorrect) {
+        correctCount++;
+      } else {
+        wrongAnswers.push({
+          number: idx + 1,
+          type: q.type,
+          content: q.question,
+          answer: q.answer,
+          analysis: q.explanation || "",
+          score: parseFloat(q.score || "0"),
+          difficulty: q.difficulty || "中等",
+        });
+      }
+
+      records.push({
+        question: {
+          number: idx + 1,
+          type: q.type,
+          content: q.question,
+          answer: q.answer,
+          analysis: q.explanation || "",
+          score: parseFloat(q.score || "0"),
+          difficulty: q.difficulty || "中等",
+        },
+        userAnswer: selectedAnswers[idx] || "",
+        isCorrect,
+      });
+    });
+
+    setScore(correctCount);
+    setSubmitted(true);
+    setShowAnswers(true);
+
+    if (onPracticeComplete && messageId) {
+      onPracticeComplete(messageId, correctCount, questions.length, records, wrongAnswers, selectedAnswers);
+    }
+  };
 
   return (
     <div className="space-y-4 my-4">
-      {/* 答案显示控制按钮 */}
-      <div className="flex justify-end mb-2">
-        <button
-          onClick={() => setShowAnswers(!showAnswers)}
-          className="text-sm px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-600 transition-colors flex items-center gap-1"
-        >
-          <span>{showAnswers ? "👁 隐藏答案" : "👁 查看答案"}</span>
-        </button>
+      {/* 工具栏 */}
+      <div className="flex justify-between items-center mb-2">
+        {practiceMode ? (
+          <div className="flex gap-2">
+            <button
+              onClick={submitPractice}
+              disabled={submitted}
+              className="text-sm px-4 py-1.5 rounded-lg bg-teal-600 hover:bg-teal-700 disabled:bg-slate-300 text-white transition-colors"
+            >
+              提交答案
+            </button>
+            {submitted && (
+              <span className="text-sm py-1.5 px-3 rounded-lg bg-slate-100 text-slate-700 font-medium">
+                得分: {score}/{questions.length}
+              </span>
+            )}
+          </div>
+        ) : (
+          <div />
+        )}
+        <div className="flex gap-2">
+          {!practiceMode && !submitted && (
+            <button
+              onClick={startPractice}
+              className="text-sm px-3 py-1.5 rounded-lg border border-teal-400 bg-teal-50 hover:bg-teal-100 text-teal-700 transition-colors"
+            >
+              开始练习
+            </button>
+          )}
+          {!practiceMode && (
+            <button
+              onClick={() => setShowAnswers(!showAnswers)}
+              className="text-sm px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-600 transition-colors flex items-center gap-1"
+            >
+              <span>{showAnswers ? "隐藏答案" : "查看答案"}</span>
+            </button>
+          )}
+        </div>
       </div>
 
       {questions.map((q, idx) => {
         const style = quizTypeStyles[q.type] || quizTypeStyles["选择题"];
+        const userAnswer = selectedAnswers[idx];
+
         return (
           <div
             key={idx}
@@ -352,19 +540,116 @@ function QuizCard({
 
             <div className="text-slate-800 mb-4 whitespace-pre-wrap text-[15px] leading-relaxed font-medium">{q.question}</div>
 
+            {/* 选择题选项 */}
             {q.options && q.options.length > 0 && (
               <div className="space-y-2 mb-4 ml-1">
-                {q.options.map((opt, optIdx) => (
-                  <div key={optIdx} className="flex items-start gap-2 text-slate-700 text-sm">
-                    <span className="w-5 h-5 rounded bg-slate-100 flex items-center justify-center text-xs font-medium text-slate-500 flex-shrink-0">
-                      {String.fromCharCode(65 + optIdx)}
-                    </span>
-                    <span>{stripChoiceOptionPrefix(opt)}</span>
-                  </div>
-                ))}
+                {q.options.map((opt, optIdx) => {
+                  const optLetter = String.fromCharCode(65 + optIdx);
+                  const isSelected = userAnswer === optLetter;
+                  const correctOptLetter = normalizeAnswer(q.answer).charAt(0);
+                  const isCorrectOpt = submitted && optLetter === correctOptLetter;
+                  const isWrongOpt = submitted && isSelected && optLetter !== correctOptLetter;
+
+                  let optClass = "bg-white border-slate-200";
+                  if (practiceMode && !submitted) {
+                    optClass = isSelected ? "bg-teal-100 border-teal-500" : "bg-white border-slate-200 hover:bg-slate-50";
+                  } else if (submitted) {
+                    optClass = isCorrectOpt ? "bg-green-100 border-green-500" : isWrongOpt ? "bg-red-100 border-red-500" : "bg-white border-slate-200";
+                  }
+
+                  return (
+                    <div
+                      key={optIdx}
+                      onClick={() => {
+                        if (practiceMode && !submitted) {
+                          setSelectedAnswers(prev => ({ ...prev, [idx]: optLetter }));
+                        }
+                      }}
+                      className={`flex items-start gap-2 text-slate-700 text-sm border-2 rounded-lg p-2 cursor-pointer transition-all ${optClass} ${practiceMode && !submitted ? "cursor-pointer" : ""}`}
+                    >
+                      <span className={`w-6 h-6 rounded flex items-center justify-center text-xs font-medium flex-shrink-0 ${
+                        isCorrectOpt ? "bg-green-500 text-white" :
+                        isWrongOpt ? "bg-red-500 text-white" :
+                        isSelected ? "bg-teal-500 text-white" :
+                        "bg-slate-100 text-slate-500"
+                      }`}>
+                        {isCorrectOpt ? "✓" : isWrongOpt ? "✗" : optLetter}
+                      </span>
+                      <span>{stripChoiceOptionPrefix(opt)}</span>
+                    </div>
+                  );
+                })}
               </div>
             )}
 
+            {/* 非选择题 */}
+            {(!q.options || q.options.length === 0) && q.type === "判断题" && (
+              <div className="flex gap-4 mb-4 ml-1">
+                {["正确", "错误"].map((opt, i) => {
+                  const optKey = opt;
+                  const isSelected = userAnswer === optKey;
+                  const isCorrectOpt = submitted && optKey === q.answer.trim();
+                  const isWrongOpt = submitted && isSelected && optKey !== q.answer.trim();
+
+                  let optClass = "bg-white border-slate-200";
+                  if (practiceMode && !submitted) {
+                    optClass = isSelected ? "bg-teal-100 border-teal-500" : "bg-white border-slate-200 hover:bg-slate-50";
+                  } else if (submitted) {
+                    optClass = isCorrectOpt ? "bg-green-100 border-green-500" : isWrongOpt ? "bg-red-100 border-red-500" : "bg-white border-slate-200";
+                  }
+
+                  return (
+                    <div
+                      key={opt}
+                      onClick={() => {
+                        if (practiceMode && !submitted) {
+                          setSelectedAnswers(prev => ({ ...prev, [idx]: optKey }));
+                        }
+                      }}
+                      className={`px-4 py-2 rounded cursor-pointer transition-all border-2 ${optClass} ${practiceMode && !submitted ? "cursor-pointer" : ""}`}
+                    >
+                      <span className={`flex-shrink-0 w-6 h-6 inline-flex items-center justify-center font-medium rounded mr-2 ${
+                        isCorrectOpt ? "bg-green-500 text-white" :
+                        isWrongOpt ? "bg-red-500 text-white" :
+                        isSelected ? "bg-teal-500 text-white" :
+                        "bg-slate-100 text-slate-600"
+                      }`}>
+                        {isCorrectOpt ? "✓" : isWrongOpt ? "✗" : "○"}
+                      </span>
+                      <span className="text-slate-700">{opt}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {(!q.options || q.options.length === 0) && q.type === "填空题" && (
+              <div className="ml-1 mb-4">
+                <input
+                  type="text"
+                  value={userAnswer || ""}
+                  onChange={(e) => {
+                    if (practiceMode && !submitted) {
+                      setSelectedAnswers(prev => ({ ...prev, [idx]: e.target.value }));
+                    }
+                  }}
+                  disabled={submitted}
+                  placeholder={practiceMode && !submitted ? "请输入答案..." : ""}
+                  className={`w-full px-4 py-2 border-2 rounded text-sm ${
+                    submitted
+                      ? normalizeAnswer(userAnswer || "") === normalizeAnswer(q.answer)
+                        ? "bg-green-50 border-green-500 text-green-800"
+                        : "bg-red-50 border-red-500 text-red-800"
+                      : "bg-white border-slate-200 focus:border-teal-500 focus:ring-1 focus:ring-teal-500"
+                  }`}
+                />
+                {submitted && normalizeAnswer(userAnswer || "") !== normalizeAnswer(q.answer) && (
+                  <div className="mt-1 text-xs text-slate-500">正确答案: <span className="font-medium text-green-700">{q.answer}</span></div>
+                )}
+              </div>
+            )}
+
+            {/* 答案（练习提交后自动显示） */}
             {showAnswers && q.answer && (
               <div className={`${style.bg} ${style.border} border-l-4 rounded-r-lg p-3 mb-3`}>
                 <div className="flex items-center gap-2 mb-1">
@@ -377,6 +662,7 @@ function QuizCard({
               </div>
             )}
 
+            {/* 解析（练习提交后自动显示） */}
             {showAnswers && q.explanation && (
               <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
                 <div className="flex items-center gap-2 mb-1">
@@ -408,13 +694,9 @@ function MarkdownContent({
   payload?: AssistantPayload;
   onRequestAnswers?: () => void;
   similarQuestions?: Record<number, SimilarQuestion[]>;
-  onPracticeComplete?: (
-    score: number,
-    total: number,
-    records: PracticeRecordItem[],
-    wrongAnswers: ExamPracticeQuestion[],
-    userAnswers: Record<number, string>
-  ) => void;
+  // Handles both ExamCanvas (5 args) and QuizCard (6 args with messageId)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  onPracticeComplete?: (...args: any[]) => void;
 }) {
   const parsedQuiz = parseQuizContent(content);
 
@@ -426,7 +708,7 @@ function MarkdownContent({
         courseName={payload?.title || "期末考试"}
         onRequestAnswers={onRequestAnswers}
         similarQuestions={similarQuestions}
-        onPracticeComplete={onPracticeComplete}
+        onPracticeComplete={onPracticeComplete as undefined}
       />
     );
   }
@@ -436,7 +718,7 @@ function MarkdownContent({
       ? payload.questions
       : parsedQuiz.questions;
     if (questions.length > 0) {
-      return <QuizCard questions={questions} />;
+      return <QuizCard questions={questions} defaultShowAnswers={false} messageId={payload?.messageId} onPracticeComplete={(msgId, sc, tot, rec, wrong) => onPracticeComplete?.(msgId, sc, tot, rec, wrong, {})} />;
     }
   }
 
@@ -457,7 +739,7 @@ function MarkdownContent({
 
   if (kind === "chat" && !parsedQuiz.isQuiz) {
     return (
-      <div className="prose-custom">
+      <div className="prose-custom chat-prose">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
@@ -502,11 +784,11 @@ function MarkdownContent({
     const questions = payload?.questions && payload.questions.length > 0
       ? payload.questions
       : parsedQuiz.questions;
-    return <QuizCard questions={questions} />;
+    return <QuizCard questions={questions} defaultShowAnswers={false} messageId={payload?.messageId} onPracticeComplete={(msgId, sc, tot, rec, wrong) => onPracticeComplete?.(msgId, sc, tot, rec, wrong, {})} />;
   }
 
   return (
-    <div className="prose-custom">
+    <div className="prose-custom chat-prose">
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
       components={{
@@ -992,26 +1274,46 @@ function SessionHistoryPanel({
   onClose: () => void;
 }) {
   const [practiceHistory, setPracticeHistory] = useState<PracticeHistoryRecord[]>([]);
+  const [practiceStats, setPracticeStats] = useState<PracticeStatsData | null>(null);
   const [loading, setLoading] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
 
-  // Fetch practice history when panel opens
+  const loadHistoryAndStats = useCallback(async () => {
+    if (!sessionId) return;
+    setLoading(true);
+    try {
+      const [historyRes, statsRes] = await Promise.all([
+        fetch(`/api/chat/practice/history?session_id=${encodeURIComponent(sessionId)}&limit=300`),
+        fetch(`/api/chat/practice/stats?session_id=${encodeURIComponent(sessionId)}`),
+      ]);
+      const historyData = await historyRes.json();
+      const statsData = await statsRes.json();
+
+      if (historyData?.code === 200 && Array.isArray(historyData.data)) {
+        setPracticeHistory(historyData.data);
+      } else {
+        setPracticeHistory([]);
+      }
+
+      if (statsData?.code === 200 && statsData?.data) {
+        setPracticeStats(statsData.data as PracticeStatsData);
+      } else {
+        setPracticeStats(null);
+      }
+    } catch {
+      setPracticeHistory([]);
+      setPracticeStats(null);
+    } finally {
+      setLoading(false);
+    }
+  }, [sessionId]);
+
+  // Fetch practice history and stats when panel opens
   useEffect(() => {
     if (!isOpen || !sessionId) return;
-    setLoading(true);
-    fetch(`/api/chat/practice/history?session_id=${encodeURIComponent(sessionId)}&limit=300`)
-      .then(res => res.json())
-      .then(data => {
-        if (data.code === 200 && Array.isArray(data.data)) {
-          setPracticeHistory(data.data);
-        } else {
-          setPracticeHistory([]);
-        }
-      })
-      .catch(() => setPracticeHistory([]))
-      .finally(() => setLoading(false));
-  }, [isOpen, sessionId]);
+    loadHistoryAndStats();
+  }, [isOpen, sessionId, loadHistoryAndStats]);
 
   const handleDeleteRecord = async (recordId: number) => {
     setDeletingId(String(recordId));
@@ -1024,6 +1326,7 @@ function SessionHistoryPanel({
       const data = await res.json();
       if (data.code === 200) {
         setPracticeHistory(prev => prev.filter(r => r.id !== recordId));
+        loadHistoryAndStats();
       }
     } catch { /* ignore */ }
     setDeletingId(null);
@@ -1039,6 +1342,7 @@ function SessionHistoryPanel({
       const data = await res.json();
       if (data.code === 200) {
         setPracticeHistory([]);
+        loadHistoryAndStats();
       }
     } catch { /* ignore */ }
     setClearing(false);
@@ -1077,7 +1381,63 @@ function SessionHistoryPanel({
         <div className="flex-1 overflow-y-auto p-4">
           {loading ? (
             <div className="text-center py-8 text-xs text-slate-400">加载中...</div>
-          ) : practiceHistory.length === 0 ? (
+          ) : (
+            <div className="space-y-4">
+              <div className="rounded-lg border border-teal-100 bg-teal-50/60 p-3">
+                <div className="text-xs font-semibold text-teal-700 mb-2">薄弱点分析看板</div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="rounded-md bg-white border border-slate-100 px-2.5 py-2">
+                    <div className="text-[11px] text-slate-500">总练习</div>
+                    <div className="text-sm font-bold text-slate-800">{practiceStats?.total_attempts ?? 0}</div>
+                  </div>
+                  <div className="rounded-md bg-white border border-slate-100 px-2.5 py-2">
+                    <div className="text-[11px] text-slate-500">正确率</div>
+                    <div className="text-sm font-bold text-emerald-700">{(practiceStats?.accuracy ?? 0).toFixed(1)}%</div>
+                  </div>
+                  <div className="rounded-md bg-white border border-slate-100 px-2.5 py-2">
+                    <div className="text-[11px] text-slate-500">错题数</div>
+                    <div className="text-sm font-bold text-amber-700">{practiceStats?.wrong_attempts ?? 0}</div>
+                  </div>
+                  <div className="rounded-md bg-white border border-slate-100 px-2.5 py-2">
+                    <div className="text-[11px] text-slate-500">错题率</div>
+                    <div className="text-sm font-bold text-amber-700">{(practiceStats?.retry_rate ?? 0).toFixed(1)}%</div>
+                  </div>
+                </div>
+                <div className="mt-3">
+                  <div className="text-[11px] text-slate-500 mb-1">薄弱知识点（正确率 &lt; 60%）</div>
+                  {(practiceStats?.weak_points?.length ?? 0) > 0 ? (
+                    <div className="flex flex-wrap gap-1.5">
+                      {(practiceStats?.weak_points ?? []).slice(0, 12).map((kp) => (
+                        <span key={kp} className="text-[11px] px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-200">
+                          {kp}
+                        </span>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="text-[11px] text-emerald-700">暂无薄弱点，继续保持。</div>
+                  )}
+                </div>
+                {practiceStats?.knowledge_point_stats && Object.keys(practiceStats.knowledge_point_stats).length > 0 && (
+                  <div className="mt-3 rounded-md border border-slate-200 bg-white overflow-hidden">
+                    <div className="px-2.5 py-1.5 text-[11px] font-medium text-slate-600 bg-slate-50 border-b">知识点正确率</div>
+                    <div className="max-h-40 overflow-y-auto">
+                      {Object.entries(practiceStats.knowledge_point_stats)
+                        .sort((a, b) => (a[1]?.accuracy ?? 0) - (b[1]?.accuracy ?? 0))
+                        .slice(0, 20)
+                        .map(([kp, stat]) => (
+                          <div key={kp} className="px-2.5 py-1.5 border-b last:border-b-0 border-slate-100 text-[11px] flex items-center justify-between gap-2">
+                            <span className="text-slate-700 truncate">{kp}</span>
+                            <span className={`font-mono ${stat.weak ? "text-amber-700" : "text-slate-500"}`}>
+                              {stat.correct}/{stat.total} · {stat.accuracy.toFixed(1)}%
+                            </span>
+                          </div>
+                        ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {practiceHistory.length === 0 ? (
             <div className="text-center py-8">
               <div className="w-10 h-10 mx-auto mb-3 rounded-full bg-slate-100 flex items-center justify-center">
                 <svg className="w-5 h-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1132,6 +1492,8 @@ function SessionHistoryPanel({
                   )}
                 </div>
               ))}
+            </div>
+          )}
             </div>
           )}
         </div>
@@ -1350,6 +1712,14 @@ export default function ChatPage() {
   // 统计
   const [totalTokens, setTotalTokens] = useState(0);
   const [responseTime, setResponseTime] = useState(0);
+  const [streamDiagnostics, setStreamDiagnostics] = useState<StreamDiagnostics>({
+    ttft_ms: null,
+    first_delta_ms: null,
+    stream_duration_ms: 0,
+    termination_reason: "idle",
+    heartbeat_count: 0,
+  });
+  const [runtimeStreamMetrics, setRuntimeStreamMetrics] = useState<RuntimeStreamMetrics | null>(null);
 
   // 模态框状态
   const [showSessionModal, setShowSessionModal] = useState(false);
@@ -1364,6 +1734,13 @@ export default function ChatPage() {
   >({});
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const streamAbortRef = useRef<AbortController | null>(null);
+
+  const stopStreaming = useCallback(() => {
+    if (streamAbortRef.current) {
+      streamAbortRef.current.abort();
+    }
+  }, []);
 
   const inferKnowledgePoint = (question: ExamPracticeQuestion): string => {
     if (question.knowledge_point && question.knowledge_point.trim()) {
@@ -1532,6 +1909,14 @@ export default function ChatPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, thoughts]);
 
+  useEffect(() => {
+    return () => {
+      if (streamAbortRef.current) {
+        streamAbortRef.current.abort();
+      }
+    };
+  }, []);
+
   // 发送消息
   const sendMessage = async (overrideText?: string, extraBody?: Record<string, unknown>) => {
     const outgoingText = (overrideText ?? input).trim();
@@ -1552,6 +1937,13 @@ export default function ChatPage() {
     setInput("");
     setIsLoading(true);
     setThoughts([]);
+    setStreamDiagnostics({
+      ttft_ms: null,
+      first_delta_ms: null,
+      stream_duration_ms: 0,
+      termination_reason: "running",
+      heartbeat_count: 0,
+    });
 
     const startTime = Date.now();
     const assistantMessageId = (Date.now() + 1).toString();
@@ -1565,17 +1957,41 @@ export default function ChatPage() {
       render_mode: "markdown",
     }]);
 
+    let fullContent = "";
+    const abortController = new AbortController();
+    streamAbortRef.current = abortController;
+    let streamTerminationReason = "success";
+    let heartbeatCount = 0;
+    let ttftMs: number | null = null;
+    let firstDeltaMs: number | null = null;
+    let seenNonPendingStart = false;
+
+    const markTtft = () => {
+      if (ttftMs === null) {
+        ttftMs = Date.now() - startTime;
+      }
+    };
+
     try {
+      const extra = (extraBody || {}) as Record<string, unknown>;
+      const resolvedExamFastMode =
+        typeof extra.exam_fast_mode === "boolean" ? Boolean(extra.exam_fast_mode) : examFastMode;
+      const resolvedQuizForceCritic =
+        typeof extra.quiz_force_llm_critic === "boolean"
+          ? Boolean(extra.quiz_force_llm_critic)
+          : !resolvedExamFastMode;
       const requestBody = {
         query: outgoingText,
         session_id: currentSession,
-        exam_fast_mode: examFastMode, // 隐式透传，不在前端回复中展示
-        ...(extraBody || {}),
+        exam_fast_mode: resolvedExamFastMode, // 快速/完整模式开关
+        quiz_force_llm_critic: resolvedQuizForceCritic, // quiz 与模式联动：完整=强制 LLM Critic
+        ...extra,
       };
       const response = await fetch("/api/chat/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(requestBody)
+        body: JSON.stringify(requestBody),
+        signal: abortController.signal,
       });
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
@@ -1583,7 +1999,6 @@ export default function ChatPage() {
 
       const reader = response.body?.getReader();
       const decoder = new TextDecoder();
-      let fullContent = "";
       let sseBuffer = "";
       let streamErrored = false;
 
@@ -1593,14 +2008,32 @@ export default function ChatPage() {
         ));
       };
 
-      const processSSEData = (data: string) => {
-        if (data === "[DONE]") return;
+      const processSSEData = (data: string, eventName?: string) => {
+        if (!data || data === "[DONE]") return;
 
         try {
-          const parsed = JSON.parse(data);
-          if (parsed.error) {
+          const parsed = JSON.parse(data) as Record<string, unknown>;
+          const semanticEvent =
+            (typeof parsed.event === "string" ? parsed.event : eventName) || "";
+          const errorValue = parsed.error;
+
+          if (semanticEvent === "heartbeat") {
+            heartbeatCount += 1;
+            return;
+          }
+          if (semanticEvent === "done") {
+            if (typeof parsed.status === "string" && parsed.status.trim()) {
+              streamTerminationReason = parsed.status.trim();
+            }
+            return;
+          }
+
+          if (semanticEvent === "error" || errorValue !== undefined) {
             streamErrored = true;
-            const errorText = typeof parsed.error === "string" ? parsed.error : "服务暂时不可用";
+            const errorText = typeof errorValue === "string" ? errorValue : "服务暂时不可用";
+            streamTerminationReason =
+              /超时|timeout/i.test(errorText) ? "timeout" : "error";
+            markTtft();
             setMessages(prev => prev.map(m =>
               m.id === assistantMessageId
                 ? { ...m, content: `[系统提示: ${errorText}]`, meta: { error: true, error_message: errorText } }
@@ -1608,76 +2041,127 @@ export default function ChatPage() {
             ));
             return;
           }
-          if (parsed.event === "start" && parsed.message) {
+
+          const parsedMessage =
+            parsed.message && typeof parsed.message === "object"
+              ? (parsed.message as Record<string, unknown>)
+              : null;
+
+          if (semanticEvent === "start" && parsedMessage) {
+            const parsedMeta =
+              parsedMessage.meta && typeof parsedMessage.meta === "object"
+                ? (parsedMessage.meta as Record<string, unknown>)
+                : {};
+            const routeTag = String(parsedMeta.route || "");
+            if (routeTag !== "pending") {
+              seenNonPendingStart = true;
+              markTtft();
+            }
             setMessages(prev => prev.map(m =>
               m.id === assistantMessageId
                 ? {
                     ...m,
-                    kind: parsed.message.kind || "chat",
-                    render_mode: parsed.message.render_mode || "markdown",
-                    meta: parsed.message.meta,
+                    kind: (parsedMessage.kind as MessageKind) || "chat",
+                    render_mode: (parsedMessage.render_mode as Message["render_mode"]) || "markdown",
+                    meta: parsedMeta || m.meta,
                   }
                 : m
             ));
             return;
           }
-          if (parsed.event === "delta" && parsed.text) {
-            fullContent += parsed.text;
+
+          const parsedText = typeof parsed.text === "string" ? parsed.text : "";
+          if (semanticEvent === "delta" && parsedText) {
+            if (seenNonPendingStart && firstDeltaMs === null) {
+              firstDeltaMs = Date.now() - startTime;
+            }
+            if (seenNonPendingStart) {
+              markTtft();
+            }
+            fullContent += parsedText;
             appendAssistantContent(fullContent);
             return;
           }
-          if (parsed.event === "complete" && parsed.message) {
-            const message = parsed.message;
-            fullContent = message.content || fullContent;
+
+          if (semanticEvent === "complete" && parsedMessage) {
+            const messageContent =
+              typeof parsedMessage.content === "string" ? parsedMessage.content : fullContent;
+            fullContent = messageContent || fullContent;
             setMessages(prev => prev.map(m =>
               m.id === assistantMessageId
                 ? {
                     ...m,
-                    content: message.content || fullContent,
-                    kind: message.kind || "chat",
-                    render_mode: message.render_mode || "markdown",
-                    payload: message.payload,
-                    meta: message.meta,
+                    content: messageContent || fullContent,
+                    kind: (parsedMessage.kind as MessageKind) || "chat",
+                    render_mode: (parsedMessage.render_mode as Message["render_mode"]) || "markdown",
+                    payload: parsedMessage.payload as AssistantPayload | undefined,
+                    meta: parsedMessage.meta as Record<string, unknown> | undefined,
                   }
                 : m
             ));
             return;
           }
-          if (parsed.text) {
+
+          if (parsedText) {
             // 跳过 think 标签内容
-            if (parsed.text.trim().startsWith("<think>")) {
+            if (parsedText.trim().startsWith("<think>")) {
               return;
             }
             // 检测系统思考
-            if (parsed.text.includes("**[系统思考")) {
-              const match = parsed.text.match(/\*\*(.*?)\*\*/);
+            if (parsedText.includes("**[系统思考")) {
+              const match = parsedText.match(/\*\*(.*?)\*\*/);
               if (match) {
                 const thought = match[1].replace("[系统思考：", "").replace("]", "");
                 setThoughts(prev => [...prev, thought]);
               }
             } else {
-              fullContent += parsed.text;
+              fullContent += parsedText;
               appendAssistantContent(fullContent);
             }
+            return;
           }
+
+          // 有 event 但 data 里不是标准对象时忽略，保持前向兼容
         } catch {
-          // 忽略解析错误（可能是非 JSON 的 data 行）
+          if (eventName === "delta" && data) {
+            // 兼容纯文本 delta
+            if (seenNonPendingStart && firstDeltaMs === null) {
+              firstDeltaMs = Date.now() - startTime;
+            }
+            if (seenNonPendingStart) {
+              markTtft();
+            }
+            fullContent += data;
+            appendAssistantContent(fullContent);
+            return;
+          }
+          if (eventName === "error") {
+            streamErrored = true;
+            const errorText = data || "服务暂时不可用";
+            streamTerminationReason =
+              /超时|timeout/i.test(errorText) ? "timeout" : "error";
+            markTtft();
+            setMessages(prev => prev.map(m =>
+              m.id === assistantMessageId
+                ? { ...m, content: `[系统提示: ${errorText}]`, meta: { error: true, error_message: errorText } }
+                : m
+            ));
+          }
         }
       };
 
       if (reader) {
         while (true) {
+          if (abortController.signal.aborted) break;
           const { done, value } = await reader.read();
           if (done) break;
 
           sseBuffer += decoder.decode(value, { stream: true });
-          const lines = sseBuffer.split("\n");
-          sseBuffer = lines.pop() || "";
+          const parsed = parseSSEFrames(sseBuffer);
+          sseBuffer = parsed.rest;
 
-          for (const rawLine of lines) {
-            const line = rawLine.trimEnd();
-            if (!line.startsWith("data: ")) continue;
-            processSSEData(line.slice(6));
+          for (const frame of parsed.frames) {
+            processSSEData(frame.data, frame.event);
             if (streamErrored) break;
           }
           if (streamErrored) {
@@ -1685,11 +2169,14 @@ export default function ChatPage() {
           }
         }
 
-        // 处理最后一个可能未换行结束的片段
+        // 处理最后一个可能未双换行结束的片段
         sseBuffer += decoder.decode();
-        const finalLine = sseBuffer.trim();
-        if (finalLine.startsWith("data: ")) {
-          processSSEData(finalLine.slice(6));
+        if (sseBuffer.trim()) {
+          const parsedTail = parseSSEFrames(`${sseBuffer}\n\n`);
+          for (const frame of parsedTail.frames) {
+            processSSEData(frame.data, frame.event);
+            if (streamErrored) break;
+          }
         }
 
         if (!streamErrored && !fullContent.trim()) {
@@ -1699,24 +2186,55 @@ export default function ChatPage() {
               : m
           ));
         }
+
+        try {
+          await reader.cancel();
+        } catch {}
       } else {
         setMessages(prev => prev.map(m =>
           m.id === assistantMessageId ? { ...m, content: "流式连接不可用，请稍后重试。" } : m
         ));
       }
 
-      // 更新统计
-      setResponseTime((Date.now() - startTime) / 1000);
-      setTotalTokens(prev => prev + Math.ceil(fullContent.length / 4));
     } catch (error) {
-      console.error("Chat error:", error);
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      setMessages(prev => prev.map(m =>
-        m.id === assistantMessageId
-          ? { ...m, content: `请求失败: ${errorMessage}`, meta: { error: true, error_message: errorMessage } }
-          : m
-      ));
+      const aborted =
+        abortController.signal.aborted ||
+        (error instanceof DOMException && error.name === "AbortError");
+      if (aborted) {
+        streamTerminationReason = "client_cancelled";
+        setMessages(prev => prev.map(m =>
+          m.id === assistantMessageId
+            ? {
+                ...m,
+                content: fullContent.trim() ? fullContent : "已停止生成。",
+                meta: { ...(m.meta || {}), cancelled: true },
+              }
+            : m
+        ));
+      } else {
+        streamTerminationReason = "error";
+        console.error("Chat error:", error);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        setMessages(prev => prev.map(m =>
+          m.id === assistantMessageId
+            ? { ...m, content: `请求失败: ${errorMessage}`, meta: { error: true, error_message: errorMessage } }
+            : m
+        ));
+      }
     } finally {
+      const finalDurationMs = Date.now() - startTime;
+      setResponseTime(finalDurationMs / 1000);
+      setTotalTokens(prev => prev + Math.ceil(fullContent.length / 4));
+      setStreamDiagnostics({
+        ttft_ms: ttftMs,
+        first_delta_ms: firstDeltaMs,
+        stream_duration_ms: finalDurationMs,
+        termination_reason: streamTerminationReason,
+        heartbeat_count: heartbeatCount,
+      });
+      if (streamAbortRef.current === abortController) {
+        streamAbortRef.current = null;
+      }
       setIsLoading(false);
     }
   };
@@ -1802,12 +2320,37 @@ export default function ChatPage() {
     }
   }, []);
 
+  // 获取流式运行指标（后端聚合）
+  const fetchRuntimeStreamMetrics = useCallback(async () => {
+    try {
+      const res = await fetch("/api/chat/metrics");
+      const data = await res.json();
+      if (data?.code === 200 && data?.data) {
+        const metricData = data.data as Record<string, unknown>;
+        setRuntimeStreamMetrics({
+          stream_ttft_p95_ms: Number(metricData.stream_ttft_p95_ms || 0),
+          stream_first_delta_p95_ms: Number(metricData.stream_first_delta_p95_ms || 0),
+          stream_duration_p95_ms: Number(metricData.stream_duration_p95_ms || 0),
+          stream_client_cancel_total: Number(metricData.stream_client_cancel_total || 0),
+          stream_timeout_total: Number(metricData.stream_timeout_total || 0),
+          stream_error_total: Number(metricData.stream_error_total || 0),
+        });
+      }
+    } catch (error) {
+      console.error("Failed to fetch runtime metrics:", error);
+    }
+  }, []);
+
   // 定期刷新统计
   useEffect(() => {
     fetchTokenStats();
-    const interval = setInterval(fetchTokenStats, 30000); // 每30秒刷新
+    fetchRuntimeStreamMetrics();
+    const interval = setInterval(() => {
+      void fetchTokenStats();
+      void fetchRuntimeStreamMetrics();
+    }, 30000); // 每30秒刷新
     return () => clearInterval(interval);
-  }, [fetchTokenStats]);
+  }, [fetchTokenStats, fetchRuntimeStreamMetrics]);
 
   // 创建会话
   const createSession = async (name: string, parentId?: string) => {
@@ -1972,7 +2515,7 @@ export default function ChatPage() {
             <span className="text-[0.65rem] font-mono text-slate-300 uppercase tracking-widest">算力核心</span>
           </div>
           <div className="h-3 w-px bg-slate-700"></div>
-          <div className="flex items-center gap-4 text-[0.7rem] font-mono text-slate-50">
+          <div className="flex items-center gap-4 text-[0.7rem] font-mono text-slate-50 flex-wrap">
             <div className="flex items-baseline gap-1">
               <span className="text-slate-400">总消耗 Tokens</span>
               <span className="font-bold text-white tracking-tight">{totalTokens}</span>
@@ -1981,6 +2524,42 @@ export default function ChatPage() {
               <span className="text-slate-400">响应延迟</span>
               <span className="font-bold text-teal-400 tracking-tight">{responseTime.toFixed(2)}s</span>
             </div>
+            <div className="flex items-baseline gap-1">
+              <span className="text-slate-400">TTFT</span>
+              <span className="font-bold text-emerald-400 tracking-tight">
+                {streamDiagnostics.ttft_ms !== null ? `${streamDiagnostics.ttft_ms}ms` : "--"}
+              </span>
+            </div>
+            <div className="flex items-baseline gap-1">
+              <span className="text-slate-400">首Delta</span>
+              <span className="font-bold text-emerald-300 tracking-tight">
+                {streamDiagnostics.first_delta_ms !== null ? `${streamDiagnostics.first_delta_ms}ms` : "--"}
+              </span>
+            </div>
+            <div className="flex items-baseline gap-1">
+              <span className="text-slate-400">流时长</span>
+              <span className="font-bold text-cyan-300 tracking-tight">{streamDiagnostics.stream_duration_ms}ms</span>
+            </div>
+            <div className="flex items-baseline gap-1">
+              <span className="text-slate-400">终止</span>
+              <span className="font-bold text-amber-300 tracking-tight">{streamDiagnostics.termination_reason}</span>
+            </div>
+            <div className="flex items-baseline gap-1">
+              <span className="text-slate-400">心跳</span>
+              <span className="font-bold text-sky-300 tracking-tight">{streamDiagnostics.heartbeat_count}</span>
+            </div>
+            {runtimeStreamMetrics && (
+              <>
+                <div className="flex items-baseline gap-1">
+                  <span className="text-slate-400">TTFT P95</span>
+                  <span className="font-bold text-violet-300 tracking-tight">{runtimeStreamMetrics.stream_ttft_p95_ms}ms</span>
+                </div>
+                <div className="flex items-baseline gap-1">
+                  <span className="text-slate-400">流时长 P95</span>
+                  <span className="font-bold text-violet-200 tracking-tight">{runtimeStreamMetrics.stream_duration_p95_ms}ms</span>
+                </div>
+              </>
+            )}
           </div>
         </div>
 
@@ -2150,12 +2729,19 @@ export default function ChatPage() {
                       message.role === "user"
                         ? "rounded-tr-md"
                         : "rounded-tl-md border"
-                    }`} style={{
+                    } ${message.role === "assistant" && (message.kind ?? "chat") === "chat" ? "chat-message" : ""}`} style={{
                       background: message.role === "user"
                         ? '#f1f5f9'
-                        : 'rgba(255,255,255,0.9)',
+                        : ((message.kind ?? "chat") === "chat"
+                          ? 'linear-gradient(145deg, rgba(255,255,255,0.98) 0%, rgba(244,252,251,0.96) 100%)'
+                          : 'rgba(255,255,255,0.9)'),
                       color: message.role === "user" ? '#334155' : '#1e293b',
-                      borderColor: 'rgba(180,170,150,0.2)'
+                      borderColor: ((message.kind ?? "chat") === "chat")
+                        ? 'rgba(13,148,136,0.18)'
+                        : 'rgba(180,170,150,0.2)',
+                      boxShadow: ((message.kind ?? "chat") === "chat")
+                        ? '0 8px 24px rgba(15,118,110,0.08)'
+                        : '0 2px 6px rgba(15,23,42,0.06)'
                     }}>
                       <MarkdownContent
                         content={message.content || (message.role === "assistant" && isLoading ? "正在思考中..." : "")}
@@ -2301,20 +2887,32 @@ export default function ChatPage() {
                 </div>
                 <button
                   id="send-btn"
-                  onClick={() => sendMessage()}
-                  disabled={isLoading || !input.trim()}
+                  onClick={() => {
+                    if (isLoading) {
+                      stopStreaming();
+                    } else {
+                      void sendMessage();
+                    }
+                  }}
+                  disabled={!isLoading && !input.trim()}
                   className="mb-2 mr-2 p-3 rounded-xl transition-all duration-300 disabled:opacity-40 disabled:cursor-not-allowed"
                   style={{
-                    background: input.trim() && !isLoading
-                      ? 'linear-gradient(135deg, #2d3436 0%, #636e72 100%)'
-                      : 'rgba(200,200,200,0.3)',
-                    boxShadow: input.trim() && !isLoading
-                      ? '0 2px 12px rgba(45,52,54,0.3)'
+                    background: isLoading
+                      ? 'linear-gradient(135deg, #7f1d1d 0%, #b91c1c 100%)'
+                      : input.trim()
+                        ? 'linear-gradient(135deg, #2d3436 0%, #636e72 100%)'
+                        : 'rgba(200,200,200,0.3)',
+                    boxShadow: isLoading
+                      ? '0 2px 12px rgba(185,28,28,0.25)'
+                      : input.trim()
+                        ? '0 2px 12px rgba(45,52,54,0.3)'
                       : 'none'
                   }}
                 >
                   {isLoading ? (
-                    <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
+                    <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24" aria-label="停止生成">
+                      <rect x="6" y="6" width="12" height="12" rx="2" />
+                    </svg>
                   ) : (
                     <svg className="w-4 h-4" fill="none" stroke="white" viewBox="0 0 24 24" style={{ opacity: input.trim() ? 1 : 0.5 }}>
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
@@ -2326,6 +2924,12 @@ export default function ChatPage() {
                 <span>Enter 发送</span>
                 <span style={{ opacity: 0.5 }}>·</span>
                 <span>Shift + Enter 换行</span>
+                {isLoading && (
+                  <>
+                    <span style={{ opacity: 0.5 }}>·</span>
+                    <span>点击红色按钮停止</span>
+                  </>
+                )}
               </div>
             </div>
           </div>

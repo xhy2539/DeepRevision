@@ -2,12 +2,16 @@ import json
 import asyncio
 import re
 import time
+from contextlib import suppress
+from functools import lru_cache
 from fastapi import APIRouter, Body, Request, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 
 from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 
 from agent.tools.agent_tools import clear_rag_cache
 from agent.multi_agent.supervisor import supervisor_workflow
@@ -15,7 +19,9 @@ from api.message_protocol import build_assistant_message
 from utils.logger_handler import logger, update_token_stats, get_system_stats
 from utils.memory_service import memory_manager
 from utils.session_context import current_session_id
+from utils.rag_metrics import rag_get_metrics_snapshot
 from rag.vector_store import VectorStoreService
+from model.factory import light_chat_model, backup_light_chat_model, chat_model
 
 router = APIRouter()
 _VALID_SESSION_ID = re.compile(r'^[\u4e00-\u9fa5a-zA-Z0-9_\-]{1,64}$')
@@ -48,6 +54,22 @@ RUNTIME_METRICS: Dict[str, Any] = {
     "hard_fail_count": 0,
     "critic_timeout_count": 0,
     "last_error": "",
+    "stream_requests_total": 0,
+    "stream_success_total": 0,
+    "stream_error_total": 0,
+    "stream_client_cancel_total": 0,
+    "stream_timeout_total": 0,
+    "stream_heartbeat_sent_total": 0,
+    "stream_ttft_samples_ms": [],
+    "stream_first_delta_samples_ms": [],
+    "stream_duration_samples_ms": [],
+    "stream_termination_reason_counts": {
+        "success": 0,
+        "error": 0,
+        "timeout": 0,
+        "client_cancelled": 0,
+        "cancelled": 0,
+    },
 }
 
 
@@ -82,6 +104,11 @@ class SimilarBatchRequest(BaseModel):
     session_id: str = "default"
     wrong_questions: List[SimilarBatchItem]
     limit: int = 3
+
+
+class PracticeHistoryDeleteRequest(BaseModel):
+    session_id: str = "default"
+    record_id: int
 
 
 def _clean_answer(answer: str) -> str:
@@ -268,6 +295,24 @@ def _record_exam_stage_latency(latency_ms: int):
         pass
 
 
+def _record_runtime_sample(metric_key: str, value: int, max_len: int = 500):
+    try:
+        samples = RUNTIME_METRICS.setdefault(metric_key, [])
+        samples.append(int(value))
+        if len(samples) > max_len:
+            del samples[:-max_len]
+    except Exception:
+        pass
+
+
+def _record_stream_termination(reason: str):
+    try:
+        counts = RUNTIME_METRICS.setdefault("stream_termination_reason_counts", {})
+        counts[reason] = int(counts.get(reason, 0)) + 1
+    except Exception:
+        pass
+
+
 def _calc_p95(values: List[int]) -> int:
     if not values:
         return 0
@@ -280,6 +325,83 @@ def _validate_session_id(session_id: str) -> str:
     if not _VALID_SESSION_ID.match(session_id):
         raise HTTPException(status_code=400, detail="非法 session_id")
     return session_id
+
+
+def _extract_kp_rule(raw_kp: str, question_content: str) -> str:
+    s = str(raw_kp or "").strip() or str(question_content or "").strip()
+    if not s:
+        return "未标注"
+    s = re.sub(r"`([^`]+)`", r"\1", s)
+    s = re.sub(r"[*_#>\[\]\(\)✅❌⚠️•·]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+
+    patterns = [
+        r"下列关于(.{2,24}?)的",
+        r"关于(.{2,24}?)的",
+        r"在(.{2,24}?)中",
+        r"(.{2,24}?)机制",
+        r"(.{2,24}?)管理",
+        r"(.{2,24}?)调度",
+        r"(.{2,24}?)系统",
+    ]
+    for p in patterns:
+        m = re.search(p, s)
+        if m:
+            cand = str(m.group(1) or "").strip("：:，,。.;；!?！？ ")
+            if 2 <= len(cand) <= 24:
+                s = cand
+                break
+
+    s = re.split(r"[；;。!?！？\n\r]", s)[0].strip()
+    s = re.sub(r"^(下列|以下|请|试|简述|说明|判断|选择|哪个|哪一项|当|在)\s*", "", s).strip()
+    s = s.strip("：:，,。.;；!?！？ ")
+    if len(s) > 24:
+        s = s[:24].rstrip("：:，,。.;；!?！？ ")
+    return s or "未标注"
+
+
+@lru_cache(maxsize=256)
+def _kp_polish_prompt_template() -> PromptTemplate:
+    return PromptTemplate.from_template(
+        "你是课程考点提炼器。请把输入内容提炼为一个“名词性考点短语”，用于题库检索。"
+        "\n要求："
+        "\n1) 只输出一个短语，不要句子，不要解释。"
+        "\n2) 长度 4-16 字优先。"
+        "\n3) 禁止输出“下列关于/哪一项/请说明/如何”等问句模板词。"
+        "\n4) 如果输入本身已有合适考点，做轻微润色即可。"
+        "\n输入考点: {raw_kp}"
+        "\n输入题干: {question}"
+    )
+
+
+async def _polish_knowledge_point(raw_kp: str, question_content: str) -> str:
+    base = _extract_kp_rule(raw_kp, question_content)
+    # 规则已较好时直接返回，避免额外延迟
+    if 4 <= len(base) <= 16 and not re.search(r"(下列|以下|哪一项|请|如何|是否)", base):
+        return base
+
+    model = light_chat_model or backup_light_chat_model or chat_model
+    if model is None:
+        return base
+
+    try:
+        chain = _kp_polish_prompt_template() | model | StrOutputParser()
+        result = await asyncio.wait_for(
+            chain.ainvoke({"raw_kp": raw_kp or "", "question": question_content or ""}),
+            timeout=3.0,
+        )
+        polished = _extract_kp_rule(result, question_content)
+        return polished or base
+    except Exception:
+        return base
+
+
+def _format_sse(payload: Any, event_name: Optional[str] = None) -> str:
+    """统一 SSE 输出格式，兼容 event + data 协议字段。"""
+    body = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+    if event_name:
+        return f"event: {event_name}\ndata: {body}\n\n"
+    return f"data: {body}\n\n"
 
 
 @router.post("/stream")
@@ -296,6 +418,8 @@ async def chat_stream_endpoint(request: Request):
     exam_rerun_stage = body.get("exam_rerun_stage")
     exam_partial_questions = body.get("exam_partial_questions") if isinstance(body.get("exam_partial_questions"), list) else []
     exam_fast_mode = bool(body.get("exam_fast_mode", True))  # True=快速路径(格式检查), False=完整路径(LLM Critique)
+    # 兼容旧前端“full模式”只传 exam_fast_mode=false 的场景：quiz 也强制走 LLM Critic
+    quiz_force_llm_critic = bool(body.get("quiz_force_llm_critic", not exam_fast_mode))
     logger.info(f"session_id={session_id}, query={query[:50]}...")
 
     # 安全校验
@@ -312,12 +436,17 @@ async def chat_stream_endpoint(request: Request):
         if msg["role"] == "user":
             chat_history.append(HumanMessage(content=msg["content"]))
         else:
+            meta = msg.get("meta") if isinstance(msg.get("meta"), dict) else {}
+            if bool(meta.get("cancelled")):
+                # 用户中途取消的半截回答不参与后续上下文，避免污染检索与生成。
+                continue
             chat_history.append(AIMessage(content=msg["content"]))
 
     graph_context = memory_manager.get_memory_context(session_id)
 
     async def event_stream():
         _safe_inc("total_requests")
+        _safe_inc("stream_requests_total")
         initial_state = {
             "input": query,
             "chat_history": chat_history,
@@ -327,6 +456,7 @@ async def chat_stream_endpoint(request: Request):
             "exam_rerun_stage": exam_rerun_stage,
             "exam_partial_questions": exam_partial_questions,
             "exam_fast_mode": exam_fast_mode,
+            "quiz_force_llm_critic": quiz_force_llm_critic,
             "route": "",
             "route_reason": "",
             "route_params": {},
@@ -337,25 +467,66 @@ async def chat_stream_endpoint(request: Request):
         logger.info("开始执行 Supervisor 工作流...")
         stream_start = time.time()
         answer = ""  # 初始化 answer 变量
+        sent_content = ""  # 仅累积已真正发送给前端的正文片段
         error_text = ""
         message = None
+        client_disconnected = False
+        termination_reason = "success"
+        stream_ttft_ms: Optional[int] = None
+        stream_first_delta_ms: Optional[int] = None
+        workflow_task: Optional[asyncio.Task] = None
+
+        def _mark_ttft_if_needed():
+            nonlocal stream_ttft_ms
+            if stream_ttft_ms is None:
+                stream_ttft_ms = int((time.time() - stream_start) * 1000)
+
         try:
             # 先发送一个占位消息，避免长耗时任务期间前端完全空白
-            pending_start = json.dumps(
+            yield _format_sse(
                 {'event': 'start', 'message': {'kind': 'chat', 'render_mode': 'markdown', 'meta': {'route': 'pending'}}},
-                ensure_ascii=False,
+                event_name="start",
             )
-            pending_delta = json.dumps(
+            yield _format_sse(
                 {'event': 'delta', 'text': '正在生成内容，请稍候...\n'},
-                ensure_ascii=False,
+                event_name="delta",
             )
-            yield f"data: {pending_start}\n\n"
-            yield f"data: {pending_delta}\n\n"
 
-            result = await asyncio.wait_for(
-                supervisor_workflow.ainvoke(initial_state),
-                timeout=660.0,  # 外层略大于 10 分钟出卷预算，避免前后层超时打架
-            )
+            workflow_timeout_s = 660.0  # 外层略大于 10 分钟出卷预算，避免前后层超时打架
+            heartbeat_interval_s = 8.0
+            deadline = time.time() + workflow_timeout_s
+            last_heartbeat_at = time.time()
+            workflow_task = asyncio.create_task(supervisor_workflow.ainvoke(initial_state))
+
+            while True:
+                if await request.is_disconnected():
+                    client_disconnected = True
+                    logger.info("检测到客户端断开，取消本次 supervisor_workflow")
+                    workflow_task.cancel()
+                    raise asyncio.CancelledError()
+
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    workflow_task.cancel()
+                    raise asyncio.TimeoutError()
+
+                try:
+                    result = await asyncio.wait_for(asyncio.shield(workflow_task), timeout=min(1.0, remaining))
+                    break
+                except asyncio.TimeoutError:
+                    now = time.time()
+                    if now - last_heartbeat_at >= heartbeat_interval_s:
+                        _safe_inc("stream_heartbeat_sent_total")
+                        yield _format_sse(
+                            {
+                                "event": "heartbeat",
+                                "status": "running",
+                                "elapsed_ms": int((now - stream_start) * 1000),
+                            },
+                            event_name="heartbeat",
+                        )
+                        last_heartbeat_at = now
+
             workflow_latency_ms = int((time.time() - stream_start) * 1000)
             raw_subagent_result = result.get("subagent_result", "")
             structured_result = raw_subagent_result if isinstance(raw_subagent_result, dict) else None
@@ -380,16 +551,27 @@ async def chat_stream_endpoint(request: Request):
                 if structured_result is not None:
                     structured_result = {**structured_result, "text": answer}
                 message = build_assistant_message(route, answer, session_id, route_params, structured_result)
-                yield f"data: {json.dumps({'event': 'start', 'message': {'kind': message['kind'], 'render_mode': message['render_mode'], 'meta': message['meta']}}, ensure_ascii=False)}\n\n"
+                _mark_ttft_if_needed()
+                yield _format_sse(
+                    {'event': 'start', 'message': {'kind': message['kind'], 'render_mode': message['render_mode'], 'meta': message['meta']}},
+                    event_name="start",
+                )
 
                 if message["kind"] == "chat":
                     # 普通对话维持伪流式
                     for i, line in enumerate(answer.splitlines(keepends=True)):
+                        if await request.is_disconnected():
+                            client_disconnected = True
+                            logger.info("客户端在回答流式输出阶段断开连接")
+                            raise asyncio.CancelledError()
                         logger.info(f"[Stream] line{i}: {line}")
-                        yield f"data: {json.dumps({'event': 'delta', 'text': line}, ensure_ascii=False)}\n\n"
+                        if stream_first_delta_ms is None:
+                            stream_first_delta_ms = int((time.time() - stream_start) * 1000)
+                        yield _format_sse({'event': 'delta', 'text': line}, event_name="delta")
+                        sent_content += line
                         await asyncio.sleep(0.03)
 
-                yield f"data: {json.dumps({'event': 'complete', 'message': message}, ensure_ascii=False)}\n\n"
+                yield _format_sse({'event': 'complete', 'message': message}, event_name="complete")
                 if route == "exam" and message.get("kind") == "exam_paper":
                     exam_data = (message.get("payload") or {}).get("exam_data", {})
                     exam_questions = exam_data.get("questions", []) if isinstance(exam_data, dict) else []
@@ -497,22 +679,67 @@ async def chat_stream_endpoint(request: Request):
                 )
                 logger.info(f"[Latency] supervisor_workflow_ms={workflow_latency_ms}")
 
+        except asyncio.CancelledError:
+            if client_disconnected:
+                termination_reason = "client_cancelled"
+                logger.info("流式连接已断开，本次请求停止继续推送")
+            else:
+                termination_reason = "cancelled"
+                logger.warning("流式任务被取消")
+                _safe_inc("failed_requests")
+                error_text = "请求已取消，请稍后重试"
+                RUNTIME_METRICS["last_error"] = error_text
+                _mark_ttft_if_needed()
+                yield _format_sse({'event': 'error', 'error': error_text}, event_name="error")
         except asyncio.TimeoutError:
+            termination_reason = "timeout"
             logger.error("流式输出异常: supervisor_workflow timeout")
             _safe_inc("failed_requests")
             error_text = "出题耗时过长已超时，请缩小题量或减少考点后重试"
             RUNTIME_METRICS["last_error"] = error_text
             logger.info(f"[Latency] supervisor_workflow_failed_ms={int((time.time()-stream_start)*1000)}")
-            yield f"data: {json.dumps({'error': error_text}, ensure_ascii=False)}\n\n"
+            _mark_ttft_if_needed()
+            yield _format_sse({'event': 'error', 'error': error_text}, event_name="error")
         except Exception as e:
+            termination_reason = "error"
             logger.error(f"流式输出异常: {e}")
             _safe_inc("failed_requests")
             error_text = str(e) or "请求超时，请稍后重试"
             RUNTIME_METRICS["last_error"] = error_text
             logger.info(f"[Latency] supervisor_workflow_failed_ms={int((time.time()-stream_start)*1000)}")
-            yield f"data: {json.dumps({'error': error_text}, ensure_ascii=False)}\n\n"
+            _mark_ttft_if_needed()
+            yield _format_sse({'event': 'error', 'error': error_text}, event_name="error")
+        finally:
+            if workflow_task is not None and not workflow_task.done():
+                workflow_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await workflow_task
 
-        yield "data: [DONE]\n\n"
+        stream_duration_ms = int((time.time() - stream_start) * 1000)
+        _record_runtime_sample("stream_duration_samples_ms", stream_duration_ms)
+        if stream_ttft_ms is not None:
+            _record_runtime_sample("stream_ttft_samples_ms", stream_ttft_ms)
+        if stream_first_delta_ms is not None:
+            _record_runtime_sample("stream_first_delta_samples_ms", stream_first_delta_ms)
+        _record_stream_termination(termination_reason)
+
+        if termination_reason == "success":
+            _safe_inc("stream_success_total")
+        elif termination_reason == "client_cancelled":
+            _safe_inc("stream_client_cancel_total")
+        elif termination_reason == "timeout":
+            _safe_inc("stream_timeout_total")
+            _safe_inc("stream_error_total")
+        else:
+            _safe_inc("stream_error_total")
+
+        if not client_disconnected:
+            yield _format_sse(
+                {"event": "done", "status": termination_reason},
+                event_name="done",
+            )
+            # 兼容旧前端：保留 [DONE] 终止标记
+            yield "data: [DONE]\n\n"
 
         # 保存对话历史（成功/失败都要记录用户输入，避免历史断层）
         now = int(time.time() * 1000)
@@ -522,12 +749,34 @@ async def chat_stream_endpoint(request: Request):
             query,
             timestamp=now,
         )
+
+        if client_disconnected:
+            if sent_content.strip():
+                ai_meta = message.get("meta") if message and isinstance(message.get("meta"), dict) else {}
+                ai_meta = {
+                    **ai_meta,
+                    "cancelled": True,
+                    "termination_reason": "client_cancelled",
+                }
+                await memory_manager.add_message(
+                    session_id,
+                    "ai",
+                    sent_content,
+                    kind="chat",
+                    render_mode="markdown",
+                    payload=None,
+                    meta=ai_meta,
+                    timestamp=now + 1,
+                )
+            return
+
         if answer:
             ai_meta = message.get("meta") if message else None
             if not isinstance(ai_meta, dict):
                 ai_meta = {}
             if error_text:
                 ai_meta = {**ai_meta, "error": True, "error_message": error_text}
+            ai_meta = {**ai_meta, "termination_reason": termination_reason}
             await memory_manager.add_message(
                 session_id,
                 "ai",
@@ -546,11 +795,20 @@ async def chat_stream_endpoint(request: Request):
                 kind="chat",
                 render_mode="markdown",
                 payload=None,
-                meta={"error": True, "error_message": error_text},
+                meta={"error": True, "error_message": error_text, "termination_reason": termination_reason},
                 timestamp=now + 1,
             )
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/practice/submit")
@@ -558,49 +816,92 @@ async def submit_practice_records(req: PracticeSubmitRequest = Body(...)):
     """
     提交练习记录（错题追踪主入口）。
     """
-    session_id = req.session_id or "default"
-    _validate_session_id(session_id)
+    try:
+        session_id = req.session_id or "default"
+        _validate_session_id(session_id)
 
-    if not req.records:
-        return {"code": 200, "message": "无记录需要提交", "saved": 0}
+        if not req.records:
+            return {"code": 200, "message": "无记录需要提交", "saved": 0}
 
-    current_session_id.set(session_id)
-    saved = 0
-    for idx, record in enumerate(req.records):
-        qid = record.question_id or f"{session_id}_{record.question_number or idx + 1}_{int(time.time() * 1000)}"
-        memory_manager.add_practice_record(
-            session_id=session_id,
-            question_id=qid,
-            question_content=record.question_content,
-            knowledge_point=record.knowledge_point or "",
-            user_answer=record.user_answer,
-            correct_answer=record.correct_answer,
-            is_correct=record.is_correct,
-            wrong_reason=record.wrong_reason,
+        current_session_id.set(session_id)
+        saved = 0
+        # 同批次知识点去重 + 归一化（规则优先，LLM 小规模润色）
+        kp_map: Dict[str, str] = {}
+        unique_items: List[tuple[str, str, str]] = []
+        for record in req.records:
+            raw_kp = str(record.knowledge_point or "")
+            q_content = str(record.question_content or "")
+            key = f"{raw_kp}|||{q_content[:160]}"
+            if key not in kp_map:
+                kp_map[key] = ""
+                unique_items.append((key, raw_kp, q_content))
+
+        llm_budget = 8  # 每次提交最多润色 8 个唯一考点，控制延迟
+        sem = asyncio.Semaphore(4)
+
+        async def _norm_one(item: tuple[str, str, str], use_llm: bool):
+            key, raw_kp, q_content = item
+            if use_llm:
+                async with sem:
+                    kp_map[key] = await _polish_knowledge_point(raw_kp, q_content)
+            else:
+                kp_map[key] = _extract_kp_rule(raw_kp, q_content)
+
+        tasks = []
+        for idx, item in enumerate(unique_items):
+            tasks.append(_norm_one(item, use_llm=(idx < llm_budget)))
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        for idx, record in enumerate(req.records):
+            qid = record.question_id or f"{session_id}_{record.question_number or idx + 1}_{int(time.time() * 1000)}"
+            kp_key = f"{str(record.knowledge_point or '')}|||{str(record.question_content or '')[:160]}"
+            normalized_kp = kp_map.get(kp_key) or _extract_kp_rule(record.knowledge_point or "", record.question_content or "")
+            try:
+                memory_manager.add_practice_record(
+                    session_id=session_id,
+                    question_id=qid,
+                    question_content=record.question_content,
+                    knowledge_point=normalized_kp,
+                    user_answer=record.user_answer,
+                    correct_answer=record.correct_answer,
+                    is_correct=record.is_correct,
+                    wrong_reason=record.wrong_reason,
+                )
+                # 题库沉淀：用于相似题检索。这里全量入库，便于后续复练。
+                try:
+                    memory_manager.store_question_to_bank(
+                        session_id=session_id,
+                        question_id=qid,
+                        question_content=record.question_content,
+                        knowledge_point=normalized_kp,
+                        answer=record.correct_answer,
+                    )
+                except Exception as e:
+                    logger.warning(f"[Practice] 题库写入失败 qid={qid}: {e}")
+                saved += 1
+            except Exception as e:
+                logger.error(f"[Practice] 记录写入失败 qid={qid}: {e}")
+                continue
+
+        stats = memory_manager.get_knowledge_point_stats(session_id)
+        weak_points = [kp for kp, data in stats.items() if data.get("weak")]
+        logger.info(f"[Practice] session={session_id}, saved={saved}, weak_points={weak_points}")
+        return {
+            "code": 200,
+            "message": f"已保存 {saved} 条练习记录",
+            "saved": saved,
+            "weak_points": weak_points,
+            "stats": stats,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[Practice] submit 接口异常: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"code": 500, "message": f"练习记录提交失败: {str(e)}", "saved": 0},
         )
-        # 题库沉淀：用于相似题检索。这里全量入库，便于后续复练。
-        try:
-            memory_manager.store_question_to_bank(
-                session_id=session_id,
-                question_id=qid,
-                question_content=record.question_content,
-                knowledge_point=record.knowledge_point or "",
-                answer=record.correct_answer,
-            )
-        except Exception as e:
-            logger.warning(f"[Practice] 题库写入失败 qid={qid}: {e}")
-        saved += 1
-
-    stats = memory_manager.get_knowledge_point_stats(session_id)
-    weak_points = [kp for kp, data in stats.items() if data.get("weak")]
-    logger.info(f"[Practice] session={session_id}, saved={saved}, weak_points={weak_points}")
-    return {
-        "code": 200,
-        "message": f"已保存 {saved} 条练习记录",
-        "saved": saved,
-        "weak_points": weak_points,
-        "stats": stats,
-    }
 
 
 @router.post("/practice/similar")
@@ -654,6 +955,38 @@ async def get_practice_stats(session_id: str):
     }
 
 
+@router.get("/practice/history")
+async def get_practice_history(session_id: str, limit: int = 200):
+    """
+    获取练习历史明细（用于前端练习历史管理面板）。
+    """
+    _validate_session_id(session_id)
+    safe_limit = max(1, min(int(limit or 200), 500))
+    history = memory_manager.get_practice_history(session_id, limit=safe_limit)
+    return {"code": 200, "data": history, "count": len(history)}
+
+
+@router.delete("/practice/history/item")
+async def delete_practice_history_item(req: PracticeHistoryDeleteRequest = Body(...)):
+    """
+    删除单条练习历史记录。
+    """
+    session_id = req.session_id or "default"
+    _validate_session_id(session_id)
+    deleted = memory_manager.delete_practice_record(session_id=session_id, record_id=req.record_id)
+    return {"code": 200 if deleted else 404, "deleted": bool(deleted)}
+
+
+@router.delete("/practice/history")
+async def clear_practice_history(session_id: str):
+    """
+    清空当前会话全部练习历史记录。
+    """
+    _validate_session_id(session_id)
+    deleted = memory_manager.clear_practice_history(session_id)
+    return {"code": 200, "deleted_count": int(deleted)}
+
+
 @router.get("/metrics")
 async def get_runtime_metrics():
     """
@@ -674,6 +1007,42 @@ async def get_runtime_metrics():
     stage_avg_ms = int(sum(stage_samples) / len(stage_samples)) if stage_samples else 0
     stage_max_ms = int(max(stage_samples)) if stage_samples else 0
     stage_p95_ms = _calc_p95(stage_samples)
+    stream_ttft_samples = RUNTIME_METRICS.get("stream_ttft_samples_ms", []) or []
+    stream_ttft_avg_ms = int(sum(stream_ttft_samples) / len(stream_ttft_samples)) if stream_ttft_samples else 0
+    stream_ttft_max_ms = int(max(stream_ttft_samples)) if stream_ttft_samples else 0
+    stream_ttft_p95_ms = _calc_p95(stream_ttft_samples)
+    stream_first_delta_samples = RUNTIME_METRICS.get("stream_first_delta_samples_ms", []) or []
+    stream_first_delta_avg_ms = int(sum(stream_first_delta_samples) / len(stream_first_delta_samples)) if stream_first_delta_samples else 0
+    stream_first_delta_max_ms = int(max(stream_first_delta_samples)) if stream_first_delta_samples else 0
+    stream_first_delta_p95_ms = _calc_p95(stream_first_delta_samples)
+    stream_duration_samples = RUNTIME_METRICS.get("stream_duration_samples_ms", []) or []
+    stream_duration_avg_ms = int(sum(stream_duration_samples) / len(stream_duration_samples)) if stream_duration_samples else 0
+    stream_duration_max_ms = int(max(stream_duration_samples)) if stream_duration_samples else 0
+    stream_duration_p95_ms = _calc_p95(stream_duration_samples)
+    stream_termination_reason_counts = RUNTIME_METRICS.get("stream_termination_reason_counts", {}) or {}
+    if not isinstance(stream_termination_reason_counts, dict):
+        stream_termination_reason_counts = {}
+    stream_requests_total = int(RUNTIME_METRICS.get("stream_requests_total", 0))
+    stream_success_total = int(RUNTIME_METRICS.get("stream_success_total", 0))
+    stream_error_total = int(RUNTIME_METRICS.get("stream_error_total", 0))
+    stream_client_cancel_total = int(RUNTIME_METRICS.get("stream_client_cancel_total", 0))
+    stream_timeout_total = int(RUNTIME_METRICS.get("stream_timeout_total", 0))
+    rag_metrics = rag_get_metrics_snapshot()
+    rag_calls = int(rag_metrics.get("rag_retrieve_calls", 0))
+    rag_cache_eligible = int(rag_metrics.get("rag_cache_eligible_calls", 0))
+    rag_hits = int(rag_metrics.get("rag_retrieve_cache_hit", 0))
+    rag_miss = int(rag_metrics.get("rag_retrieve_cache_miss", 0))
+    rag_empty = int(rag_metrics.get("rag_empty_context_count", 0))
+    rag_latency_samples = rag_metrics.get("rag_retrieve_latency_samples_ms", []) or []
+    rag_latency_avg = int(sum(rag_latency_samples) / len(rag_latency_samples)) if rag_latency_samples else 0
+    rag_latency_p95 = _calc_p95(rag_latency_samples)
+    comprehensive_samples = rag_metrics.get("comprehensive_parallel_ms_samples", []) or []
+    comprehensive_avg = int(sum(comprehensive_samples) / len(comprehensive_samples)) if comprehensive_samples else 0
+    comprehensive_p95 = _calc_p95(comprehensive_samples)
+    grounded_pass = int(rag_metrics.get("rag_grounded_pass_count", 0))
+    grounded_partial = int(rag_metrics.get("rag_grounded_partial_count", 0))
+    grounded_fail = int(rag_metrics.get("rag_grounded_fail_count", 0))
+    grounded_total = grounded_pass + grounded_partial + grounded_fail
     structured_fail_count_by_reason = {}
     try:
         from agent.multi_agent.quiz_agent import get_structured_fail_stats
@@ -684,6 +1053,7 @@ async def get_runtime_metrics():
         "code": 200,
         "data": {
             **RUNTIME_METRICS,
+            **rag_metrics,
             "structured_fail_count_by_reason": structured_fail_count_by_reason,
             "exam_success_rate": exam_success_rate,
             "exam_end_to_end_avg_ms": avg_ms,
@@ -695,6 +1065,27 @@ async def get_runtime_metrics():
             "exam_stage_latency_avg_ms": stage_avg_ms,
             "exam_stage_latency_max_ms": stage_max_ms,
             "exam_stage_latency_p95_ms": stage_p95_ms,
+            "stream_ttft_avg_ms": stream_ttft_avg_ms,
+            "stream_ttft_max_ms": stream_ttft_max_ms,
+            "stream_ttft_p95_ms": stream_ttft_p95_ms,
+            "stream_first_delta_avg_ms": stream_first_delta_avg_ms,
+            "stream_first_delta_max_ms": stream_first_delta_max_ms,
+            "stream_first_delta_p95_ms": stream_first_delta_p95_ms,
+            "stream_duration_avg_ms": stream_duration_avg_ms,
+            "stream_duration_max_ms": stream_duration_max_ms,
+            "stream_duration_p95_ms": stream_duration_p95_ms,
+            "stream_termination_reason_counts": stream_termination_reason_counts,
+            "stream_success_rate": round((stream_success_total / stream_requests_total) * 100, 2) if stream_requests_total > 0 else 0.0,
+            "stream_error_rate": round((stream_error_total / stream_requests_total) * 100, 2) if stream_requests_total > 0 else 0.0,
+            "stream_client_cancel_rate": round((stream_client_cancel_total / stream_requests_total) * 100, 2) if stream_requests_total > 0 else 0.0,
+            "stream_timeout_rate": round((stream_timeout_total / stream_requests_total) * 100, 2) if stream_requests_total > 0 else 0.0,
+            "rag_cache_hit_rate": round((rag_hits / rag_cache_eligible) * 100, 2) if rag_cache_eligible > 0 else 0.0,
+            "rag_empty_context_rate": round((rag_empty / rag_calls) * 100, 2) if rag_calls > 0 else 0.0,
+            "rag_retrieve_avg_ms": rag_latency_avg,
+            "rag_retrieve_p95_ms": rag_latency_p95,
+            "comprehensive_parallel_avg_ms": comprehensive_avg,
+            "comprehensive_parallel_p95_ms": comprehensive_p95,
+            "rag_grounded_pass_rate": round((grounded_pass / grounded_total) * 100, 2) if grounded_total > 0 else 0.0,
         },
     }
 
@@ -791,7 +1182,20 @@ async def get_messages(session_id: str):
     """
     _validate_session_id(session_id)
     messages = memory_manager.get_messages(session_id)
-    return {"code": 200, "messages": messages, "count": len(messages)}
+    normalized = []
+    for msg in messages:
+        normalized.append({
+            "id": f"{msg.get('timestamp', 0)}",
+            "role": msg.get("role"),
+            "content": msg.get("content"),
+            "timestamp": msg.get("timestamp", 0),
+            "kind": msg.get("kind"),
+            "render_mode": msg.get("render_mode"),
+            "payload": msg.get("payload"),
+            "meta": msg.get("meta"),
+        })
+    # 兼容前端/旧客户端：同时返回 data 和 messages
+    return {"code": 200, "data": normalized, "messages": normalized, "count": len(normalized)}
 
 
 class DeleteMessageRequest(BaseModel):
@@ -823,27 +1227,11 @@ async def clear_messages(session_id: str):
     return {"code": 404, "message": "会话不存在"}
 
 
-@router.get("/messages")
-async def get_session_messages(session_id: str):
-    _validate_session_id(session_id)
-    memory_manager._init_session(session_id)
-    recent_records = memory_manager.store[session_id]["recent"]
-    messages = []
-    for msg in recent_records:
-        messages.append({
-            "id": f"{msg.get('timestamp', 0)}",
-            "role": msg["role"],
-            "content": msg["content"],
-            "timestamp": msg.get("timestamp", 0),
-            "kind": msg.get("kind"),
-            "render_mode": msg.get("render_mode"),
-            "payload": msg.get("payload"),
-            "meta": msg.get("meta"),
-        })
-    return {"code": 200, "data": messages}
-
-
 @router.get("/tokens")
 async def get_tokens():
-    stats = get_system_stats()
-    return {"code": 200, "data": stats}
+    try:
+        stats = get_system_stats()
+        return {"code": 200, "data": stats}
+    except Exception as e:
+        logger.error(f"[Tokens] 获取统计失败: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"code": 500, "message": f"token统计获取失败: {str(e)}"})
