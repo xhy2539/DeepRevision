@@ -182,8 +182,31 @@ def _clean_knowledge_point_phrase(text: str) -> str:
     s = re.sub(r"^(下列|以下|请|试|简述|说明|判断|选择|哪个|哪一项|当|在)\s*", "", s).strip()
     s = s.strip("：:，,。.;；!?！？ ")
     s = re.sub(r"\s+", " ", s).strip()
+
+    # 超长短语优先抽取核心专业词，避免“半截考点”。
     if len(s) > 28:
-        s = s[:28].rstrip("：:，,。.;；!?！？ ")
+        keyword_patterns = [
+            r"(进程调度(?:三层架构|层次关系|策略|模型|器)?)",
+            r"(中期调度(?:器)?)",
+            r"(进程状态(?:模型|迁移)?)",
+            r"(阻塞(?:状态|队列)?)",
+            r"(资源分配图)",
+            r"(循环等待)",
+            r"(死锁(?:判定|条件)?)",
+            r"(分时系统)",
+            r"(虚拟内存(?:系统|机制)?)",
+            r"(页面置换)",
+            r"(文件系统分层结构)",
+            r"(逻辑文件系统)",
+            r"(系统调用接口)",
+            r"(内核(?:硬件)?接口)",
+        ]
+        for pattern in keyword_patterns:
+            match = re.search(pattern, s)
+            if match:
+                core = str(match.group(1) or "").strip("：:，,。.;；!?！？ ")
+                if core:
+                    return core
     return s
 
 

@@ -1914,15 +1914,19 @@ async def critique_quiz_node(state: QuizState) -> QuizState:
     quiz = state.get('revised_quiz') or state.get('quiz', '')
     logger.info("[Agent2-Critic] 质疑出题推理链...")
 
-    fast = _quick_quiz_quality_check(state)
-    if fast is not None:
-        # 快速本地评审通过时跳过 LLM Critic，显著降低链路时延。
-        score = fast.get("overall_score", 80)
-        logger.info(f"[Agent2-Critic] 本地快速质检通过，跳过 LLM Critic，score={score}")
-        update: dict = {"critique": fast}
-        if state.get('reflection_rounds', 0) == 0 and not state.get('initial_score'):
-            update["initial_score"] = score
-        return update
+    force_llm_critic = bool(state.get("force_llm_critic", False))
+    if not force_llm_critic:
+        fast = _quick_quiz_quality_check(state)
+        if fast is not None:
+            # 快速本地评审通过时跳过 LLM Critic，显著降低链路时延。
+            score = fast.get("overall_score", 80)
+            logger.info(f"[Agent2-Critic] 本地快速质检通过，跳过 LLM Critic，score={score}")
+            update: dict = {"critique": fast}
+            if state.get('reflection_rounds', 0) == 0 and not state.get('initial_score'):
+                update["initial_score"] = score
+            return update
+    else:
+        logger.info("[Agent2-Critic] force_llm_critic=true，跳过本地快速质检，强制走 LLM Critic")
 
     budget_left = _quiz_budget_left_seconds(state)
     if budget_left <= 18:
@@ -2817,7 +2821,8 @@ async def run_quiz_agent(
     topic: str,
     quiz_type: str = "选择题",
     num: int = 3,
-    sample_paper_context: str = None
+    sample_paper_context: str = None,
+    force_llm_critic: bool = False,
 ) -> dict:
     """
     运行 Reflexion 出题系统（3 Agent 协作）
@@ -2880,6 +2885,7 @@ async def run_quiz_agent(
         "quiz_budget_seconds": QUIZ_BUDGET_SECONDS,
         "evidence_source": "courseware_only",
         "reflection_rounds": 0,
+        "force_llm_critic": bool(force_llm_critic),
     }
     use_web = False
     gate_reason = "courseware_sufficient"
@@ -2918,6 +2924,7 @@ async def run_quiz_agent(
         "quiz_budget_seconds": QUIZ_BUDGET_SECONDS,
         "evidence_source": evidence_source,
         "reflection_rounds": 0,
+        "force_llm_critic": bool(force_llm_critic),
     }
 
     try:

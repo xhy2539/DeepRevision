@@ -14,7 +14,7 @@ Supervisor Agent 分析用户意图，路由到对应 SubAgent：
 import json
 import time
 import re
-from typing import TypedDict, List
+from typing import TypedDict, List, Dict, Any
 
 from langgraph.graph import StateGraph, END
 from langchain_core.prompts import PromptTemplate
@@ -1099,6 +1099,141 @@ def _resolve_message_ts_by_index(ordered_messages: list[dict], index: int) -> in
     return int(ts) if ts is not None else None
 
 
+def _classify_wrong_reason(reason: str) -> str:
+    """将错因归入可读类别，便于聚合展示。"""
+    text = str(reason or "").strip().lower()
+    if not text:
+        return "未填写错因"
+    mapping = [
+        ("概念理解偏差", ["概念", "定义", "理解", "混淆", "区分"]),
+        ("审题与条件遗漏", ["审题", "条件", "忽略", "漏看", "题意"]),
+        ("记忆与背诵不牢", ["记忆", "背诵", "遗忘", "没记住", "不熟"]),
+        ("步骤与推理链断裂", ["步骤", "推导", "推理", "过程", "链路"]),
+        ("计算与细节失误", ["计算", "符号", "单位", "抄错", "粗心"]),
+    ]
+    for label, keywords in mapping:
+        if any(k in text for k in keywords):
+            return label
+    return "其他原因"
+
+
+def _is_noisy_kp_name(kp: str) -> bool:
+    """识别像题干句子的考点名，用于数据质量提醒。"""
+    text = str(kp or "").strip()
+    if not text:
+        return True
+    return len(text) > 28 or any(tok in text for tok in ["请", "下列", "以下", "？", "?", "。", "；", ";"])
+
+
+def _build_practice_analysis_report(
+    stats: Dict[str, Dict[str, Any]],
+    history: List[Dict[str, Any]],
+    *,
+    max_weak: int = 8,
+    max_recent_wrong: int = 6,
+) -> str:
+    """构建结构化练习分析报告，避免仅复述历史列表。"""
+    total = len(history)
+    correct = sum(1 for item in history if bool(item.get("is_correct")))
+    wrong = max(0, total - correct)
+    accuracy = (correct / total * 100.0) if total > 0 else 0.0
+
+    recent_window = history[: min(20, total)]
+    recent_total = len(recent_window)
+    recent_correct = sum(1 for item in recent_window if bool(item.get("is_correct")))
+    recent_acc = (recent_correct / recent_total * 100.0) if recent_total > 0 else 0.0
+
+    weak_items = [
+        (kp, item)
+        for kp, item in stats.items()
+        if float(item.get("accuracy", 0.0)) < 60.0 and int(item.get("total", 0)) > 0
+    ]
+    weak_items.sort(key=lambda kv: (float(kv[1].get("accuracy", 0.0)), -int(kv[1].get("total", 0)), kv[0]))
+
+    strong_items = [
+        (kp, item)
+        for kp, item in stats.items()
+        if float(item.get("accuracy", 0.0)) >= 80.0 and int(item.get("total", 0)) > 0
+    ]
+    strong_items.sort(key=lambda kv: (-float(kv[1].get("accuracy", 0.0)), -int(kv[1].get("total", 0)), kv[0]))
+
+    reason_counts: Dict[str, int] = {}
+    for row in history:
+        if bool(row.get("is_correct")):
+            continue
+        label = _classify_wrong_reason(str(row.get("wrong_reason") or ""))
+        reason_counts[label] = int(reason_counts.get(label, 0)) + 1
+    top_reasons = sorted(reason_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:4]
+
+    noisy_kp_count = sum(1 for kp in stats.keys() if _is_noisy_kp_name(kp))
+    recent_wrong_rows = [row for row in history if not bool(row.get("is_correct"))][:max_recent_wrong]
+
+    lines: List[str] = ["【历史学习分析】"]
+    lines.append(f"- 累计练习 {total} 题，正确 {correct} 题，错误 {wrong} 题，整体正确率 {accuracy:.1f}%")
+    if recent_total > 0:
+        lines.append(f"- 最近 {recent_total} 题正确率 {recent_acc:.1f}%")
+    if total == 0:
+        lines.append("- 暂无可分析练习记录。建议先做 5-10 道基础题再查看分析。")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("【薄弱知识点优先级】")
+    if weak_items:
+        for i, (kp, item) in enumerate(weak_items[:max_weak], 1):
+            lines.append(
+                f"{i}. {kp}：{int(item.get('correct', 0))}/{int(item.get('total', 0))}（{float(item.get('accuracy', 0.0)):.1f}%）"
+            )
+    else:
+        lines.append("- 暂无明显薄弱点（当前正确率均 >= 60%）。")
+
+    lines.append("")
+    lines.append("【已掌握知识点】")
+    if strong_items:
+        for i, (kp, item) in enumerate(strong_items[:5], 1):
+            lines.append(
+                f"{i}. {kp}：{int(item.get('correct', 0))}/{int(item.get('total', 0))}（{float(item.get('accuracy', 0.0)):.1f}%）"
+            )
+    else:
+        lines.append("- 暂无稳定掌握项（正确率 >= 80%）。")
+
+    lines.append("")
+    lines.append("【高频错因模式】")
+    if top_reasons:
+        for i, (label, cnt) in enumerate(top_reasons, 1):
+            lines.append(f"{i}. {label}：{cnt} 次")
+    else:
+        lines.append("- 暂无可用错因文本，建议做题后补充错因。")
+
+    lines.append("")
+    lines.append("【最近错题样本】")
+    if recent_wrong_rows:
+        for i, row in enumerate(recent_wrong_rows, 1):
+            kp = str(row.get("knowledge_point") or "未标注")
+            question = str(row.get("question_content") or "").strip().replace("\n", " ")
+            wrong_reason = str(row.get("wrong_reason") or "").strip()
+            lines.append(f"{i}. [{kp}] {question[:120]}{'...' if len(question) > 120 else ''}")
+            if wrong_reason:
+                lines.append(f"   错因：{wrong_reason[:80]}{'...' if len(wrong_reason) > 80 else ''}")
+    else:
+        lines.append("- 最近记录中暂无错题。")
+
+    lines.append("")
+    lines.append("【下一步建议】")
+    if weak_items:
+        top_targets = [kp for kp, _ in weak_items[:3]]
+        for kp in top_targets:
+            lines.append(f"- 先复习「{kp}」10 分钟，再做 2 道同考点题并立即对照错因。")
+        lines.append("- 若仍连续错 2 次以上，请发“讲解 + 出1道同类题”进行纠偏。")
+    else:
+        lines.append("- 进入混合拔高训练：薄弱点 40% + 随机综合题 60%。")
+
+    if noisy_kp_count > 0:
+        lines.append("")
+        lines.append(f"【数据质量提示】检测到 {noisy_kp_count} 个考点名接近题干句式，后续统计可继续归一化。")
+
+    return "\n".join(lines)
+
+
 async def history_subagent_node(state: SupervisorState) -> SupervisorState:
     """History SubAgent: 查看练习历史、答题记录、错题分析（由LLM理解用户意图并回答）"""
     from utils.memory_service import memory_manager
@@ -1167,6 +1302,12 @@ async def history_subagent_node(state: SupervisorState) -> SupervisorState:
         if action_name == "clear_messages":
             success = memory_manager.clear_messages(sid)
             text = "已清空历史对话记录。" if success else "清空失败：会话不存在。"
+            return {"subagent_result": text, "final_answer": text}
+
+        if action_name == "analyze_practice":
+            stats = memory_manager.get_knowledge_point_stats(sid)
+            history_rows = memory_manager.get_practice_history(sid, max(50, min(int(limit or 120), 200)))
+            text = _build_practice_analysis_report(stats, history_rows)
             return {"subagent_result": text, "final_answer": text}
 
     # 获取统计数据和历史记录

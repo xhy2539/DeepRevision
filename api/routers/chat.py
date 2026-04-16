@@ -3,6 +3,7 @@ import asyncio
 import re
 import time
 import hashlib
+import shlex
 from contextlib import suppress
 from functools import lru_cache
 from fastapi import APIRouter, Body, Request, HTTPException
@@ -14,7 +15,7 @@ from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-from agent.tools.agent_tools import clear_rag_cache, get_rag_service
+from agent.tools.agent_tools import clear_rag_cache, get_rag_service, tools as registered_tools
 from agent.multi_agent.supervisor import supervisor_workflow, supervisor_node, CHITCHAT_PROMPT
 from api.message_protocol import build_assistant_message
 from utils.logger_handler import logger, update_token_stats, get_system_stats
@@ -27,6 +28,12 @@ from model.factory import light_chat_model, backup_light_chat_model, chat_model
 
 router = APIRouter()
 _VALID_SESSION_ID = re.compile(r'^[\u4e00-\u9fa5a-zA-Z0-9_\-]{1,64}$')
+_TOOL_CMD_PREFIX = "/tool"
+_REGISTERED_TOOL_MAP: Dict[str, Any] = {
+    getattr(tool_item, "name", ""): tool_item
+    for tool_item in registered_tools
+    if getattr(tool_item, "name", "")
+}
 
 # 轻量运行指标（进程内）
 RUNTIME_METRICS: Dict[str, Any] = {
@@ -338,6 +345,130 @@ def _validate_session_id(session_id: str) -> str:
     if not _VALID_SESSION_ID.match(session_id):
         raise HTTPException(status_code=400, detail="非法 session_id")
     return session_id
+
+
+def _tool_accepts_argument(tool_obj: Any, arg_name: str) -> bool:
+    """检查工具签名是否包含指定参数。"""
+    schema = getattr(tool_obj, "args_schema", None)
+    if schema is None:
+        return False
+    model_fields = getattr(schema, "model_fields", None)
+    if isinstance(model_fields, dict):
+        return arg_name in model_fields
+    legacy_fields = getattr(schema, "__fields__", None)
+    if isinstance(legacy_fields, dict):
+        return arg_name in legacy_fields
+    return False
+
+
+def _coerce_tool_value(raw_value: str) -> Any:
+    """把 key=value 中的字符串值做基础类型还原。"""
+    text = str(raw_value or "").strip()
+    if text == "":
+        return ""
+    try:
+        return json.loads(text)
+    except Exception:
+        return text
+
+
+def _parse_tool_kv_args(raw_text: str) -> Dict[str, Any]:
+    """解析 k=v 形式参数，支持引号。"""
+    args: Dict[str, Any] = {}
+    tokens = shlex.split(raw_text or "")
+    for token in tokens:
+        if "=" not in token:
+            raise ValueError(f"参数格式错误: {token}（应为 key=value）")
+        key, value = token.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"参数名不能为空: {token}")
+        args[key] = _coerce_tool_value(value)
+    return args
+
+
+def _parse_explicit_tool_command(text: str) -> Optional[Dict[str, Any]]:
+    """
+    解析显式工具调用:
+    - /tool tool_name {"k":"v"}
+    - /tool tool_name k=v k2=v2
+    """
+    raw = str(text or "").strip()
+    if not raw.lower().startswith(_TOOL_CMD_PREFIX):
+        return None
+
+    payload = raw[len(_TOOL_CMD_PREFIX):].strip()
+    if not payload:
+        return {"error": "缺少工具名。示例: /tool get_practice_history {\"limit\":20}"}
+
+    if " " in payload:
+        tool_name, raw_args = payload.split(" ", 1)
+        raw_args = raw_args.strip()
+    else:
+        tool_name, raw_args = payload, ""
+
+    if not tool_name:
+        return {"error": "工具名不能为空。"}
+
+    args: Dict[str, Any] = {}
+    if raw_args:
+        if raw_args.startswith("{"):
+            try:
+                parsed = json.loads(raw_args)
+            except Exception as e:
+                return {"error": f"JSON 参数解析失败: {e}"}
+            if not isinstance(parsed, dict):
+                return {"error": "JSON 参数必须是对象，例如 {\"limit\":20}"}
+            args = parsed
+        else:
+            try:
+                args = _parse_tool_kv_args(raw_args)
+            except ValueError as e:
+                return {"error": str(e)}
+
+    return {"tool_name": tool_name.strip(), "args": args}
+
+
+def _available_tool_names_preview(max_items: int = 18) -> str:
+    """返回可用工具名预览文本。"""
+    names = sorted(_REGISTERED_TOOL_MAP.keys())
+    if len(names) <= max_items:
+        return ", ".join(names)
+    return ", ".join(names[:max_items]) + f" ...（共 {len(names)} 个）"
+
+
+async def _execute_registered_tool(tool_name: str, args: Dict[str, Any], session_id: str) -> Dict[str, Any]:
+    """执行已注册工具并返回统一结果。"""
+    tool_obj = _REGISTERED_TOOL_MAP.get(tool_name)
+    if tool_obj is None:
+        return {
+            "ok": False,
+            "text": (
+                f"未知工具: {tool_name}\n"
+                f"可用工具: {_available_tool_names_preview()}"
+            ),
+        }
+
+    tool_args = dict(args or {})
+    # 常见管理工具允许 session 透传，若调用方未给则自动补当前会话。
+    if "session_id" not in tool_args and _tool_accepts_argument(tool_obj, "session_id"):
+        tool_args["session_id"] = session_id
+
+    try:
+        result = await tool_obj.ainvoke(tool_args)
+        if isinstance(result, (dict, list)):
+            result_text = json.dumps(result, ensure_ascii=False, indent=2)
+        else:
+            result_text = str(result)
+        return {
+            "ok": True,
+            "text": result_text,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "text": f"工具执行失败: {e}",
+        }
 
 
 def _extract_kp_rule(raw_kp: str, question_content: str) -> str:
@@ -659,6 +790,7 @@ async def chat_stream_endpoint(request: Request):
         stream_sections: Dict[str, Any] = {"reasoning": "", "actions": [], "citations": [], "progress": []}
         rag_citations: List[Dict[str, Any]] = []
         v2_text_stream_started = False
+        explicit_tool_cmd = _parse_explicit_tool_command(query)
 
         def _mark_ttft_if_needed():
             """在首次可见有效事件时标记 TTFT（仅记录一次）。"""
@@ -672,6 +804,64 @@ async def chat_stream_endpoint(request: Request):
             return stream_v2_seq
 
         try:
+            # 显式工具调用：跳过 supervisor，直接执行注册工具。
+            if explicit_tool_cmd is not None:
+                route = "history"
+                route_reason = "explicit_tool_command"
+                route_params = {"explicit_tool": True}
+
+                parse_error = explicit_tool_cmd.get("error")
+                if parse_error:
+                    answer = (
+                        f"工具调用格式错误：{parse_error}\n"
+                        f"示例1: /tool get_practice_history {{\"limit\":20}}\n"
+                        f"示例2: /tool get_weak_points_tool top_k=5"
+                    )
+                else:
+                    tool_name = str(explicit_tool_cmd.get("tool_name", "")).strip()
+                    route_params["tool_name"] = tool_name
+                    exec_result = await _execute_registered_tool(
+                        tool_name=tool_name,
+                        args=explicit_tool_cmd.get("args") or {},
+                        session_id=session_id,
+                    )
+                    status_text = "成功" if bool(exec_result.get("ok")) else "失败"
+                    answer = f"【工具执行{status_text}】{tool_name}\n{exec_result.get('text', '')}"
+
+                answer = _clean_answer(answer)
+                message = build_assistant_message(route, answer, session_id, route_params, structured_result=None)
+
+                _mark_ttft_if_needed()
+                _record_stream_event("start")
+                yield _format_sse(
+                    {
+                        "event": "start",
+                        "message": {
+                            "kind": message["kind"],
+                            "render_mode": message["render_mode"],
+                            "meta": message["meta"],
+                        },
+                    },
+                    event_name="start",
+                )
+                chunks = answer.splitlines(keepends=True) or [answer]
+                for chunk in chunks:
+                    if await request.is_disconnected():
+                        client_disconnected = True
+                        raise asyncio.CancelledError()
+                    if stream_first_delta_ms is None:
+                        stream_first_delta_ms = int((time.time() - stream_start) * 1000)
+                    _record_stream_event("delta")
+                    yield _format_sse({"event": "delta", "text": chunk}, event_name="delta")
+                    sent_content += chunk
+                    await asyncio.sleep(0.01)
+
+                _record_stream_event("complete")
+                yield _format_sse({"event": "complete", "message": message}, event_name="complete")
+                if route in RUNTIME_METRICS["routes"]:
+                    RUNTIME_METRICS["routes"][route] += 1
+                raise _StreamV2Handled()
+
             # 先发送一个占位消息，避免长耗时任务期间前端完全空白
             _record_stream_event("start")
             yield _format_sse(
