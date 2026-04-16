@@ -2,6 +2,8 @@
 .idea/
 .claude/
 .vscode/
+.DS_Store
+Thumbs.db
 
 # Python
 __pycache__/
@@ -9,6 +11,12 @@ __pycache__/
 *$py.class
 venv/
 .env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage/
+htmlcov/
 
 # Node.js / React前端
 node_modules/
@@ -20,6 +28,7 @@ react/node_modules/
 react/.next/
 react/dist/
 react/build/
+react/.turbo/
 tsconfig.tsbuildinfo
 *.tsbuildinfo
 
@@ -28,10 +37,10 @@ chroma_db/
 test_chroma_db_dir/
 logs/
 data/
-*.txt
+tmp/
+output/
 server.log
 log.md
-# 如果你需要保留某个特定的 txt，可以把 *.txt 删掉，手动忽略特定的 test 文件：
-# test_math.txt
-# test_os.txt
-# test_output.txt
+# 测试/调试临时文本
+test_*.txt
+*_output.txt

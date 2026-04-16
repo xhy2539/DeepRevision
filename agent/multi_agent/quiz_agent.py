@@ -6,6 +6,7 @@ Agent 3: Revise Agent — 逐条回应批评，修订题目并给出修改说明
 循环：critique → revise → critique，最多 2 轮
 """
 import json
+import os
 import re
 import asyncio
 import time
@@ -19,8 +20,10 @@ from langchain_core.output_parsers import StrOutputParser
 
 from model.factory import chat_model, light_chat_model, backup_chat_model, backup_light_chat_model
 from agent.tools.agent_tools import get_rag_service
+from utils.config_handler import chroma_conf
 from utils.session_context import current_session_id
 from utils.logger_handler import logger
+from utils.rag_metrics import rag_inc, rag_append_sample, rag_set
 from agent.multi_agent.quiz_types import (
     QuizState,
     ExamPaperState,
@@ -115,6 +118,81 @@ EXAM_MISSING_MODEL_RETRY_ROUNDS = 6
 EXAM_TYPE_ORDER = ["选择题", "填空题", "判断题", "简答题"]
 TYPE_KEY_TO_LABEL = {"choice": "选择题", "fill": "填空题", "judge": "判断题", "essay": "简答题"}
 TYPE_LABEL_TO_KEY = {v: k for k, v in TYPE_KEY_TO_LABEL.items()}
+_COURSEWARE_WARMUP_CACHE: Dict[str, Dict[str, Any]] = {}
+_WARMUP_LOCKS: Dict[str, asyncio.Lock] = {}
+
+
+# ==================== 课件预热缓存 ====================
+
+def _build_courseware_manifest(session_data_path: str) -> Dict[str, Any]:
+    """
+    列出 session_data_path 下所有已上传课件文件（不含子目录），
+    并计算整体 fingerprint（所有文件 MD5 排序后拼接的 MD5）。
+    """
+    if not session_data_path or not os.path.isdir(session_data_path):
+        return {"files": [], "fingerprint": ""}
+    try:
+        from utils.file_handler import listdir_with_allowed_type
+        files = listdir_with_allowed_type(
+            session_data_path,
+            (".pdf", ".ppt", ".pptx", ".doc", ".docx", ".txt", ".md", ".png", ".jpg", ".jpeg")
+        )
+        files_sorted = sorted(files)
+        if not files_sorted:
+            return {"files": [], "fingerprint": ""}
+        import hashlib
+        combined = "".join(files_sorted)
+        fingerprint = hashlib.md5(combined.encode("utf-8")).hexdigest()[:16]
+        return {"files": files_sorted, "fingerprint": fingerprint}
+    except Exception:
+        return {"files": [], "fingerprint": ""}
+
+
+async def _get_or_build_courseware_warmup(rag: Any, force: bool = False) -> Dict[str, Any]:
+    """
+    课件预热摘要池（会话级缓存）：
+    - 记录已上传文件清单
+    - 预抽课件考点池，供"随机出题"多考点覆盖
+    """
+    sid = current_session_id.get() or "default"
+    lock = _WARMUP_LOCKS.setdefault(sid, asyncio.Lock())
+    async with lock:
+        session_data_path = getattr(getattr(rag, "vector_store_service", None), "session_data_path", "")
+        manifest = _build_courseware_manifest(session_data_path)
+        files = manifest.get("files", [])
+        fingerprint = manifest.get("fingerprint", "")
+
+        cached = _COURSEWARE_WARMUP_CACHE.get(sid)
+        if (
+            not force
+            and isinstance(cached, dict)
+            and cached.get("fingerprint") == fingerprint
+            and cached.get("files") == files
+        ):
+            return cached
+
+        name_terms = [os.path.splitext(f)[0].replace("_", " ").replace("-", " ").strip() for f in files]
+        name_terms = [t for t in name_terms if t]
+        warm_seed = "；".join(name_terms[:8]) if name_terms else ""
+        warm_query = (warm_seed + " 核心概念 机制 流程 易错点").strip() or "课程课件 核心概念 机制 流程 易错点"
+        warm_context = await _get_comprehensive_rag_context(warm_query)
+        topic_pool = _extract_topics_from_rag_context(warm_context, limit=max(28, min(80, max(32, len(files) * 8))))
+
+        payload = {
+            "fingerprint": fingerprint,
+            "files": files,
+            "warm_query": warm_query,
+            "topic_pool": topic_pool,
+            "core_topics": topic_pool[: min(12, len(topic_pool))],
+            "weak_topics": [],
+            "dynamic_topics": [],
+            "topic_scores": [{"topic": t, "score": 60.0, "tag": "normal"} for t in topic_pool[:60]],
+            "last_refresh_source": "startup_warmup",
+            "updated_at": int(time.time()),
+        }
+        _COURSEWARE_WARMUP_CACHE[sid] = payload
+        logger.info(f"[Courseware Warmup] session={sid}, files={len(files)}, topics={len(topic_pool)}")
+        return payload
 
 
 # ==================== 工具函数 ====================
@@ -152,6 +230,8 @@ async def _get_comprehensive_rag_context(seed_topic: str = "") -> str:
     """
     综合覆盖检索：针对不同模块做多路检索并拼接，避免只命中少数章节。
     """
+    rag_inc("comprehensive_calls", 1)
+    start_ts = time.time()
     base = str(seed_topic or "").strip()
     queries = [
         f"{base} 基础概念 体系结构".strip(),
@@ -159,21 +239,43 @@ async def _get_comprehensive_rag_context(seed_topic: str = "") -> str:
         f"{base} 内存管理 虚拟内存 页面置换".strip(),
         f"{base} 文件系统 I/O 设备管理 网络通信".strip(),
     ]
-    # 去重并剔除空查询
-    dedup_queries: List[str] = []
+    # 请求级去重并按归一化 key 稳定排序，减少缓存 key 抖动
+    dedup_pairs: List[Tuple[str, str]] = []
     seen = set()
     for q in queries:
         q = re.sub(r"\s+", " ", q).strip()
-        if not q or q in seen:
+        if not q:
             continue
-        seen.add(q)
-        dedup_queries.append(q)
+        norm = re.sub(r"\s+", " ", q.lower())
+        if norm in seen:
+            continue
+        seen.add(norm)
+        dedup_pairs.append((norm, q))
+    dedup_pairs.sort(key=lambda x: x[0])
+    dedup_queries = [q for _, q in dedup_pairs]
+
+    parallelism = max(1, int(chroma_conf.get("comprehensive_retrieve_parallelism", 2)))
+    sem = asyncio.Semaphore(parallelism)
+
+    async def _fetch_ctx(query_text: str) -> str:
+        async with sem:
+            return await get_rag_context(query_text)
+
+    tasks = [_fetch_ctx(q) for q in dedup_queries]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
     contexts: List[str] = []
-    for q in dedup_queries:
-        ctx = await get_rag_context(q)
-        if ctx and ctx.strip():
-            contexts.append(ctx.strip())
+    for result in results:
+        if isinstance(result, Exception):
+            logger.warning(f"[Comprehensive Retrieve] 并行检索失败: {result}")
+            continue
+        ctx = str(result or "").strip()
+        if ctx:
+            contexts.append(ctx)
+
+    elapsed_ms = int((time.time() - start_ts) * 1000)
+    rag_set("comprehensive_parallel_ms", elapsed_ms)
+    rag_append_sample("comprehensive_parallel_ms_samples", elapsed_ms)
 
     if not contexts:
         return await get_rag_context(base or "本课程重点知识点")

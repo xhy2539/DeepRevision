@@ -40,8 +40,9 @@ def listdir_with_allowed_type(path: str, allowed_types: tuple[str]):
         logger.error(f"[listdir_with_allowed_type]{path}不是文件夹")
         return tuple(files)
 
+    allowed = tuple(str(ext).lower() for ext in allowed_types)
     for f in os.listdir(path):
-        if f.endswith(allowed_types):
+        if str(f).lower().endswith(allowed):
             files.append(os.path.join(path, f))
     return tuple(files)
 
@@ -53,7 +54,15 @@ def txt_loader(filepath: str) -> list[Document]:
 def word_loader(filepath: str) -> list[Document]:
     """Word(.docx)解析器"""
     from langchain_community.document_loaders import Docx2txtLoader
-    return Docx2txtLoader(filepath).load()
+    ext = os.path.splitext(filepath)[1].lower()
+    # .doc 老格式优先走 Unstructured，Docx2txt 对 .doc 支持不稳定
+    if ext == ".doc":
+        return _unstructured_loader(filepath)
+    try:
+        return Docx2txtLoader(filepath).load()
+    except Exception as e:
+        logger.warning(f"[Word解析] Docx2txt 失败，回退 Unstructured: {e}")
+        return _unstructured_loader(filepath)
 
 
 # ================= Unstructured 文档加载器 =================
@@ -334,7 +343,20 @@ def _summarize_image(image_bytes: bytes, context: str = "") -> str:
 
     try:
         response = vision_model.invoke([message])
-        return response.content
+        content = getattr(response, "content", "")
+        if isinstance(content, list):
+            text_parts: List[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    t = str(item.get("text", "")).strip()
+                    if t:
+                        text_parts.append(t)
+                else:
+                    t = str(item).strip()
+                    if t:
+                        text_parts.append(t)
+            return "\n".join(text_parts) if text_parts else "无有效信息"
+        return str(content or "").strip() or "无有效信息"
     except Exception as e:
         logger.error(f"图片解析失败: {e}")
         return "[图片内容提取失败]"
@@ -391,136 +413,142 @@ def _custom_pdf_loader(filepath: str, passwd=None) -> list[Document]:
     documents = []
     logger.info(f"[PDF解析] 开始解析: {filepath}")
 
+    doc = None
     try:
         doc = fitz.open(filepath)
     except Exception as e:
         logger.error(f"无法打开PDF文件 {filepath}: {e}")
         return []
 
-    if passwd and doc.is_encrypted:
-        try:
-            doc.authenticate(passwd)
-        except:
-            logger.error(f"PDF密码错误: {filepath}")
-            return []
-
-    metadata = doc.metadata
-    title = metadata.get("title", "")
-    author = metadata.get("author", "")
-
-    for page_num in range(len(doc)):
-        page = doc.load_page(page_num)
-        page_text = f"\n\n{'='*20}\n第 {page_num + 1} 页 / 共 {len(doc)} 页\n{'='*20}\n"
-
-        if page_num == 0 and title:
-            page_text += f"【文档标题】{title}\n"
-        if page_num == 0 and author:
-            page_text += f"【作者】{author}\n"
-
-        # 1. 提取文本
-        text = page.get_text("text").strip()
-        formulas = _detect_formulas(text)
-        if formulas:
-            for f in formulas:
-                page_text += f"【公式】{f['content']}\n"
-        if text:
-            page_text += f"【文本内容】\n{text}\n"
-
-        # 2. 页眉页脚
-        try:
-            header = page.header().strip() if callable(page.header) else ""
-            footer = page.footer().strip() if callable(page.footer) else ""
-            if header:
-                page_text += f"【页眉】{header}\n"
-            if footer:
-                page_text += f"【页脚】{footer}\n"
-        except:
-            pass
-
-        # 3. 超链接
-        links = page.get_links()
-        if links:
-            page_text += "\n【超链接】\n"
-            for link in links:
-                if link.get("uri"):
-                    page_text += f"- {link.get('uri')}\n"
-
-        # 4. 表格
-        tables = page.find_tables()
-        if tables:
-            page_text += "\n【表格内容】\n"
-            for table_idx, table in enumerate(tables):
-                page_text += f"\n表格 {table_idx + 1}:\n"
-                extracted_table = table.extract()
-                if extracted_table and len(extracted_table) > 0:
-                    headers = extracted_table[0]
-                    page_text += "表头: " + " | ".join([str(h).strip() if h else "" for h in headers]) + "\n"
-                    for row_idx, row in enumerate(extracted_table[1:], 1):
-                        row_text = " | ".join([str(cell).strip() if cell else "" for cell in row])
-                        page_text += f"第{row_idx}行: {row_text}\n"
-
-        # 5. 图片
-        image_list = page.get_images()
-        image_blobs = []
-        ocr_text = ""
-
-        if image_list:
-            logger.info(f"[PDF解析] 第 {page_num + 1} 页发现 {len(image_list)} 张图片")
-            for img_idx, img in enumerate(image_list):
-                try:
-                    xref = img[0]
-                    base_image = doc.extract_image(xref)
-                    image_bytes = base_image["image"]
-                    if len(image_bytes) < 5000:
-                        continue
-
-                    # OCR（同步，轻量，保留）
-                    ocr_result = _ocr_image(image_bytes)
-                    if ocr_result and len(ocr_result) > 20:
-                        ocr_text += f"\n【图片 {img_idx + 1} OCR文字】\n{ocr_result}\n"
-
-                    # 收集字节供并发视觉理解（不在此处串行调用）
-                    image_blobs.append((img_idx + 1, image_bytes))
-                except Exception as e:
-                    logger.warning(f"[PDF解析] 图片提取失败: {e}")
-
-        # OCR 页面（文本少时）
-        if not text or len(text.strip()) < 50:
+    try:
+        if passwd and doc.is_encrypted:
             try:
-                import pytesseract
-                logger.info(f"[PDF解析] 第 {page_num + 1} 页文本较少，尝试 OCR...")
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                ocr_page_result = pytesseract.image_to_string(pix.tobytes("png"), lang='chi_sim+eng')
-                if ocr_page_result and len(ocr_page_result) > 20:
-                    ocr_text += f"\n【页面OCR识别】\n{ocr_page_result.strip()}\n"
-            except ImportError:
-                pass
+                doc.authenticate(passwd)
+            except Exception:
+                logger.error(f"PDF密码错误: {filepath}")
+                return []
+
+        metadata = doc.metadata
+        title = metadata.get("title", "")
+        author = metadata.get("author", "")
+
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            page_text = f"\n\n{'='*20}\n第 {page_num + 1} 页 / 共 {len(doc)} 页\n{'='*20}\n"
+
+            if page_num == 0 and title:
+                page_text += f"【文档标题】{title}\n"
+            if page_num == 0 and author:
+                page_text += f"【作者】{author}\n"
+
+            # 1. 提取文本
+            text = page.get_text("text").strip()
+            formulas = _detect_formulas(text)
+            if formulas:
+                for f in formulas:
+                    page_text += f"【公式】{f['content']}\n"
+            if text:
+                page_text += f"【文本内容】\n{text}\n"
+
+            # 2. 页眉页脚
+            try:
+                header = page.header().strip() if callable(page.header) else ""
+                footer = page.footer().strip() if callable(page.footer) else ""
+                if header:
+                    page_text += f"【页眉】{header}\n"
+                if footer:
+                    page_text += f"【页脚】{footer}\n"
             except Exception:
                 pass
 
-        # 合并文本内容（图片描述由 load_document 并发追加）
-        full_content = page_text
-        if ocr_text:
-            full_content += f"\n{ocr_text}\n"
+            # 3. 超链接
+            links = page.get_links()
+            if links:
+                page_text += "\n【超链接】\n"
+                for link in links:
+                    if link.get("uri"):
+                        page_text += f"- {link.get('uri')}\n"
 
-        doc_obj = Document(
-            page_content=full_content,
-            metadata={
-                "source": filepath,
-                "page": page_num + 1,
-                "type": "pdf",
-                "total_pages": len(doc),
-                "has_images": len(image_list) > 0,
-                "title": title,
-                "author": author,
-                "_image_blobs": image_blobs,          # 供异步处理使用
-                "_slide_context": text[:500] if text else "",
-            }
-        )
-        documents.append(doc_obj)
+            # 4. 表格
+            tables = page.find_tables()
+            if tables:
+                page_text += "\n【表格内容】\n"
+                for table_idx, table in enumerate(tables):
+                    page_text += f"\n表格 {table_idx + 1}:\n"
+                    extracted_table = table.extract()
+                    if extracted_table and len(extracted_table) > 0:
+                        headers = extracted_table[0]
+                        page_text += "表头: " + " | ".join([str(h).strip() if h else "" for h in headers]) + "\n"
+                        for row_idx, row in enumerate(extracted_table[1:], 1):
+                            row_text = " | ".join([str(cell).strip() if cell else "" for cell in row])
+                            page_text += f"第{row_idx}行: {row_text}\n"
 
+            # 5. 图片
+            image_list = page.get_images()
+            image_blobs = []
+            ocr_text = ""
 
-    doc.close()
+            if image_list:
+                logger.info(f"[PDF解析] 第 {page_num + 1} 页发现 {len(image_list)} 张图片")
+                for img_idx, img in enumerate(image_list):
+                    try:
+                        xref = img[0]
+                        base_image = doc.extract_image(xref)
+                        image_bytes = base_image["image"]
+                        if len(image_bytes) < 5000:
+                            continue
+
+                        # OCR（同步，轻量，保留）
+                        ocr_result = _ocr_image(image_bytes)
+                        if ocr_result and len(ocr_result) > 20:
+                            ocr_text += f"\n【图片 {img_idx + 1} OCR文字】\n{ocr_result}\n"
+
+                        # 收集字节供并发视觉理解（不在此处串行调用）
+                        image_blobs.append((img_idx + 1, image_bytes))
+                    except Exception as e:
+                        logger.warning(f"[PDF解析] 图片提取失败: {e}")
+
+            # OCR 页面（文本少时）
+            if not text or len(text.strip()) < 50:
+                try:
+                    import pytesseract
+                    from PIL import Image
+                    import io
+
+                    logger.info(f"[PDF解析] 第 {page_num + 1} 页文本较少，尝试 OCR...")
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                    img = Image.open(io.BytesIO(pix.tobytes("png")))
+                    ocr_page_result = pytesseract.image_to_string(img, lang='chi_sim+eng')
+                    if ocr_page_result and len(ocr_page_result) > 20:
+                        ocr_text += f"\n【页面OCR识别】\n{ocr_page_result.strip()}\n"
+                except ImportError:
+                    pass
+                except Exception:
+                    pass
+
+            # 合并文本内容（图片描述由 load_document 并发追加）
+            full_content = page_text
+            if ocr_text:
+                full_content += f"\n{ocr_text}\n"
+
+            doc_obj = Document(
+                page_content=full_content,
+                metadata={
+                    "source": filepath,
+                    "page": page_num + 1,
+                    "type": "pdf",
+                    "total_pages": len(doc),
+                    "has_images": len(image_list) > 0,
+                    "title": title,
+                    "author": author,
+                    "_image_blobs": image_blobs,          # 供异步处理使用
+                    "_slide_context": text[:500] if text else "",
+                }
+            )
+            documents.append(doc_obj)
+    finally:
+        if doc is not None:
+            doc.close()
     logger.info(f"[PDF解析] 解析完成，共 {len(documents)} 页")
     return documents
 

@@ -120,6 +120,20 @@ function canonicalizeOptionLines(rawOptions: string[]): string[] {
   return cleaned.map((content, idx) => `${String.fromCharCode(65 + idx)}. ${content}`);
 }
 
+function extractOptionKey(optionText: string, fallbackIndex: number): string {
+  const text = String(optionText || "").trim();
+  const m = text.match(/^\s*([A-D])(?:[.、．:：)\s]|$)/i);
+  if (m && m[1]) return m[1].toUpperCase();
+  return String.fromCharCode(65 + fallbackIndex);
+}
+
+function stripOptionPrefix(optionText: string): string {
+  return String(optionText || "")
+    // 支持清理重复前缀：如 "A A xxx" / "A\nA xxx" / "A) A. xxx"
+    .replace(/^(?:\s*[A-D](?:[.、．:：)\s]+|$))+/i, "")
+    .trim();
+}
+
 // Props
 interface ExamCanvasProps {
   examContent: string;
@@ -1096,7 +1110,7 @@ export default function ExamCanvas({ examContent, examDataOverride, courseName =
                           {q.type === "选择题" && normalizedRenderOptions.length > 0 && (
                             <div className="ml-10 grid grid-cols-1 sm:grid-cols-2 gap-2 mb-3">
                               {normalizedRenderOptions.map((opt, i) => {
-                                const optionKey = opt.charAt(0);
+                                const optionKey = extractOptionKey(opt, i);
                                 const isSelected = answers[q.number] === optionKey;
                                 const isCorrect = submitted && optionKey === q.answer.trim().charAt(0);
                                 const isWrong = submitted && isSelected && optionKey !== q.answer.trim().charAt(0);
@@ -1131,7 +1145,7 @@ export default function ExamCanvas({ examContent, examDataOverride, courseName =
                                     }`}>
                                       {isCorrect ? '✓' : isWrong ? '✗' : optionKey}
                                     </span>
-                                    <span className="text-slate-700">{opt.replace(/^[A-D][.、．]\s*/, "").trim()}</span>
+                                    <span className="text-slate-700">{stripOptionPrefix(opt)}</span>
                                   </div>
                                 );
                               })}
@@ -1177,7 +1191,7 @@ export default function ExamCanvas({ examContent, examDataOverride, courseName =
                                           isSelected ? 'bg-teal-500 text-white' :
                                           'bg-slate-100 text-slate-600'
                                         }`}>
-                                          {isCorrect ? '✓' : isWrong ? '✗' : opt.charAt(0)}
+                                          {isCorrect ? '✓' : isWrong ? '✗' : '○'}
                                         </span>
                                         <span className="text-slate-700">{opt}</span>
                                       </div>

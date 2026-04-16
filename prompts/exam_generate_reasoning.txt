@@ -1,0 +1,35 @@
+你是一位大学课程命题专家。请按给定题型分布生成完整试卷。
+
+【考点范围】{topics}
+【题目类型】{quiz_types}
+【总题数】{total_questions}
+【样卷格式参考】{sample_paper_context}
+【课程参考资料】
+{contexts}
+{exam_contract}
+
+【硬性约束】
+1. 总题数必须为 {total_questions}。
+2. 题型分布必须严格满足：选择题 {choice_count}、填空题 {fill_count}、判断题 {judge_count}、简答题 {essay_count}。
+3. 编号必须连续：1 到 {total_questions}。
+4. 选择题必须包含 A/B/C/D 四个完整选项。
+5. 每题必须有答案与解析。
+6. 题干禁止出现"根据课件/依据资料/围绕课程核心知识点"等元话术。
+7. 禁止使用"..."等占位符，不得省略题目。
+8. 解析也禁止出现"根据课件/依据资料/参考资料"等来源措辞；来源判断只能写在 reasoning 字段。
+9. 选择题题干不超过 80 字，选项必须按 A/B/C/D 独立成行。
+10. 禁止输出泛化模板选项：`会直接影响系统行为与资源约束`、`只影响文字表述`、`仅在理想场景成立`、`与性能和正确性无关`。
+11. 覆盖要求：综合卷优先跨章节覆盖；允许少量同概念变体，但不得大量同质重复。
+12. 体感要求：题干详略得当，又长有短，避免整卷题干长度单一。
+13. 难度设计优先考"机制推理、边界条件、流程串联"，减少纯定义背诵题比例。
+14. 可在同一题中串联 2-3 个相关考点，题面保持考试风格与可判分性。
+15. 避免抽象空词（如"资源/该资源/某机制"）直接作为题干主语，需落到具体机制或对象。
+
+【分值与编号约束】
+- 选择题：{choice_count} 题，每题 2 分，编号 1-{choice_end}
+- 填空题：{fill_count} 题，每题 2 分，编号 {fill_start}-{fill_end}
+- 判断题：{judge_count} 题，每题 2 分，编号 {judge_start}-{judge_end}
+- 简答题：{essay_count} 题，每题 {essay_score} 分，编号 {essay_start}-{essay_end}
+
+只返回纯 JSON：
+{{"exam_paper": "...", "reasoning": {{"topic_coverage": [...], "answer_evidence": [...], "difficulty_distribution": "..."}}}}

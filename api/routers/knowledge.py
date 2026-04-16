@@ -72,6 +72,67 @@ def _load_file_vector_map(session_data_dir: str) -> Dict[str, List[str]]:
     except Exception:
         return {}
 
+def _count_md5_references(session_data_dir: str, target_md5: str, exclude_filename: str = "") -> int:
+    """统计会话目录内（允许类型）引用某个 MD5 的文件数量。"""
+    if not target_md5 or not os.path.isdir(session_data_dir):
+        return 0
+    count = 0
+    for fname in os.listdir(session_data_dir):
+        if fname.startswith(".") or fname == os.path.basename(chroma_conf.get("md5_hex_store", ".md5_hex_store")):
+            continue
+        if exclude_filename and fname == exclude_filename:
+            continue
+        ext = os.path.splitext(fname)[1].lower()
+        if ext not in ALLOWED_SUFFIX:
+            continue
+        fpath = os.path.join(session_data_dir, fname)
+        if not os.path.isfile(fpath):
+            continue
+        try:
+            with open(fpath, "rb") as f:
+                if hashlib.md5(f.read()).hexdigest() == target_md5:
+                    count += 1
+        except Exception:
+            continue
+    return count
+
+def _has_vectorized_peer_for_md5(
+    session_data_dir: str,
+    target_md5: str,
+    file_vector_map: Dict[str, List[str]],
+    ingest_status: Dict[str, Any],
+    exclude_filename: str = "",
+) -> bool:
+    """
+    判断是否存在“同 MD5 且已入库”的其他文件。
+    用于避免“同内容不同文件名”被误判为可重试。
+    """
+    if not target_md5 or not os.path.isdir(session_data_dir):
+        return False
+    for fname in os.listdir(session_data_dir):
+        if fname.startswith(".") or fname == os.path.basename(chroma_conf.get("md5_hex_store", ".md5_hex_store")):
+            continue
+        if exclude_filename and fname == exclude_filename:
+            continue
+        ext = os.path.splitext(fname)[1].lower()
+        if ext not in ALLOWED_SUFFIX:
+            continue
+        fpath = os.path.join(session_data_dir, fname)
+        if not os.path.isfile(fpath):
+            continue
+        try:
+            with open(fpath, "rb") as f:
+                file_md5 = hashlib.md5(f.read()).hexdigest()
+            if file_md5 != target_md5:
+                continue
+        except Exception:
+            continue
+        has_mapping = bool(file_vector_map.get(fname))
+        is_completed = str((ingest_status.get(fname) or {}).get("status", "")).strip() == "completed"
+        if has_mapping or is_completed:
+            return True
+    return False
+
 
 def _load_ingest_status(status_path: str) -> Dict[str, Any]:
     if not os.path.exists(status_path):
@@ -216,10 +277,21 @@ async def upload_documents(
             status_entry = ingest_status.get(safe_name, {})
             is_failed_file = status_entry.get("status") == "failed"
             has_vector_mapping = bool(file_vector_map.get(safe_name))
+            peer_vectorized = _has_vectorized_peer_for_md5(
+                session_data_dir=session_data_dir,
+                target_md5=md5_hex,
+                file_vector_map=file_vector_map,
+                ingest_status=ingest_status,
+                exclude_filename=safe_name,
+            )
 
             # 失败文件允许重试：清理旧 MD5，重新进入向量化流程
-            if is_failed_file or not has_vector_mapping:
-                logger.info(f"[上传重试] {file.filename} 命中旧MD5但允许重试（failed={is_failed_file}, mapped={has_vector_mapping}）")
+            # 仅当“同名文件失败”或“同名映射缺失且不存在其他已入库同MD5文件”时允许重试
+            if is_failed_file or (not has_vector_mapping and not peer_vectorized):
+                logger.info(
+                    f"[上传重试] {file.filename} 命中旧MD5但允许重试（failed={is_failed_file}, "
+                    f"mapped={has_vector_mapping}, peer_vectorized={peer_vectorized}）"
+                )
                 _remove_md5(md5_store_path, md5_hex)
                 existing_md5s.discard(md5_hex)
             else:
@@ -258,7 +330,10 @@ async def upload_documents(
     dup_updates = {}
     for r in results:
         if r.get("status") == "duplicate" and r.get("filename"):
-            dup_updates[r["filename"]] = {"status": "completed", "detail": "内容重复，复用已有向量"}
+            existing_path = os.path.join(session_data_dir, os.path.basename(r["filename"]))
+            # 仅对真实存在的本地文件回填状态，避免“幽灵状态”污染 ingest_status
+            if os.path.exists(existing_path):
+                dup_updates[r["filename"]] = {"status": "completed", "detail": "内容重复，复用已有向量"}
     if dup_updates:
         _update_ingest_status(session_id, dup_updates)
 
@@ -669,10 +744,14 @@ async def delete_file(
 
         # 5. 从 MD5 store 中移除该文件的 MD5
         if os.path.exists(md5_store_path):
-            with open(md5_store_path, "r", encoding="utf-8") as f:
-                md5_lines = [line.strip() for line in f if line.strip() and line.strip() != file_md5]
-            with open(md5_store_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(md5_lines) + "\n")
+            # 若仍有其他文件引用该 MD5，则保留 md5 标记，避免误判未入库
+            ref_count = _count_md5_references(session_data_dir, file_md5, exclude_filename=decoded_filename)
+            if ref_count <= 0:
+                with open(md5_store_path, "r", encoding="utf-8") as f:
+                    md5_lines = [line.strip() for line in f if line.strip() and line.strip() != file_md5]
+                with open(md5_store_path, "w", encoding="utf-8") as f:
+                    if md5_lines:
+                        f.write("\n".join(md5_lines) + "\n")
         # 同步删除状态记录
         status_data = _load_ingest_status(status_store_path)
         if decoded_filename in status_data:

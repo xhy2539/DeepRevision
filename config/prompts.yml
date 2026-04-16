@@ -23,8 +23,3 @@ exam_contract_path: prompts/exam_contract.txt
 # 格式示例
 format_examples_path: prompts/format_examples.txt
 
-# 报告生成
-report_prompt_path: prompts/report_prompt.txt
-
-# 旧版出题提示词（保留兼容性）
-quiz_prompt_path: prompts/quiz_prompt.txt

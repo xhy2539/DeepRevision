@@ -2,6 +2,7 @@ import asyncio
 import random
 from typing import Any, Callable, Dict, List, Tuple
 
+import httpx
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import PromptTemplate
 from pydantic import BaseModel
@@ -144,14 +145,14 @@ async def call_llm_structured(
         "QuizGenerateResult": 120.0,
         "ExamPaper": 150.0,
         "ExamPaperText": 150.0,
-        "CritiqueResult": 20.0,
+        "CritiqueResult": 12.0,
         "ReviseResult": 30.0,
         "ExamReviseResult": 45.0,
     }
     retry_map = {
         "StructuredQuizSetResult": 1,
         "QuizGenerateResult": 1,
-        "CritiqueResult": 1,
+        "CritiqueResult": 0,
         "ReviseResult": 1,
         "ExamPaper": 1,
         "ExamPaperText": 1,
@@ -164,15 +165,42 @@ async def call_llm_structured(
     if not providers:
         raise RuntimeError("未配置可用的聊天模型")
 
+    # 根治挂起：httpx 级别超时（覆盖 connect+read） + 线程隔离确保 asyncio.wait_for 可中断
+    # 原理：httpx.AsyncClient.timeout 控制 TCP 层面超时；线程内抛出的异常可被 wait_for 捕获
+    def _chain_ainvoke_sync(chain: Any, chain_kwargs: dict) -> str:
+        return asyncio.run(chain.ainvoke(chain_kwargs))
+
     for provider_name, provider_model in providers:
         chain = prompt | provider_model | StrOutputParser()
         attempt = 0
         local_max_retries = max_retries
         local_overload_bonus_used = False
+        allow_backup_for_schema = schema_name not in {"CritiqueResult"}
         while attempt <= local_max_retries:
             result = None
             try:
-                result = await asyncio.wait_for(chain.ainvoke(kwargs), timeout=llm_timeout)
+                # 临时注入 httpx 超时（覆盖 connect + read），避免 TCP 握手卡死
+                orig_client = getattr(provider_model, "http_client", None)
+                http_client = None
+                client_set = False
+                if orig_client is not None and isinstance(orig_client, httpx.AsyncClient):
+                    http_client = httpx.AsyncClient(
+                        timeout=httpx.Timeout(llm_timeout, connect=10.0)
+                    )
+                    provider_model.http_client = http_client
+                    client_set = True
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.to_thread(_chain_ainvoke_sync, chain, kwargs),
+                        timeout=llm_timeout + 5,
+                    )
+                finally:
+                    if client_set and http_client is not None:
+                        await http_client.aclose()
+                    if orig_client is not None:
+                        provider_model.http_client = orig_client
+                    elif hasattr(provider_model, "http_client"):
+                        delattr(provider_model, "http_client")
                 parsed = extract_json_fn(result)
                 parsed = coerce_payload_fn(parsed, schema)
                 return schema(**parsed)
@@ -205,8 +233,10 @@ async def call_llm_structured(
                     break
                 await asyncio.sleep(retry_sleep_seconds(fail_reason, attempt))
                 attempt += 1
-        if provider_name == "primary" and backup_model and should_retry_structured_error(last_error or Exception("unknown")):
+        if provider_name == "primary" and (not allow_backup_for_schema):
+            # Critique 阶段不切备用模型，快速失败交给上层本地评审兜底
+            break
+        if provider_name == "primary" and backup_model and allow_backup_for_schema and should_retry_structured_error(last_error or Exception("unknown")):
             logger.warning("[call_llm_structured] 主模型异常，切换备用模型继续结构化生成")
 
     raise last_error
-

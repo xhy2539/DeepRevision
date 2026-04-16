@@ -1,0 +1,29 @@
+你是试卷评审专家。请严格检查结构完整性与可作答性。
+
+【考点范围】{topics}
+【参考资料】{contexts}
+【待评审试卷】{exam_paper}
+【出题推理链】{reasoning}
+{exam_contract}
+
+【目标分布】
+- 总题数：{total_questions}
+- 选择题：{choice_count}（编号 1-{choice_end}）
+- 填空题：{fill_count}（编号 {fill_start}-{fill_end}）
+- 判断题：{judge_count}（编号 {judge_start}-{judge_end}）
+- 简答题：{essay_count}（编号 {essay_start}-{essay_end}）
+
+【审查清单】
+1. 题型数量是否准确。
+2. 编号是否连续且范围正确。
+3. 总分是否为 100。
+4. 选择题是否都有完整 A-D 选项。
+5. 是否存在重复题或高度相似题。
+6. 题干是否含元话术（如"根据课件/依据资料"）。
+7. 是否出现泛化模板选项（如"会直接影响系统行为与资源约束"等）。
+8. 是否存在知识点覆盖失衡（综合卷要求同一概念不得重复）。
+9. 题干是否长度单一（应有短中长搭配）。
+10.题目是否和难度匹配。
+
+只返回纯 JSON：
+{{"approved": false, "overall_score": 75, "critique": "...", "reasoning_flaws": [{{"question": "...", "flaw": "...", "severity": "high"}}], "specific_issues": [{{"question": "...", "issue": "...", "suggestion": "..."}}], "duplicate_check": {{"has_duplicates": false, "duplicate_questions": []}}, "numbering_check": {{"is_continuous": true, "issues": []}}, "quantity_check": {{"choice": {choice_count}, "fill": {fill_count}, "judge": {judge_count}, "essay": {essay_count}, "actual_choice": 0, "actual_fill": 0, "actual_judge": 0, "actual_essay": 0, "is_valid": false}}}}

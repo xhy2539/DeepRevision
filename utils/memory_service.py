@@ -11,6 +11,7 @@ import sqlite3
 import asyncio
 import time
 import hashlib
+import re
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 from functools import partial
@@ -144,6 +145,46 @@ def _loads_json_or_default(text: Optional[str], default: Any) -> Any:
         return json.loads(text)
     except Exception:
         return default
+
+
+def _clean_knowledge_point_phrase(text: str) -> str:
+    s = str(text or "")
+    # 去 markdown / emoji-like 噪音
+    s = re.sub(r"`([^`]+)`", r"\1", s)
+    s = re.sub(r"[*_#>\[\]\(\)✅❌⚠️•·]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return ""
+
+    # 常见题干模板抽取（偏名词短语）
+    patterns = [
+        r"下列关于(.{2,24}?)的",
+        r"关于(.{2,24}?)的",
+        r"在(.{2,24}?)中",
+        r"(.{2,24}?)的核心作用",
+        r"(.{2,24}?)机制",
+    ]
+    for p in patterns:
+        m = re.search(p, s)
+        if m:
+            cand = str(m.group(1) or "").strip("：:，,。.;；!?！？ ")
+            if 2 <= len(cand) <= 24:
+                s = cand
+                break
+
+    # 分隔截断（保留前半句名词性内容）
+    for sep in ["；", ";", "。", "?", "？", "!", "！", " - ", "——", "：", ":"]:
+        if sep in s:
+            s = s.split(sep, 1)[0].strip()
+            break
+
+    # 去疑问句前缀
+    s = re.sub(r"^(下列|以下|请|试|简述|说明|判断|选择|哪个|哪一项|当|在)\s*", "", s).strip()
+    s = s.strip("：:，,。.;；!?！？ ")
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > 28:
+        s = s[:28].rstrip("：:，,。.;；!?！？ ")
+    return s
 
 
 def _load_session_sync(db: str, session_id: str) -> Dict:
@@ -677,19 +718,27 @@ class SessionMemoryManager:
                            knowledge_point: str, user_answer: str, correct_answer: str,
                            is_correct: bool, wrong_reason: str = None):
         """记录一次练习答题"""
-        loop = asyncio.get_event_loop()
-        loop.run_in_executor(None, partial(
+        task = partial(
             _add_practice_record_sync,
             self.db, session_id, question_id, question_content,
             knowledge_point, user_answer, correct_answer, is_correct, wrong_reason
-        ))
+        )
+        try:
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(None, task)
+        except RuntimeError:
+            # 无运行中事件循环时，退化为同步写入，避免抛错导致接口 500
+            task()
+        except Exception:
+            # 兜底：写入失败时再尝试同步一次
+            task()
 
     def get_practice_history(self, session_id: str, limit: int = 20) -> List[Dict]:
         """获取练习历史"""
         conn = sqlite3.connect(self.db)
         try:
             rows = conn.execute("""
-                SELECT question_content, knowledge_point, user_answer, correct_answer, is_correct, wrong_reason, created_at
+                SELECT id, question_content, knowledge_point, user_answer, correct_answer, is_correct, wrong_reason, created_at
                 FROM practice_records
                 WHERE session_id = ?
                 ORDER BY created_at DESC
@@ -697,16 +746,43 @@ class SessionMemoryManager:
             """, (session_id, limit)).fetchall()
             return [
                 {
-                    "question_content": row[0],
-                    "knowledge_point": row[1],
-                    "user_answer": row[2],
-                    "correct_answer": row[3],
-                    "is_correct": bool(row[4]),
-                    "wrong_reason": row[5],
-                    "created_at": row[6]
+                    "id": row[0],
+                    "question_content": row[1],
+                    "knowledge_point": row[2],
+                    "user_answer": row[3],
+                    "correct_answer": row[4],
+                    "is_correct": bool(row[5]),
+                    "wrong_reason": row[6],
+                    "created_at": row[7]
                 }
                 for row in rows
             ]
+        finally:
+            conn.close()
+
+    def delete_practice_record(self, session_id: str, record_id: int) -> bool:
+        """删除一条练习记录"""
+        conn = sqlite3.connect(self.db)
+        try:
+            cur = conn.execute(
+                "DELETE FROM practice_records WHERE session_id = ? AND id = ?",
+                (session_id, int(record_id)),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0) > 0
+        finally:
+            conn.close()
+
+    def clear_practice_history(self, session_id: str) -> int:
+        """清空会话下所有练习记录，返回删除条数"""
+        conn = sqlite3.connect(self.db)
+        try:
+            cur = conn.execute(
+                "DELETE FROM practice_records WHERE session_id = ?",
+                (session_id,),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
         finally:
             conn.close()
 
@@ -722,11 +798,22 @@ class SessionMemoryManager:
                 WHERE session_id = ? AND knowledge_point IS NOT NULL
                 GROUP BY knowledge_point
             """, (session_id,)).fetchall()
-            stats = {}
+            # 兼容历史脏数据：按归一后的“名词短语考点”聚合
+            agg: Dict[str, Dict[str, int]] = {}
             for row in rows:
+                raw_kp = str(row[0] or "").strip()
+                kp = _clean_knowledge_point_phrase(raw_kp) or raw_kp or "未标注"
                 total = row[1]
                 correct = row[2]
-                stats[row[0]] = {
+                if kp not in agg:
+                    agg[kp] = {"total": 0, "correct": 0}
+                agg[kp]["total"] += int(total or 0)
+                agg[kp]["correct"] += int(correct or 0)
+            stats = {}
+            for kp, data in agg.items():
+                total = int(data.get("total", 0))
+                correct = int(data.get("correct", 0))
+                stats[kp] = {
                     "total": total,
                     "correct": correct,
                     "accuracy": round(correct / total * 100, 1) if total > 0 else 0,

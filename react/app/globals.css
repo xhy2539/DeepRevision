@@ -201,6 +201,57 @@ h1, h2, h3, .font-serif {
   border-color: rgb(var(--brand));
 }
 
+/* 闲聊内容排版优化 */
+.chat-prose p {
+  margin: 0.6rem 0;
+  line-height: 1.75;
+}
+
+.chat-prose p:first-child {
+  margin-top: 0;
+}
+
+.chat-prose p:last-child {
+  margin-bottom: 0;
+}
+
+.chat-prose ul,
+.chat-prose ol {
+  margin: 0.75rem 0;
+}
+
+.chat-prose li::marker {
+  color: rgba(13, 148, 136, 0.75);
+}
+
+.chat-prose blockquote {
+  background: rgba(13, 148, 136, 0.06);
+  border-left: 4px solid rgba(13, 148, 136, 0.5);
+  padding: 0.6rem 0.9rem;
+  border-radius: 0.5rem;
+}
+
+.chat-prose code {
+  background: rgba(15, 118, 110, 0.08);
+  border-color: rgba(13, 148, 136, 0.2);
+}
+
+.chat-message {
+  position: relative;
+  overflow: hidden;
+}
+
+.chat-message::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0.85rem;
+  bottom: 0.85rem;
+  width: 3px;
+  border-radius: 999px;
+  background: linear-gradient(180deg, rgba(13, 148, 136, 0.65), rgba(15, 118, 110, 0.2));
+}
+
 /* 滚动条美化 */
 ::-webkit-scrollbar {
   width: 6px;

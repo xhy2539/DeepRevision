@@ -96,18 +96,6 @@ def load_format_examples():
     return _load_prompt_from_config("format_examples_path")
 
 
-# ============ 兼容旧版 ============
-
-def load_report_prompts():
-    """加载报告生成提示词（兼容旧版）"""
-    return _load_prompt_from_config("report_prompt_path")
-
-
-def load_quiz_prompts():
-    """加载出题提示词（兼容旧版）"""
-    return _load_prompt_from_config("quiz_prompt_path")
-
-
 # ============ 便捷加载函数 ============
 
 def load_all_exam_prompts() -> dict:

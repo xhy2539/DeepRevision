@@ -25,6 +25,7 @@ from model.factory import chat_model, backup_chat_model, light_chat_model, backu
 from agent.tools.agent_tools import get_rag_service
 from utils.logger_handler import logger
 from utils.session_context import current_session_id
+from utils.rag_metrics import rag_inc
 
 
 # ==================== 状态定义 ====================
@@ -38,6 +39,7 @@ class SupervisorState(TypedDict):
     exam_rerun_stage: str   # 失败后仅重跑某一段
     exam_partial_questions: list  # 已成功段题目（重跑失败段时回传）
     exam_fast_mode: bool   # True=快速路径(格式检查), False=完整路径(LLM Critique)
+    quiz_force_llm_critic: bool  # True=quiz强制走LLM Critic，不走本地快速质检短路
     # Supervisor 决策
     route: str              # "rag" | "quiz" | "exam" | "planner" | "chitchat"
     route_reason: str       # 路由原因（用于日志）
@@ -433,21 +435,29 @@ def _extract_json(text: str) -> dict:
     if not text:
         return {}
 
-    match = re.search(r'```(?:json)?\s*([\s\S]*?)```', text)
-    if match:
-        text = match.group(1).strip()
-    # 如果不是 JSON 格式，尝试直接解析
+    # 先按原文直接解析，避免 evidence 内部代码块干扰。
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # 如果失败，尝试找 JSON 对象
-        match = re.search(r'\{[\s\S]*\}', text)
-        if match:
-            try:
-                return json.loads(match.group(0))
-            except:
-                pass
-        return {}
+        pass
+
+    # 仅当整段文本是 fenced block 时才去掉外层围栏，避免误匹配内部 ```bash / ```text。
+    fenced_match = re.match(r'^\s*```(?:json)?\s*([\s\S]*?)\s*```\s*$', text)
+    if fenced_match:
+        fenced_body = fenced_match.group(1).strip()
+        try:
+            return json.loads(fenced_body)
+        except json.JSONDecodeError:
+            pass
+
+    # 最后回退：提取首个 JSON 对象片段再解析。
+    match = re.search(r'\{[\s\S]*\}', text)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+    return {}
 
 
 def _extract_grounded_evidence(parsed: dict, context: str) -> list[dict]:
@@ -732,7 +742,7 @@ async def rag_subagent_node(state: SupervisorState) -> SupervisorState:
         rag = await get_rag_service()
         # retrieve_context 只检索、不调 LLM，避免冗余的双重 LLM 调用
         retrieve_start = time.time()
-        context = await rag.retrieve_context(topic)
+        context = await rag.retrieve_context(topic, mode="rag_chat")
         logger.info(f"[Latency] rag_retrieve_ms={int((time.time() - retrieve_start) * 1000)}")
         # 如果检索为空，给出友好提示
         if not context or context.strip() == "":
@@ -757,6 +767,7 @@ async def rag_subagent_node(state: SupervisorState) -> SupervisorState:
     grounded_evidence = _extract_grounded_evidence(parsed, context)
 
     if answer and grounded_evidence:
+        rag_inc("rag_grounded_pass_count", 1)
         logger.info(f"[RAG SubAgent] 回答依据校验通过，evidence_count={len(grounded_evidence)}")
         logger.info(f"[Latency] rag_total_ms={int((time.time() - rag_start) * 1000)}")
         return {
@@ -769,6 +780,7 @@ async def rag_subagent_node(state: SupervisorState) -> SupervisorState:
 
     # 非严格模式：课件作为主要依据即可，不再因证据条目不足直接拒答
     if answer:
+        rag_inc("rag_grounded_partial_count", 1)
         logger.warning("[RAG SubAgent] 回答依据条目不足，按课件优先策略继续返回答案")
         logger.info(f"[Latency] rag_total_ms={int((time.time() - rag_start) * 1000)}")
         return {
@@ -781,6 +793,7 @@ async def rag_subagent_node(state: SupervisorState) -> SupervisorState:
         }
 
     logger.warning("[RAG SubAgent] 无有效回答，触发保守提示")
+    rag_inc("rag_grounded_fail_count", 1)
     logger.info(f"[Latency] rag_total_ms={int((time.time() - rag_start) * 1000)}")
     fallback = (
         "根据当前检索结果，我暂时无法提取到可核验的课件依据。"
@@ -837,9 +850,15 @@ async def quiz_subagent_node(state: SupervisorState) -> SupervisorState:
             weak_context = f"\n\n【薄弱点提醒】以下知识点正确率低于60%，请优先出这些方面的题目：\n" + "\n".join(weak_lines)
             logger.info(f"[Quiz SubAgent] 检测到 {len(weak_points)} 个薄弱点，将优先出相关题目")
 
-    # 通用请求直接使用“课件核心知识点”，避免把“做练习题”这类意图词当作知识点检索
-    effective_topic = "综合知识应用" if is_generic_request else topic
-    quiz_result = await run_quiz_agent(effective_topic + weak_context, quiz_type, num, sample_ctx)
+    # 通用请求不再注入固定锚点词；交给出题链路按课件池随机抽样检索
+    effective_topic = topic_stripped if is_generic_request else topic
+    quiz_result = await run_quiz_agent(
+        effective_topic + weak_context,
+        quiz_type,
+        num,
+        sample_ctx,
+        force_llm_critic=bool(state.get("quiz_force_llm_critic", False)),
+    )
     quiz_text = quiz_result.get("text", "") if isinstance(quiz_result, dict) else quiz_result
     if not quiz_text:
         quiz_text = "抱歉，出题失败了，请稍后重试。"

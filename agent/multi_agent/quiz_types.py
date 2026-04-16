@@ -24,6 +24,7 @@ class QuizState(TypedDict):
     quiz_budget_seconds: int
     evidence_source: str
     reflection_rounds: int
+    force_llm_critic: bool
 
 
 class ExamPaperState(TypedDict):
@@ -118,4 +119,3 @@ class ExamReviseResult(BaseModel):
     revised_exam: str = Field(description="修订后的试卷")
     revision_notes: str = Field(description="修改说明")
     addressed_issues: List[str] = Field(default_factory=list, description="已解决的问题列表")
-

@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 import asyncio
+import math
 from functools import wraps
 from logging.handlers import RotatingFileHandler
 
@@ -91,7 +92,25 @@ _stats_lock = threading.Lock()
 
 
 def get_system_stats():
-    return token_stats
+    # 返回可 JSON 序列化且数值稳定的快照，避免前端偶发 500
+    with _stats_lock:
+        snap = dict(token_stats)
+    out = {}
+    for k, v in snap.items():
+        if isinstance(v, bool):
+            out[k] = bool(v)
+        elif isinstance(v, int):
+            out[k] = int(v)
+        elif isinstance(v, float):
+            out[k] = float(v) if math.isfinite(v) else 0.0
+        else:
+            try:
+                out[k] = float(v)
+                if not math.isfinite(out[k]):
+                    out[k] = 0.0
+            except Exception:
+                out[k] = str(v)
+    return out
 
 
 def update_token_stats(usage_dict):

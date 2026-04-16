@@ -109,16 +109,52 @@ class VectorStoreService():
             logger.warning(f"[删除向量] 文件 {filename} 不在映射表中，可能未向量化或已删除")
             return False
 
-        doc_ids = mapping[filename]
+        doc_ids = list(mapping[filename] or [])
+        target_id_set = set(doc_ids)
+        shared_with_others = False
+        if target_id_set:
+            for other_file, other_ids in mapping.items():
+                if other_file == filename:
+                    continue
+                if set(other_ids or []) == target_id_set:
+                    shared_with_others = True
+                    break
         try:
-            self.vector_store.delete(ids=doc_ids)
+            # 多文件共享同一批向量ID时，仅移除文件映射，避免误删仍被引用的向量
+            if doc_ids and not shared_with_others:
+                self.vector_store.delete(ids=doc_ids)
             del mapping[filename]
             self._save_file_vector_map(mapping)
-            logger.info(f"[删除向量] 成功删除文件 {filename} 的 {len(doc_ids)} 个向量")
+            if shared_with_others:
+                logger.info(f"[删除向量] 文件 {filename} 与其他文件共享向量，已仅移除映射")
+            else:
+                logger.info(f"[删除向量] 成功删除文件 {filename} 的 {len(doc_ids)} 个向量")
             return True
         except Exception as e:
             logger.error(f"[删除向量] 删除文件 {filename} 失败: {e}")
             return False
+
+    async def _delete_file_vectors_if_exists(self, filename: str):
+        """
+        上传同名文件前清理旧向量，避免残留 chunk 污染检索。
+        """
+        mapping = self._load_file_vector_map()
+        old_ids = list(mapping.get(filename) or [])
+        if not old_ids:
+            # 历史版本可能缺少映射，尝试按 metadata 条件删除
+            try:
+                self.vector_store.delete(where={"source_filename": filename})
+                logger.info(f"[向量重建] 映射缺失，按 source_filename 条件清理: file={filename}")
+            except Exception:
+                pass
+            return
+        try:
+            self.vector_store.delete(ids=old_ids)
+            mapping.pop(filename, None)
+            self._save_file_vector_map(mapping)
+            logger.info(f"[向量重建] 已清理旧向量: file={filename}, chunks={len(old_ids)}")
+        except Exception as e:
+            logger.warning(f"[向量重建] 清理旧向量失败 file={filename}: {e}")
 
     async def load_document(self, target_filenames: Optional[List[str]] = None):
         """
@@ -215,9 +251,17 @@ class VectorStoreService():
             try:
                 md5_hex = get_file_md5_hex(path)
                 if chunk_md5_hex(md5_hex):
-                    logger.info(f"[加载知识库]{path}内容已存在，跳过")
-                    result_map[fname] = {"status": "completed", "detail": "内容已存在，跳过重复向量化"}
-                    continue
+                    # 仅当“MD5命中 + 存在向量映射”同时满足时才跳过
+                    mapping = self._load_file_vector_map()
+                    mapped_ids = list(mapping.get(fname) or [])
+                    if mapped_ids:
+                        logger.info(f"[加载知识库]{path}内容已存在且向量映射有效，跳过")
+                        result_map[fname] = {"status": "completed", "detail": "内容已存在，跳过重复向量化"}
+                        continue
+                    logger.warning(f"[加载知识库]{path}命中MD5但缺少向量映射，执行重建")
+
+                # 确认需要重建时再清理旧向量，避免“误删后判重跳过”
+                await self._delete_file_vectors_if_exists(fname)
 
                 documents = await get_file_document(path)
                 if not documents:
