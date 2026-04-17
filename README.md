@@ -2,6 +2,8 @@
 
 DeepRevision 是一个面向高校课程复习场景的智能问答与出题系统。核心思路是“课件锚定 + 练习闭环”：先用课件构建检索知识库，再把练习记录反哺到后续出题与计划。
 
+> 文档更新时间：2026-04-17
+
 ## 当前实现概览
 
 - 多 Agent 路由：`supervisor` 在 `rag / quiz / exam / ops / planner / history / chitchat` 之间分流。
@@ -9,7 +11,9 @@ DeepRevision 是一个面向高校课程复习场景的智能问答与出题系�
 - 失败文件重试：支持对失败或异常状态文件执行重试入库（`/api/knowledge/retry-failed`）。
 - RAG 检索：BM25 + 向量检索 + RRF 融合，低召回场景可触发 HyDE，带会话级上下文缓存与语义缓存。
 - 智能出题与组卷：基于 Reflexion（Generate -> Critique -> Revise）链路生成题目和试卷，支持按题型与数量控制。
+- 出题跨轮去重：同一会话会记录每轮题干签名，默认在新一轮出题前加载最近 15 轮签名，避免生成“一模一样”的重复题。
 - 练习闭环：提交作答、错因、相似题推荐、薄弱点统计、知识点回填（`/practice/backfill-kp`）。
+- 出题后复盘跟进：当用户追问“怎么样/如何”时，Supervisor 会把最近出题/作答快照作为提示交给 LLM 判定，默认倾向 `history` 复盘；仅在用户明确“继续出题/再来几题”时才走 `quiz/exam`。
 - 用户画像：支持用户级助手人格配置（语气、详略、教学风格、称呼等）。
 - 导出能力：支持试卷格式化、试卷 Word 导出、答案卷导出与下载。
 - 运行观测：提供健康检查、token 统计与运行指标接口。
@@ -109,6 +113,8 @@ npm run dev
 
 - 前端：`http://127.0.0.1:3000/chat`
 - 健康检查：`http://127.0.0.1:8001/health`
+- 后端根路由：`http://127.0.0.1:8001/`（重定向到前端）
+- 后端应用页：`http://127.0.0.1:8001/app`（重定向到前端 `/chat`）
 
 ## Docker 部署（当前仓库实现）
 
@@ -170,10 +176,14 @@ docker compose -f docker-compose.prod.yml up -d
 
 ### 试卷导出
 
-- `POST /api/exam/format`
-- `POST /api/exam/export/docx`
-- `POST /api/exam/answersheet`
-- `GET /api/exam/download/{filename}`
+- `POST /api/exam/api/exam/format`
+- `POST /api/exam/api/exam/export/docx`
+- `POST /api/exam/api/exam/answersheet`
+- `GET /api/exam/api/exam/download/{filename}`
+
+说明：
+- 当前代码中 `api/main.py` 与 `api/routers/exam_export.py` 都配置了 `/api/exam` 前缀，所以实际路由是双前缀形式。
+- `export/docx` 与 `answersheet` 返回体中的 `download_url` 当前仍是 `/api/exam/download/{filename}` 字符串（与实际路由存在前缀差异），这是现状实现。
 
 ## 测试
 

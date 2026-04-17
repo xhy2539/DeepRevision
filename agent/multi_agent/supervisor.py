@@ -75,6 +75,27 @@ def _safe_int(value, default: int, minimum: int | None = None, maximum: int | No
     return result
 
 
+def _extract_quiz_question_texts(quiz_result: Any) -> List[str]:
+    """从 quiz payload 中提取题干列表，供跨轮去重落库。"""
+    if not isinstance(quiz_result, dict):
+        return []
+    payload = quiz_result.get("payload")
+    if not isinstance(payload, dict):
+        return []
+    questions = payload.get("questions")
+    if not isinstance(questions, list):
+        return []
+
+    stems: List[str] = []
+    for item in questions:
+        if not isinstance(item, dict):
+            continue
+        stem = str(item.get("question") or item.get("content") or "").strip()
+        if stem:
+            stems.append(stem)
+    return stems
+
+
 # ==================== 提示词 ====================
 
 SUPERVISOR_PROMPT = """你是【复习助手】的智能调度中心。
@@ -106,6 +127,11 @@ SUPERVISOR_PROMPT = """你是【复习助手】的智能调度中心。
 - 且历史对话中助手刚提供了带编号的选项菜单
 - 则应将用户回复理解为选择该菜单项，并按对应意图路由
 - 例如：历史中助手提供了"1.复习 2.做题 3.聊天"，用户回复"2" → 应路由到 quiz
+
+## 低信息跟进理解（重要）：
+- 当用户输入是"怎么样/如何/我答得咋样"等低信息短句时，必须结合近期上下文判断，不要机械按关键词改写
+- 若近期刚完成出题/作答，默认优先 route=history（复盘、正确率、薄弱点）
+- 仅当用户明确说“继续出题/再来几题/重新出卷”时，才 route=quiz/exam
 
 ## 参数提取规则（仅对 quiz/exam/ops 路由）：
 - quiz_params: {{"topic": "从用户输入中提取的知识点/科目", "quiz_type": "题型", "num": 数量}}
@@ -758,7 +784,12 @@ def _extract_grounded_evidence(parsed: dict, context: str) -> list[dict]:
     return grounded
 
 
-def _validate_supervisor_decision(decision: dict, original_query: str) -> dict:
+def _validate_supervisor_decision(
+    decision: dict,
+    original_query: str,
+    *,
+    has_recent_quiz_context: bool = False,
+) -> dict:
     """校验 Supervisor 的结构化路由结果，避免静默误路由。"""
     if not isinstance(decision, dict) or not decision:
         raise ValueError("empty supervisor decision")
@@ -803,6 +834,24 @@ def _validate_supervisor_decision(decision: dict, original_query: str) -> dict:
         str(decision.get('rewritten_query', '') or '')
     )
     reason = str(decision.get('reason', '') or '').strip()
+
+    # 语义漂移保护：低信息短句优先保持原语义，不让改写硬注入“出题/出卷”触发词。
+    if route in {"quiz", "exam"} and not _is_menu_selection_reply(original_query):
+        original_has_trigger = _contains_route_trigger(original_query, route)
+        rewritten_has_trigger = _contains_route_trigger(rewritten_query, route)
+        if (not original_has_trigger) and rewritten_has_trigger:
+            logger.warning(
+                f"[Supervisor] 语义漂移保护触发: original='{original_query}' rewritten='{rewritten_query}' route={route}"
+            )
+            rewritten_query = original_query
+            if _is_low_info_followup(original_query):
+                if has_recent_quiz_context and _is_quiz_review_followup(original_query):
+                    route = "history"
+                    reason = "低信息跟进，结合近期练习语境转为复盘分析"
+                    params = {"limit": 120}
+                else:
+                    reason = reason or "低信息短句，已阻断语义漂移改写"
+
     return {
         "rewritten_query": rewritten_query,
         "route": route,
@@ -877,6 +926,145 @@ def _validate_rewritten_query(original: str, rewritten: str) -> str:
             return original
 
     return rewritten
+
+
+def _is_menu_selection_reply(text: str) -> bool:
+    """判断是否是菜单选择式回复（如 1/选2/第二个）。"""
+    q = str(text or "").strip()
+    if not q:
+        return False
+    if re.fullmatch(r"\d{1,2}", q):
+        return True
+    if re.fullmatch(r"(选|第)?\s*\d{1,2}\s*(个|项|题|道)?", q):
+        return True
+    if re.fullmatch(r"第[一二三四五六七八九十两]+(个|项|题|道)?", q):
+        return True
+    return False
+
+
+def _contains_route_trigger(text: str, route: str) -> bool:
+    """判断文本是否包含某路由的显式触发词。"""
+    q = str(text or "")
+    if route == "quiz":
+        return any(k in q for k in ["出题", "做题", "练习", "刷题", "练习题"])
+    if route == "exam":
+        return any(k in q for k in ["试卷", "考试", "出卷", "期末"])
+    return False
+
+
+def _is_low_info_followup(text: str) -> bool:
+    """判断是否为低信息短句（容易被模型过度改写）。"""
+    q = re.sub(r"\s+", "", str(text or "").strip().lower())
+    if not q:
+        return True
+    low_info_set = {
+        "怎么样", "咋样", "如何", "然后呢", "还有吗", "继续", "继续吧", "行吗", "可以吗",
+        "行", "可以", "好", "好的", "嗯", "哦", "ok", "okay",
+    }
+    return q in low_info_set
+
+
+def _is_quiz_review_followup(text: str) -> bool:
+    """判断是否是“评价本轮作答表现”的跟进问句。"""
+    q = re.sub(r"\s+", "", str(text or "").strip().lower())
+    if not q:
+        return False
+    exact_matches = {
+        "怎么样",
+        "咋样",
+        "如何",
+        "我做得怎么样",
+        "我答得怎么样",
+        "我答得如何",
+        "做得怎么样",
+        "答得怎么样",
+        "表现如何",
+    }
+    if q in exact_matches:
+        return True
+    return (
+        any(token in q for token in ["评价", "评估", "复盘", "分析", "总结"])
+        and any(token in q for token in ["答题", "作答", "练习", "这次", "刚才", "本轮"])
+    )
+
+
+def _get_recent_session_messages(session_id: str, limit: int = 12) -> List[Dict[str, Any]]:
+    """读取会话最近消息，用于路由前的轻量上下文判定。"""
+    sid = str(session_id or "").strip() or "default"
+    try:
+        from utils.memory_service import memory_manager
+
+        messages = memory_manager.get_messages(sid)
+    except Exception as e:
+        logger.warning(f"[Supervisor] 读取会话消息失败 sid={sid}: {e}")
+        return []
+    if not messages:
+        return []
+    safe_limit = max(1, min(int(limit or 12), 40))
+    return list(messages[-safe_limit:])
+
+
+def _has_recent_quiz_turn(session_id: str) -> bool:
+    """判断最近一轮助手回复是否来自 quiz 路由。"""
+    recent_messages = _get_recent_session_messages(session_id, limit=12)
+    for msg in reversed(recent_messages):
+        if str(msg.get("role", "")).lower() != "ai":
+            continue
+        kind = str(msg.get("kind") or "").strip().lower()
+        meta = msg.get("meta") if isinstance(msg.get("meta"), dict) else {}
+        route = str(meta.get("route") or "").strip().lower()
+        return route == "quiz" or kind == "quiz_set"
+    return False
+
+
+def _build_recent_practice_snapshot(session_id: str, limit: int = 6) -> str:
+    """构造近期作答摘要，补充给 Supervisor 作为判定参考。"""
+    sid = str(session_id or "").strip() or "default"
+    safe_limit = max(3, min(int(limit or 6), 20))
+    try:
+        from utils.memory_service import memory_manager
+
+        history = memory_manager.get_practice_history(sid, safe_limit)
+        stats = memory_manager.get_knowledge_point_stats(sid)
+    except Exception as e:
+        logger.warning(f"[Supervisor] 读取练习快照失败 sid={sid}: {e}")
+        return ""
+
+    if not history:
+        return ""
+
+    total = len(history)
+    correct = sum(1 for row in history if bool(row.get("is_correct")))
+    accuracy = round((correct / total) * 100.0, 1) if total > 0 else 0.0
+    weak_points = [kp for kp, data in stats.items() if bool(data.get("weak"))][:3] if stats else []
+    latest_items = []
+    for row in history[:3]:
+        status = "正确" if bool(row.get("is_correct")) else "错误"
+        kp = str(row.get("knowledge_point") or "未标注").strip()
+        latest_items.append(f"{status}:{kp}")
+
+    lines = [
+        f"- 最近{total}题正确率：{correct}/{total}（{accuracy}%）",
+        f"- 薄弱点：{', '.join(weak_points) if weak_points else '暂无'}",
+        f"- 最近作答：{' / '.join(latest_items) if latest_items else '暂无'}",
+    ]
+    return "\n".join(lines)
+
+
+def _build_followup_intent_hint(user_input: str, has_recent_quiz_context: bool) -> str:
+    """构造低信息跟进的软提示，让 LLM 结合上下文自主判定。"""
+    if not _is_quiz_review_followup(user_input):
+        return ""
+    if has_recent_quiz_context:
+        return (
+            "- 当前用户提问是低信息跟进（如“怎么样/如何”），且上一轮为出题或作答场景。\n"
+            "- 请优先理解为“复盘/评价最近作答表现”，默认倾向 route=history。\n"
+            "- 仅当用户明确要求“继续出题/再来几题”时，才路由到 quiz。"
+        )
+    return (
+        "- 当前用户提问是低信息跟进（如“怎么样/如何”），请先结合近期上下文判断语义。\n"
+        "- 若未出现明确出题关键词，不要把该句强改写成“出题/考试”请求。"
+    )
 
 
 def _estimate_tokens(text: str) -> int:
@@ -1002,6 +1190,14 @@ async def supervisor_node(state: SupervisorState) -> SupervisorState:
 
     # 预检：按句子边界截断历史，保留语义完整性
     recent_history = _format_history_with_limit(state.get('chat_history', []))
+    sid = state.get("session_id") or current_session_id.get() or "default"
+    has_recent_quiz_context = _has_recent_quiz_turn(str(sid))
+    practice_snapshot = _build_recent_practice_snapshot(str(sid))
+    if practice_snapshot:
+        recent_history = f"{recent_history}\n\n【最近练习快照】\n{practice_snapshot}"
+    followup_hint = _build_followup_intent_hint(state.get("input", ""), has_recent_quiz_context)
+    if followup_hint:
+        recent_history = f"{recent_history}\n\n【意图判定提示】\n{followup_hint}"
 
     # 使用主模型进行意图识别
     result = ""
@@ -1012,7 +1208,11 @@ async def supervisor_node(state: SupervisorState) -> SupervisorState:
             memory_context=state.get('memory_context', ''),
             recent_history=recent_history,
         )
-        decision = _validate_supervisor_decision(_extract_json(result), state['input'])
+        decision = _validate_supervisor_decision(
+            _extract_json(result),
+            state['input'],
+            has_recent_quiz_context=has_recent_quiz_context,
+        )
         rewritten_query = decision['rewritten_query']
         route = decision['route']
         reason = decision['reason']
@@ -1153,7 +1353,8 @@ async def quiz_subagent_node(state: SupervisorState) -> SupervisorState:
     # 如果 topic 为空或只有意图词（题、出题等），视为通用出题请求
     # 不拦截，让 LLM 自己选择合适的知识点出题
     intent_only_keywords = ['题', '出题', '做题', '练习', '考试', '测试', '一道', '几个', '一些', '做一个', '出']
-    topic_stripped = topic.strip()
+    # topic 为空时回退到当前输入，避免参数提取失败导致上下文丢失。
+    topic_stripped = (str(topic or "").strip() or str(state.get("input", "") or "").strip())
     is_generic_request = (
         not topic_stripped or
         topic_stripped in intent_only_keywords
@@ -1170,13 +1371,21 @@ async def quiz_subagent_node(state: SupervisorState) -> SupervisorState:
             logger.info(f"[Quiz SubAgent] 检测到 {len(weak_points)} 个薄弱点，将优先出相关题目")
 
     # 通用请求不再注入固定锚点词；交给出题链路按课件池随机抽样检索
-    effective_topic = topic_stripped if is_generic_request else topic
+    effective_topic = topic_stripped
+    recent_signatures = memory_manager.get_recent_quiz_question_signatures(
+        sid,
+        rounds=15,
+        limit=600,
+    )
+    if recent_signatures:
+        logger.info(f"[Quiz SubAgent] 已加载最近15轮签名 {len(recent_signatures)} 条，启用跨轮去重")
     quiz_result = await run_quiz_agent(
         effective_topic + weak_context,
         quiz_type,
         num,
         sample_ctx,
         force_llm_critic=bool(state.get("quiz_force_llm_critic", False)),
+        forbidden_question_signatures=recent_signatures,
     )
     quiz_text = quiz_result.get("text", "") if isinstance(quiz_result, dict) else quiz_result
     if not quiz_text:
@@ -1185,6 +1394,18 @@ async def quiz_subagent_node(state: SupervisorState) -> SupervisorState:
             quiz_result = {**quiz_result, "text": quiz_text}
         else:
             quiz_result = quiz_text
+    if isinstance(quiz_result, dict):
+        try:
+            round_questions = _extract_quiz_question_texts(quiz_result)
+            if round_questions:
+                saved_count = memory_manager.record_quiz_round_questions(
+                    sid,
+                    round_questions,
+                    keep_recent_rounds=180,
+                )
+                logger.info(f"[Quiz SubAgent] 已记录本轮题干签名 {saved_count} 条")
+        except Exception as e:
+            logger.warning(f"[Quiz SubAgent] 记录本轮题干签名失败: {e}")
     return {"subagent_result": quiz_result, "final_answer": quiz_text}
 
 

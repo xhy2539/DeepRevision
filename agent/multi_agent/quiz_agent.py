@@ -241,7 +241,8 @@ async def get_rag_context(topic: str) -> str:
     logger.info(f"[RAG Context] 正在检索 topic={topic[:50]}...")
     try:
         rag = await get_rag_service()
-        context = await rag.retrieve_context(topic)
+        # quiz 场景使用独立 mode，避免复用 rag_chat 上下文缓存导致多轮同题。
+        context = await rag.retrieve_context(topic, mode="quiz")
         logger.info(f"[RAG Context] 检索完成，返回长度={len(context)}")
         if not context or context.strip() == "":
             logger.warning("[RAG Context] 知识库为空，返回提示信息")
@@ -940,6 +941,88 @@ def _quiz_quality_floor_flags(questions: List[dict], expected_type: str, expecte
         "duplicates": duplicates,
         "quality_floor_passed": quality_floor_passed,
     }
+
+
+def _dedupe_quiz_questions_across_rounds(
+    questions: List[dict],
+    forbidden_question_signatures: Optional[List[str]],
+    quiz_type: str,
+    topic: str,
+    rag_context: str,
+    target_num: int,
+) -> List[dict]:
+    """跨轮去重：移除与最近轮次重复题干，并尝试补齐缺失数量。"""
+    safe_target = max(1, int(target_num or 1))
+    blocked = {str(sig or "").strip() for sig in (forbidden_question_signatures or []) if str(sig or "").strip()}
+    if not questions:
+        return []
+    if not blocked:
+        return _sanitize_quiz_questions_for_delivery(questions)[:safe_target]
+
+    deduped: List[dict] = []
+    seen_now = set()
+    dropped = 0
+
+    def _append_if_unique(item: dict) -> bool:
+        nonlocal dropped
+        normalized = _normalize_question_item(item, len(deduped) + 1)
+        stem = str(normalized.get("question") or normalized.get("content") or "")
+        sig = _question_signature(stem)
+        if not sig:
+            dropped += 1
+            return False
+        if sig in blocked or sig in seen_now:
+            dropped += 1
+            return False
+        seen_now.add(sig)
+        deduped.append(normalized)
+        return True
+
+    for q in (questions or []):
+        _append_if_unique(q)
+        if len(deduped) >= safe_target:
+            break
+
+    if len(deduped) < safe_target:
+        missing = safe_target - len(deduped)
+        fallback, _ = _build_retrieval_anchored_fallback_questions(
+            quiz_type=quiz_type,
+            num=max(missing * 4, missing + 2),
+            start_num=1,
+            topic=topic or "本课程重点内容",
+            courseware_context=rag_context,
+            score_per_question=5,
+        )
+        for candidate in fallback:
+            _append_if_unique(candidate)
+            if len(deduped) >= safe_target:
+                break
+
+    if len(deduped) < safe_target:
+        # 最后一层兜底：给应急题注入轻量场景后缀，避免签名完全重复。
+        topic_seed = str(topic or "本课程重点内容").strip() or "本课程重点内容"
+        for idx in range(safe_target - len(deduped)):
+            suffix = len(blocked) + idx + 1
+            emergency = _build_emergency_questions(
+                quiz_type=quiz_type,
+                num=1,
+                start_num=1,
+                topics=f"{topic_seed} 场景{suffix}",
+                score_per_question=5,
+            )
+            if not emergency:
+                continue
+            _append_if_unique(emergency[0])
+            if len(deduped) >= safe_target:
+                break
+
+    sanitized = _sanitize_quiz_questions_for_delivery(deduped)[:safe_target]
+    for idx, q in enumerate(sanitized, start=1):
+        q["id"] = idx
+
+    if dropped > 0:
+        logger.info(f"[Quiz Dedup] 跨轮去重剔除 {dropped} 道重复题，目标数量={safe_target}，最终数量={len(sanitized)}")
+    return sanitized
 
 
 def _build_emergency_questions(
@@ -2888,6 +2971,7 @@ async def run_quiz_agent(
     num: int = 3,
     sample_paper_context: str = None,
     force_llm_critic: bool = False,
+    forbidden_question_signatures: Optional[List[str]] = None,
 ) -> dict:
     """
     运行 Reflexion 出题系统（3 Agent 协作）
@@ -3038,7 +3122,14 @@ async def run_quiz_agent(
                 "score": q.get("score") if isinstance(q.get("score"), str) else f"{int(q.get('score') or 5)}分",
                 "difficulty": q.get("difficulty", "中等"),
             })
-        questions = _sanitize_quiz_questions_for_delivery(questions)
+        questions = _dedupe_quiz_questions_across_rounds(
+            questions=questions,
+            forbidden_question_signatures=forbidden_question_signatures,
+            quiz_type=quiz_type,
+            topic=topic,
+            rag_context=rag_context,
+            target_num=max(1, int(num)),
+        )
         payload = _build_quiz_payload(topic, questions)
         floor_flags = _quiz_quality_floor_flags(questions, quiz_type, num)
         term_style_ok = all(_question_term_style_ok(q) for q in questions)
@@ -3118,7 +3209,14 @@ async def run_quiz_agent(
                 },
             }
 
-    parsed_questions = _sanitize_quiz_questions_for_delivery(parsed_questions)
+    parsed_questions = _dedupe_quiz_questions_across_rounds(
+        questions=parsed_questions,
+        forbidden_question_signatures=forbidden_question_signatures,
+        quiz_type=quiz_type,
+        topic=topic,
+        rag_context=rag_context,
+        target_num=max(1, int(num)),
+    )
     final_payload = _build_quiz_payload(topic, parsed_questions)
     final_text = _build_quiz_text_from_questions(parsed_questions)
 

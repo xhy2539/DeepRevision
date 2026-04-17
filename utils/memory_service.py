@@ -80,12 +80,23 @@ def _create_tables(conn: sqlite3.Connection):
             wrong_reason    TEXT,
             created_at      INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS quiz_round_questions (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id        TEXT    NOT NULL,
+            round_id          TEXT    NOT NULL,
+            question_signature TEXT   NOT NULL,
+            question_text     TEXT,
+            created_at        INTEGER NOT NULL
+        );
     """)
     # 创建索引，加速按 session_id 查询
     conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_sid ON messages(session_id);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_sid ON graph_nodes(session_id);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_practice_sid ON practice_records(session_id);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_practice_kp ON practice_records(knowledge_point);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_quiz_round_sid ON quiz_round_questions(session_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_quiz_round_sid_created ON quiz_round_questions(session_id, created_at DESC);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_quiz_round_sid_round ON quiz_round_questions(session_id, round_id);")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS question_bank (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -208,6 +219,19 @@ def _clean_knowledge_point_phrase(text: str) -> str:
                 if core:
                     return core
     return s
+
+
+def _normalize_quiz_question_signature(text: str) -> str:
+    """将题干归一化为稳定签名，便于跨轮去重。"""
+    src = str(text or "").strip()
+    if not src:
+        return ""
+    src = re.sub(r'^\s*\d+\s*[.、．)]\s*', '', src)
+    src = re.sub(r'^第\s*\d+\s*题[:：]?\s*', '', src)
+    src = src.lower()
+    src = re.sub(r'[（(]\s*\d+\s*[）)]', '', src)
+    src = re.sub(r'[^\w\u4e00-\u9fff]+', '', src)
+    return src
 
 
 def _load_session_sync(db: str, session_id: str) -> Dict:
@@ -369,6 +393,7 @@ def _delete_session_sync(db: str, session_id: str):
         conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM graph_nodes WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM quiz_round_questions WHERE session_id = ?", (session_id,))
         conn.commit()
     finally:
         conn.close()
@@ -715,6 +740,53 @@ class SessionMemoryManager:
         loop = asyncio.get_event_loop()
         loop.create_task(self._persist(session_id))
         return True
+
+    def record_quiz_round_questions(
+        self,
+        session_id: str,
+        questions: List[str],
+        keep_recent_rounds: int = 120,
+    ) -> int:
+        """记录一轮出题题干签名，供跨轮去重读取。"""
+        self._init_session(session_id)
+        now_ms = int(time.time() * 1000)
+        rows: List[tuple[str, str, int]] = []
+        seen = set()
+        for idx, raw_text in enumerate(questions or []):
+            text = str(raw_text or "").strip()
+            signature = _normalize_quiz_question_signature(text)
+            if not signature or signature in seen:
+                continue
+            seen.add(signature)
+            rows.append((signature, text[:500], now_ms + idx))
+
+        if not rows:
+            return 0
+
+        round_seed = f"{session_id}:{time.time_ns()}:{len(rows)}:{rows[0][0]}"
+        round_id = hashlib.md5(round_seed.encode("utf-8")).hexdigest()[:16]
+        return _save_quiz_round_questions_sync(
+            self.db,
+            session_id=session_id,
+            round_id=round_id,
+            question_rows=rows,
+            keep_recent_rounds=keep_recent_rounds,
+        )
+
+    def get_recent_quiz_question_signatures(
+        self,
+        session_id: str,
+        rounds: int = 15,
+        limit: int = 400,
+    ) -> List[str]:
+        """读取会话最近 N 轮出题签名，供生成前禁重。"""
+        self._init_session(session_id)
+        return _get_recent_quiz_signatures_sync(
+            self.db,
+            session_id=session_id,
+            rounds=rounds,
+            limit=limit,
+        )
 
     def get_all_sessions(self) -> List[Dict[str, str]]:
         return [{"id": k, "name": v["name"], "parent_id": v.get("parent_id")} for k, v in self.store.items()]
@@ -1085,6 +1157,106 @@ def _store_question_bank_sync(db: str, question_id: str, session_id: str,
             VALUES (?, ?, ?, ?, ?, ?)
         """, (question_id, session_id, knowledge_point, question_content, answer, chroma_id))
         conn.commit()
+    finally:
+        conn.close()
+
+
+def _save_quiz_round_questions_sync(
+    db: str,
+    session_id: str,
+    round_id: str,
+    question_rows: List[tuple[str, str, int]],
+    keep_recent_rounds: int = 120,
+) -> int:
+    """同步写入一轮出题签名，并裁剪历史轮次体积。"""
+    if not question_rows:
+        return 0
+    conn = sqlite3.connect(db)
+    try:
+        conn.executemany(
+            """
+            INSERT INTO quiz_round_questions (session_id, round_id, question_signature, question_text, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (session_id, round_id, signature, question_text, created_at)
+                for signature, question_text, created_at in question_rows
+            ],
+        )
+        safe_keep_rounds = max(30, int(keep_recent_rounds or 120))
+        conn.execute(
+            """
+            DELETE FROM quiz_round_questions
+            WHERE session_id = ?
+              AND round_id NOT IN (
+                    SELECT round_id FROM (
+                        SELECT round_id, MAX(created_at) AS latest_at
+                        FROM quiz_round_questions
+                        WHERE session_id = ?
+                        GROUP BY round_id
+                        ORDER BY latest_at DESC
+                        LIMIT ?
+                    )
+              )
+            """,
+            (session_id, session_id, safe_keep_rounds),
+        )
+        conn.commit()
+        return int(len(question_rows))
+    finally:
+        conn.close()
+
+
+def _get_recent_quiz_signatures_sync(
+    db: str,
+    session_id: str,
+    rounds: int = 15,
+    limit: int = 400,
+) -> List[str]:
+    """同步读取会话最近 N 轮出题签名。"""
+    conn = sqlite3.connect(db)
+    try:
+        safe_rounds = max(1, min(int(rounds or 15), 50))
+        safe_limit = max(1, min(int(limit or 400), 2000))
+        round_rows = conn.execute(
+            """
+            SELECT round_id
+            FROM (
+                SELECT round_id, MAX(created_at) AS latest_at
+                FROM quiz_round_questions
+                WHERE session_id = ?
+                GROUP BY round_id
+                ORDER BY latest_at DESC
+                LIMIT ?
+            )
+            """,
+            (session_id, safe_rounds),
+        ).fetchall()
+        round_ids = [str(row[0]) for row in round_rows if row and row[0]]
+        if not round_ids:
+            return []
+
+        placeholders = ",".join(["?"] * len(round_ids))
+        rows = conn.execute(
+            f"""
+            SELECT question_signature
+            FROM quiz_round_questions
+            WHERE session_id = ? AND round_id IN ({placeholders})
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            [session_id, *round_ids, safe_limit],
+        ).fetchall()
+
+        signatures: List[str] = []
+        seen = set()
+        for row in rows:
+            sig = str((row or [""])[0] or "").strip()
+            if not sig or sig in seen:
+                continue
+            seen.add(sig)
+            signatures.append(sig)
+        return signatures
     finally:
         conn.close()
 
