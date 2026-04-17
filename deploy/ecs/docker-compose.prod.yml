@@ -1,0 +1,29 @@
+services:
+  backend:
+    image: ${BACKEND_IMAGE}
+    container_name: deeprevision-backend
+    restart: unless-stopped
+    env_file:
+      - .env.backend
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./data:/app/data
+      - ./chroma_db:/app/chroma_db
+      - ./logs:/app/logs
+      - ./models:/app/models
+
+  frontend:
+    image: ${FRONTEND_IMAGE}
+    container_name: deeprevision-frontend
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      BACKEND_API_BASE: http://backend:8001
+      NODE_ENV: production
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"

@@ -133,13 +133,35 @@ def _build_courseware_manifest(session_data_path: str) -> Dict[str, Any]:
         return {"files": [], "fingerprint": ""}
     try:
         from utils.file_handler import listdir_with_allowed_type
-        files = listdir_with_allowed_type(
+
+        # file_handler 返回绝对路径；预热 seed 仅应使用“文件名”避免路径污染检索 query。
+        raw_files = listdir_with_allowed_type(
             session_data_path,
             (".pdf", ".ppt", ".pptx", ".doc", ".docx", ".txt", ".md", ".png", ".jpg", ".jpeg")
         )
-        files_sorted = sorted(files)
+        if not raw_files:
+            return {"files": [], "fingerprint": ""}
+
+        session_root = os.path.abspath(session_data_path)
+        basenames: List[str] = []
+        for item in raw_files:
+            abs_item = os.path.abspath(str(item or ""))
+            if not abs_item:
+                continue
+            try:
+                # 安全约束：仅接受当前会话目录下文件，避免跨目录误混入。
+                if os.path.commonpath([session_root, abs_item]) != session_root:
+                    continue
+            except Exception:
+                continue
+            name = os.path.basename(abs_item).strip()
+            if name:
+                basenames.append(name)
+
+        files_sorted = sorted(set(basenames))
         if not files_sorted:
             return {"files": [], "fingerprint": ""}
+
         import hashlib
         combined = "".join(files_sorted)
         fingerprint = hashlib.md5(combined.encode("utf-8")).hexdigest()[:16]
@@ -196,6 +218,22 @@ async def _get_or_build_courseware_warmup(rag: Any, force: bool = False) -> Dict
         return payload
 
 
+async def prewarm_courseware_summary_for_session(session_id: str, force: bool = False) -> Dict[str, Any]:
+    """为指定会话构建课件预热摘要缓存，供启动预热与首题加速使用。"""
+    sid = str(session_id or "").strip() or "default"
+    token = current_session_id.set(sid)
+    try:
+        rag = await get_rag_service()
+        payload = await _get_or_build_courseware_warmup(rag, force=force)
+        logger.info(
+            f"[Courseware Warmup API] session={sid}, files={len(payload.get('files', []))}, "
+            f"topics={len(payload.get('topic_pool', []))}, force={bool(force)}"
+        )
+        return payload
+    finally:
+        current_session_id.reset(token)
+
+
 # ==================== 工具函数 ====================
 
 async def get_rag_context(topic: str) -> str:
@@ -215,15 +253,47 @@ async def get_rag_context(topic: str) -> str:
 
 
 def _default_comprehensive_topics() -> List[str]:
-    """未指定章节时的综合覆盖考点标签。"""
+    """未指定章节时的综合覆盖考点标签（学科无关）。"""
     return [
-        "基础概念与体系结构",
-        "进程与线程管理",
-        "调度与同步互斥",
-        "死锁与资源管理",
-        "内存管理与虚拟内存",
-        "文件系统与I/O",
-        "网络与通信机制",
+        "核心概念与术语",
+        "关键流程与方法",
+        "架构与模块关系",
+        "应用场景与实践案例",
+        "常见错误与排查思路",
+        "重点难点与综合训练",
+        "课程总结与迁移应用",
+    ]
+
+
+def _is_os_domain_topic(text: str) -> bool:
+    """判断 seed 是否明显属于操作系统领域（用于保留历史检索优势）。"""
+    t = str(text or "").lower()
+    if not t:
+        return False
+    os_signals = [
+        "操作系统", "进程", "线程", "调度", "死锁",
+        "虚拟内存", "页面置换", "文件系统", "i/o", "内核",
+    ]
+    return any(sig in t for sig in os_signals)
+
+
+def _build_comprehensive_queries(seed_topic: str) -> List[str]:
+    """根据 seed 构建 4 路综合检索 query，避免跨学科锚点污染。"""
+    base = str(seed_topic or "").strip()
+    if _is_os_domain_topic(base):
+        # 操作系统会话保留原锚点，避免已调优场景回退。
+        return [
+            f"{base} 基础概念 体系结构".strip(),
+            f"{base} 进程 线程 调度 同步 死锁".strip(),
+            f"{base} 内存管理 虚拟内存 页面置换".strip(),
+            f"{base} 文件系统 I/O 设备管理 网络通信".strip(),
+        ]
+    # 通用学科锚点：适配“实训/产品/工程”等非操作系统主题。
+    return [
+        f"{base} 核心概念 术语 定义".strip(),
+        f"{base} 关键流程 方法 步骤".strip(),
+        f"{base} 架构 模块 组件 接口".strip(),
+        f"{base} 应用场景 实践案例 易错点".strip(),
     ]
 
 
@@ -234,12 +304,7 @@ async def _get_comprehensive_rag_context(seed_topic: str = "") -> str:
     rag_inc("comprehensive_calls", 1)
     start_ts = time.time()
     base = str(seed_topic or "").strip()
-    queries = [
-        f"{base} 基础概念 体系结构".strip(),
-        f"{base} 进程 线程 调度 同步 死锁".strip(),
-        f"{base} 内存管理 虚拟内存 页面置换".strip(),
-        f"{base} 文件系统 I/O 设备管理 网络通信".strip(),
-    ]
+    queries = _build_comprehensive_queries(base)
     # 4 路子查询并行覆盖不同知识域，降低“只命中一章”概率。
     # 请求级去重并按归一化 key 稳定排序，减少缓存 key 抖动
     dedup_pairs: List[Tuple[str, str]] = []

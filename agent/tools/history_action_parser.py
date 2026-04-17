@@ -33,9 +33,21 @@ def parse_history_action(user_input: str) -> Dict[str, Any]:
         return {"action": "analyze_practice"}
 
     # 先判定“清空类”动作，避免被“删除”关键词误命中。
-    if any(k in text for k in ["清空错题", "清除错题", "清空练习记录", "清除练习记录", "删除全部错题"]):
+    if any(k in text for k in ["清空错题", "清除错题", "清空练习记录", "清除练习记录", "删除全部错题", "清空历史记录", "清除历史记录", "清理历史记录", "删除全部历史记录"]):
         return {"action": "clear_practice"}
-    if any(k in text for k in ["清空对话", "清除对话", "清空聊天记录", "清除聊天记录", "删除全部消息", "删除聊天记录"]):
+    if any(
+        k in text
+        for k in [
+            "清空对话",
+            "清除对话",
+            "清空历史对话",
+            "清除历史对话",
+            "清空聊天记录",
+            "清除聊天记录",
+            "删除全部消息",
+            "删除聊天记录",
+        ]
+    ):
         return {"action": "clear_messages"}
 
     # 删除错题：支持按 ID 或“第N条”。
@@ -71,14 +83,14 @@ def parse_history_action(user_input: str) -> Dict[str, Any]:
     # 查询类动作。
     if any(k in text for k in ["历史对话", "对话记录", "聊天记录", "消息历史"]):
         return {"action": "list_messages"}
-    practice_keywords = ["错题", "练习记录", "答题记录", "错题本"]
+    practice_keywords = ["错题", "练习记录", "答题记录", "错题本", "历史记录"]
     list_intent_keywords = ["查看", "列出", "展示", "显示", "查询", "看看", "给我看", "帮我看", "最近", "有哪些"]
     analysis_intent_keywords = ["分析", "总结", "归纳", "薄弱", "弱项", "错因", "原因", "复盘", "建议", "提升"]
     if any(k in text for k in practice_keywords):
         # 含“分析/总结”等意图时返回分析动作，避免被列表规则短路。
         if any(k in text for k in analysis_intent_keywords):
             return {"action": "analyze_practice"}
-        if any(k in text for k in list_intent_keywords) or text in {"错题", "错题本", "我的错题", "练习记录", "答题记录"}:
+        if any(k in text for k in list_intent_keywords) or text in {"错题", "错题本", "我的错题", "练习记录", "答题记录", "历史记录"}:
             return {"action": "list_practice"}
 
     return {"action": "none"}

@@ -1,5 +1,7 @@
 import json
 import re
+import os
+import asyncio
 from typing import Optional
 
 from langchain_core.tools import tool
@@ -197,6 +199,29 @@ async def clear_practice_history_tool(session_id: Optional[str] = None) -> str:
     return f"已清空练习历史，共删除 {deleted_count} 条记录"
 
 
+@tool(description='回填历史练习记录的知识点字段。可用 dry_run=true 先预览将更新的条数。')
+@timer_and_token_logger
+async def backfill_practice_kp_tool(
+    session_id: Optional[str] = None,
+    limit: int = 2000,
+    dry_run: bool = True,
+) -> str:
+    """清洗并回填历史练习的 knowledge_point。"""
+    from utils.memory_service import memory_manager
+
+    sid = session_id or current_session_id.get() or "default"
+    summary = memory_manager.backfill_practice_knowledge_points(
+        session_id=sid,
+        limit=max(1, min(int(limit or 2000), 20000)),
+        dry_run=bool(dry_run),
+    )
+    return (
+        f"考点回填完成（session={sid}）："
+        f"扫描 {summary.get('scanned', 0)} 条，候选更新 {summary.get('candidate_updates', 0)} 条，"
+        f"实际更新 {summary.get('updated', 0)} 条，dry_run={bool(summary.get('dry_run', 0))}"
+    )
+
+
 @tool(description='查看会话历史对话消息，可用于审阅和管理聊天记录。')
 @timer_and_token_logger
 async def get_chat_history_tool(session_id: Optional[str] = None, limit: int = 30) -> str:
@@ -341,6 +366,64 @@ async def list_knowledge_files_tool(session_id: Optional[str] = None) -> str:
     return "\n".join(lines)
 
 
+@tool(description='列出当前会话向量化失败的课件文件；可通过 retry=true 触发重试。')
+@timer_and_token_logger
+async def list_failed_uploads_tool(
+    session_id: Optional[str] = None,
+    retry: bool = False,
+    wait_for_retry: bool = False,
+) -> str:
+    """
+    列出失败文件；可选触发重试。
+    retry=true 时会把 failed 文件状态改为 processing 并重试。
+    """
+    sid = _normalize_session_id(session_id)
+
+    from api.routers.knowledge import list_documents, _update_ingest_status, process_document_task
+
+    result = await list_documents(session_id=sid)
+    files = result.get("files", []) if isinstance(result, dict) else []
+    failed_files = [f for f in files if str(f.get("status", "")).strip() == "failed"]
+    if not failed_files:
+        return f"会话 {sid} 当前没有向量化失败文件"
+
+    failed_names = [str(f.get("filename", "")).strip() for f in failed_files if str(f.get("filename", "")).strip()]
+    lines = [f"【失败文件】session={sid}, count={len(failed_names)}"]
+    for i, f in enumerate(failed_files, 1):
+        lines.append(f"{i}. {f.get('filename', '')} | detail={f.get('detail', '')}")
+
+    if not retry:
+        lines.append("如需重试可调用：retry=true")
+        return "\n".join(lines)
+
+    _update_ingest_status(
+        sid,
+        {name: {"status": "processing", "detail": "工具触发重试中"} for name in failed_names},
+    )
+
+    if wait_for_retry:
+        # 在后台线程中执行重试，避免阻塞事件循环。
+        await asyncio.to_thread(process_document_task, failed_names, sid)
+        refreshed = await list_documents(session_id=sid)
+        refreshed_files = refreshed.get("files", []) if isinstance(refreshed, dict) else []
+        still_failed = [
+            str(f.get("filename", "")).strip()
+            for f in refreshed_files
+            if str(f.get("status", "")).strip() == "failed"
+        ]
+        lines.append(
+            f"重试已完成：提交 {len(failed_names)} 个，"
+            f"当前仍失败 {len([n for n in still_failed if n])} 个"
+        )
+        if still_failed:
+            lines.append("仍失败文件：" + ", ".join([n for n in still_failed if n]))
+        return "\n".join(lines)
+
+    asyncio.create_task(asyncio.to_thread(process_document_task, failed_names, sid))
+    lines.append(f"已提交重试任务：{len(failed_names)} 个文件（后台执行中）")
+    return "\n".join(lines)
+
+
 @tool(description='删除指定课件文件（filename）并同步删除向量。')
 @timer_and_token_logger
 async def delete_knowledge_file_tool(filename: str, session_id: Optional[str] = None) -> str:
@@ -385,6 +468,74 @@ async def get_sample_paper_tool(session_id: Optional[str] = None) -> str:
         lines.append("内容预览:")
         lines.append(preview[:1200])
     return "\n".join(lines)
+
+
+@tool(description='导出试卷为 Word 文档（docx），返回下载地址与服务器文件路径。')
+@timer_and_token_logger
+async def export_exam_docx_tool(
+    exam_paper: str,
+    course_name: str = "期末考试",
+    include_answers: bool = True,
+) -> str:
+    """导出试卷 docx。"""
+    from api.routers.exam_export import export_docx, ExamExportRequest, TEMP_DIR
+
+    if not str(exam_paper or "").strip():
+        return "exam_paper 不能为空"
+
+    req = ExamExportRequest(
+        exam_paper=str(exam_paper),
+        course_name=str(course_name or "期末考试"),
+        include_answers=bool(include_answers),
+    )
+    result = await export_docx(req)
+    if not isinstance(result, dict):
+        return "导出失败：返回格式异常"
+    if not result.get("success"):
+        return f"导出失败：{result}"
+
+    filename = str(result.get("filename", "")).strip()
+    download_url = str(result.get("download_url", "")).strip()
+    abs_path = os.path.realpath(os.path.join(TEMP_DIR, filename)) if filename else ""
+    return (
+        "导出成功\n"
+        f"- 文件名: {filename}\n"
+        f"- 下载地址: {download_url}\n"
+        f"- 服务器路径: {abs_path}"
+    )
+
+
+@tool(description='导出答案卷为 Word 文档（docx），返回下载地址与服务器文件路径。')
+@timer_and_token_logger
+async def export_answer_sheet_tool(
+    exam_paper: str,
+    course_name: str = "期末考试",
+) -> str:
+    """导出答案卷 docx。"""
+    from api.routers.exam_export import generate_answer_sheet, AnswerSheetRequest, TEMP_DIR
+
+    if not str(exam_paper or "").strip():
+        return "exam_paper 不能为空"
+
+    req = AnswerSheetRequest(
+        exam_paper=str(exam_paper),
+        course_name=str(course_name or "期末考试"),
+    )
+    result = await generate_answer_sheet(req)
+    if not isinstance(result, dict):
+        return "导出失败：返回格式异常"
+    if not result.get("success"):
+        return f"导出失败：{result}"
+
+    filename = str(result.get("filename", "")).strip()
+    download_url = str(result.get("download_url", "")).strip()
+    abs_path = os.path.realpath(os.path.join(TEMP_DIR, filename)) if filename else ""
+    return (
+        "答案卷导出成功\n"
+        f"- 文件名: {filename}\n"
+        f"- 下载地址: {download_url}\n"
+        f"- 服务器路径: {abs_path}"
+    )
 
 
 @tool(description='获取练习统计：总作答数、错误数、正确率、重练率和薄弱点。')
@@ -535,6 +686,7 @@ def _build_tools():
         get_practice_history,
         delete_practice_record_tool,
         clear_practice_history_tool,
+        backfill_practice_kp_tool,
         get_chat_history_tool,
         delete_chat_message_tool,
         clear_chat_history_tool,
@@ -543,8 +695,11 @@ def _build_tools():
         rename_session_tool,
         delete_session_tool,
         list_knowledge_files_tool,
+        list_failed_uploads_tool,
         delete_knowledge_file_tool,
         get_sample_paper_tool,
+        export_exam_docx_tool,
+        export_answer_sheet_tool,
         get_practice_stats_tool,
         get_weak_points_tool,
         get_token_usage_tool,

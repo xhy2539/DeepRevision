@@ -11,6 +11,7 @@ from typing import List, Dict, Any, Optional
 from utils.logger_handler import logger
 from utils.session_context import current_session_id
 from utils.rag_metrics import rag_inc, rag_append_sample
+from utils.kb_version import read_kb_version
 import asyncio
 import sqlite3
 import os
@@ -44,6 +45,7 @@ class SemanticCache:
             CREATE TABLE IF NOT EXISTS cache (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id  TEXT    NOT NULL,
+                scope_key   TEXT    NOT NULL DEFAULT '',
                 query_text  TEXT    NOT NULL,
                 query_hash  TEXT    NOT NULL,
                 embedding   TEXT    NOT NULL,
@@ -51,9 +53,16 @@ class SemanticCache:
                 created_at  INTEGER NOT NULL
             );
         """)
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(cache);").fetchall()}
+        if "scope_key" not in columns:
+            conn.execute("ALTER TABLE cache ADD COLUMN scope_key TEXT NOT NULL DEFAULT ''")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_session ON cache(session_id);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_hash ON cache(query_hash);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_session_created ON cache(session_id, created_at DESC);")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cache_session_scope_created "
+            "ON cache(session_id, scope_key, created_at DESC);"
+        )
         conn.commit()
         conn.close()
 
@@ -65,17 +74,20 @@ class SemanticCache:
             return 0.0
         return dot / (norm_a * norm_b)
 
-    async def get(self, query: str, session_id: str) -> Optional[str]:
+    async def get(self, query: str, session_id: str, scope_key: str = "") -> Optional[str]:
         """
         查询语义缓存。命中返回缓存的 response，未命中返回 None。
         """
-        q_hash = hashlib.md5(query.encode()).hexdigest()
+        scope = str(scope_key or "")
+        q_hash = hashlib.md5(f"{scope}|{query}".encode("utf-8")).hexdigest()
         conn = sqlite3.connect(self.db_path)
         try:
             # 1) 精确命中优先
             exact_row = conn.execute(
-                "SELECT response FROM cache WHERE session_id = ? AND query_hash = ? ORDER BY created_at DESC LIMIT 1",
-                (session_id, q_hash),
+                "SELECT response FROM cache "
+                "WHERE session_id = ? AND scope_key = ? AND query_hash = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (session_id, scope, q_hash),
             ).fetchone()
             if exact_row and exact_row[0]:
                 logger.info("[语义缓存] 精确命中")
@@ -83,8 +95,10 @@ class SemanticCache:
 
             # 2) 语义命中仅扫描最近窗口，避免全量扫描拖慢
             rows = conn.execute(
-                "SELECT embedding, response FROM cache WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
-                (session_id, self.max_candidates),
+                "SELECT embedding, response FROM cache "
+                "WHERE session_id = ? AND scope_key = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (session_id, scope, self.max_candidates),
             ).fetchall()
         finally:
             conn.close()
@@ -108,7 +122,7 @@ class SemanticCache:
                 continue
         return None
 
-    def set(self, query: str, response: str, session_id: str):
+    def set(self, query: str, response: str, session_id: str, scope_key: str = ""):
         """写入缓存"""
         try:
             emb = embed_model.embed_query(query)
@@ -116,12 +130,13 @@ class SemanticCache:
             logger.warning(f"[语义缓存] embedding 失败，跳过写入: {e}")
             return
 
-        q_hash = hashlib.md5(query.encode()).hexdigest()
+        scope = str(scope_key or "")
+        q_hash = hashlib.md5(f"{scope}|{query}".encode("utf-8")).hexdigest()
         conn = sqlite3.connect(self.db_path)
         conn.execute(
-            "INSERT INTO cache (session_id, query_text, query_hash, embedding, response, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (session_id, query, q_hash, json.dumps(emb), response, int(time.time()))
+            "INSERT INTO cache (session_id, scope_key, query_text, query_hash, embedding, response, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (session_id, scope, query, q_hash, json.dumps(emb), response, int(time.time()))
         )
         conn.commit()
         conn.close()
@@ -236,6 +251,7 @@ class RagSummarizeService:
         self.ingest_wait_seconds = int(chroma_conf.get('ingest_wait_seconds', 8))
         self.ingest_poll_interval = float(chroma_conf.get('ingest_poll_interval', 1.0))
         self.fast_to_full_min_docs = max(1, int(chroma_conf.get('retrieve_fast_to_full_min_docs', 3)))
+        self.fast_to_full_min_sources = max(1, int(chroma_conf.get('retrieve_fast_to_full_min_sources', 2)))
         # 检索上下文缓存默认调长：出题/组卷链路常常超过几十秒，45s 容易失效导致重复检索
         self.context_cache_ttl_seconds = int(chroma_conf.get('retrieve_context_cache_ttl_seconds', 1200))
         self.context_cache_max_entries = int(chroma_conf.get('retrieve_context_cache_max_entries', 1000))
@@ -243,6 +259,11 @@ class RagSummarizeService:
         self.hyde_trigger_min_docs = max(1, int(chroma_conf.get('hyde_trigger_min_docs', 3)))
         self.hyde_max_chars = max(80, int(chroma_conf.get('hyde_max_chars', 180)))
         self._context_cache: Dict[str, Dict[str, Any]] = {}
+        self._kb_version = 0
+        self._kb_version_check_ts = 0.0
+        self._retrieve_config_signature = ""
+        self.prompt_version = ""
+        self.model_tag = ""
         self.fast_retrieve_top_k = 8
         self.fast_final_top_k = 6
         self.full_retrieve_top_k = 16
@@ -258,6 +279,8 @@ class RagSummarizeService:
         刷新检索器状态。当知识库（Chroma）中文档发生变化时，
         调用此方法重新构建 BM25 索引，同时失效旧缓存。
         """
+        self._kb_version = self._get_kb_version(force_reload=True)
+        self._retrieve_config_signature = self._build_retrieve_config_signature()
         if invalidate_cache:
             self.semantic_cache.invalidate(self.vector_store_service.session_id)
             self._context_cache.clear()
@@ -330,6 +353,8 @@ class RagSummarizeService:
         self.prompt_text = load_rag_prompts()
         self.prompt_template = PromptTemplate.from_template(self.prompt_text)
         self.model = chat_model
+        self.prompt_version = hashlib.md5(self.prompt_text.encode("utf-8")).hexdigest()[:10]
+        self.model_tag = self._resolve_model_tag(self.model)
         self.chain = self._init_chain()
 
     def _init_chain(self):
@@ -409,11 +434,53 @@ class RagSummarizeService:
         """统一 query 归一化（空白合并 + 小写），用于缓存键稳定。"""
         return re.sub(r"\s+", " ", str(query or "").strip().lower())
 
+    def _get_kb_version(self, force_reload: bool = False) -> int:
+        """读取会话知识库版本号；短周期缓存避免每次都读磁盘。"""
+        now = time.time()
+        if force_reload or (now - self._kb_version_check_ts >= 2.0):
+            self._kb_version = read_kb_version(self.vector_store_service.session_data_path)
+            self._kb_version_check_ts = now
+        return int(self._kb_version or 0)
+
+    def _build_retrieve_config_signature(self) -> str:
+        """生成检索配置签名，避免参数变化后复用旧缓存。"""
+        payload = {
+            "fast_top_k": int(self.fast_retrieve_top_k),
+            "fast_final_k": int(self.fast_final_top_k),
+            "full_top_k": int(self.full_retrieve_top_k),
+            "full_final_k": int(self.full_final_top_k),
+            "source_cap": 2,
+        }
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()[:10]
+
+    @staticmethod
+    def _resolve_model_tag(model_obj: Any) -> str:
+        """提取模型标识，失败时回退到类名。"""
+        for attr in ("model", "model_name", "model_id"):
+            value = str(getattr(model_obj, attr, "") or "").strip()
+            if value:
+                return value
+        return model_obj.__class__.__name__
+
+    def _build_answer_cache_scope(self) -> str:
+        """构造答案缓存作用域，隔离模型/提示词/知识库版本差异。"""
+        return (
+            f"kb:{self._get_kb_version()}"
+            f"|model:{self.model_tag or self._resolve_model_tag(self.model)}"
+            f"|prompt:{self.prompt_version}"
+            f"|retr:{self._retrieve_config_signature}"
+        )
+
     def _build_context_cache_key(self, query: str, mode: str) -> str:
-        """构造检索上下文缓存键：`session + mode + normalized_query`。"""
-        sid = current_session_id.get() or "default"
+        """构造检索上下文缓存键：`session + mode + normalized_query + kb_version + top_k签名`。"""
+        sid = self.vector_store_service.session_id or current_session_id.get() or "default"
         norm = self._normalize_query(query)
-        key_src = f"{sid}|{mode}|{norm}"
+        key_src = (
+            f"{sid}|{mode}|{norm}"
+            f"|kb:{self._get_kb_version()}"
+            f"|retr:{self._retrieve_config_signature}"
+        )
         return hashlib.md5(key_src.encode("utf-8")).hexdigest()
 
     def _get_cached_context(self, query: str, mode: str) -> Optional[str]:
@@ -575,6 +642,11 @@ class RagSummarizeService:
         meta = doc.metadata or {}
         return str(meta.get("source_filename") or meta.get("source") or "unknown")
 
+    def _count_unique_sources(self, docs: List[Document]) -> int:
+        """统计候选文档的来源数，用于 fast->full 升级判定。"""
+        sources = {self._get_doc_source(doc) for doc in docs or [] if doc is not None}
+        return len({s for s in sources if str(s).strip()})
+
     def _apply_source_cap(self, docs: List[Document], final_limit: int, per_source_cap: int = 2) -> List[Document]:
         """来源均衡：限制单文件命中条数，提升最终上下文的来源多样性。"""
         if not docs:
@@ -715,11 +787,19 @@ class RagSummarizeService:
                 except Exception:
                     continue
 
-        # 低延迟优先：fast 档命中不足时升级 full 档重试
-        if profile == "fast" and len(context_docs) < self.fast_to_full_min_docs:
+        # 低延迟优先：fast 档命中不足或来源过于单一时升级 full 档重试
+        unique_sources = self._count_unique_sources(context_docs)
+        low_docs = len(context_docs) < self.fast_to_full_min_docs
+        low_sources = unique_sources < self.fast_to_full_min_sources
+        if profile == "fast" and (low_docs or low_sources):
             rag_inc("fast_to_full_escalations", 1)
+            reason = []
+            if low_docs:
+                reason.append(f"docs={len(context_docs)}<{self.fast_to_full_min_docs}")
+            if low_sources:
+                reason.append(f"sources={unique_sources}<{self.fast_to_full_min_sources}")
             logger.info(
-                f"[RAG] fast 档命中不足（docs={len(context_docs)}<{self.fast_to_full_min_docs}），升级 full 档重试"
+                f"[RAG] fast 档触发升级（{', '.join(reason)}），升级 full 档重试"
             )
             try:
                 full_docs = await asyncio.wait_for(self.retriever_docs(expanded_query, profile="full"), timeout=6.0)
@@ -795,8 +875,9 @@ class RagSummarizeService:
     async def rag_summarize(self, query: str) -> str:
         """完整 RAG 问答链（检索 + 总结），会写入语义缓存。"""
         session_id = current_session_id.get() or "default"
+        cache_scope = self._build_answer_cache_scope()
 
-        cached = await self.semantic_cache.get(query, session_id)
+        cached = await self.semantic_cache.get(query, session_id, scope_key=cache_scope)
         if cached is not None:
             return cached
 
@@ -828,7 +909,7 @@ class RagSummarizeService:
              "context": context,
              }
         )
-        self.semantic_cache.set(query, response, session_id)
+        self.semantic_cache.set(query, response, session_id, scope_key=cache_scope)
         return response
 
 if __name__ == "__main__":

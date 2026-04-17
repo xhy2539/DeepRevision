@@ -33,6 +33,7 @@ rrf_k: 30            # RRF 公式参数（降低30，重视高排名结果）
 retrieve_top_k: 20    # 混合检索召回数量
 rerank_final_k: 12   # 最终返回数量
 retrieve_fast_to_full_min_docs: 3   # fast 档命中不足时自动升级到 full 的阈值
+retrieve_fast_to_full_min_sources: 2   # fast 档来源多样性不足时自动升级到 full 的阈值
 retrieve_context_cache_ttl_seconds: 1200   # 检索上下文缓存 TTL（秒），20 分钟
 retrieve_context_cache_max_entries: 1000   # 检索上下文缓存最大条目数（进程内）
 hyde_enabled: true   # 是否启用 HyDE（低召回场景）

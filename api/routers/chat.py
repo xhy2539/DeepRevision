@@ -23,6 +23,12 @@ from utils.memory_service import memory_manager
 from utils.session_context import current_session_id
 from utils.rag_metrics import rag_get_metrics_snapshot, rag_inc
 from utils.config_handler import chroma_conf
+from utils.user_profile_service import (
+    normalize_username,
+    get_user_profile as get_user_profile_data,
+    update_user_profile as update_user_profile_data,
+    build_persona_instructions,
+)
 from rag.vector_store import VectorStoreService
 from model.factory import light_chat_model, backup_light_chat_model, chat_model
 
@@ -39,7 +45,7 @@ _REGISTERED_TOOL_MAP: Dict[str, Any] = {
 RUNTIME_METRICS: Dict[str, Any] = {
     "total_requests": 0,
     "failed_requests": 0,
-    "routes": {"rag": 0, "quiz": 0, "exam": 0, "planner": 0, "history": 0, "chitchat": 0},
+    "routes": {"rag": 0, "quiz": 0, "exam": 0, "ops": 0, "planner": 0, "history": 0, "chitchat": 0},
     "quiz_timeout_count": 0,
     "fallback_quality_guard_count": 0,
     "tool_call_count_rag": 0,
@@ -121,6 +127,17 @@ class SimilarBatchRequest(BaseModel):
 class PracticeHistoryDeleteRequest(BaseModel):
     session_id: str = "default"
     record_id: int
+
+
+class PracticeBackfillRequest(BaseModel):
+    session_id: str = "default"
+    limit: int = 2000
+    dry_run: bool = True
+
+
+class UserProfileUpdateRequest(BaseModel):
+    username: str
+    profile: Dict[str, Any]
 
 
 def _clean_answer(answer: str) -> str:
@@ -625,6 +642,57 @@ def _build_v2_event(
     }
 
 
+def _create_stream_sections() -> Dict[str, Any]:
+    """创建统一的分区结构，避免前后端字段漂移。"""
+    return {"reasoning": "", "actions": [], "citations": [], "progress": [], "tool_calls": []}
+
+
+def _ops_trace_to_stream_sections(ops_trace: Any) -> Dict[str, Any]:
+    """把 ops_trace 映射为可展示的流式分区（动作 + 工具调用）。"""
+    sections = _create_stream_sections()
+    if not isinstance(ops_trace, list):
+        return sections
+
+    for idx, item in enumerate(ops_trace, start=1):
+        if not isinstance(item, dict):
+            continue
+        tool_name = str(item.get("tool") or "").strip()
+        guard_blocked = bool(item.get("guard_blocked"))
+        has_observation = bool(str(item.get("observation") or "").strip())
+        has_error = bool(str(item.get("error") or "").strip())
+
+        if tool_name:
+            status = "running"
+            if guard_blocked:
+                status = "blocked"
+            elif has_observation:
+                status = "completed"
+            elif has_error:
+                status = "failed"
+            action_item = {
+                "name": tool_name,
+                "status": status,
+                "detail": str(item.get("reason") or item.get("error") or "").strip(),
+            }
+            sections["actions"].append(action_item)
+            sections["tool_calls"].append(
+                {
+                    "tool_name": tool_name,
+                    "status": status,
+                    "result_summary": str(item.get("observation") or item.get("reason") or item.get("error") or "").strip()[:160],
+                    "source": "ops_react",
+                }
+            )
+            continue
+
+        if guard_blocked:
+            sections["progress"].append(str(item.get("reason") or "高风险操作已被安全闸拦截"))
+        elif has_error:
+            sections["progress"].append(str(item.get("error") or f"步骤 {idx} 执行失败"))
+
+    return sections
+
+
 def _format_recent_history_for_prompt(chat_history: List[Any], max_chars: int = 600) -> str:
     """将近期对话压缩成 prompt 可用文本，避免上下文过长。"""
     if not chat_history:
@@ -691,6 +759,17 @@ def _extract_citations_from_context(context: str, limit: int = 6) -> List[Dict[s
     return out
 
 
+def _merge_persona_into_context(memory_context: str, persona_text: str) -> str:
+    """把用户级人格指令拼入上下文，供所有路由共享。"""
+    persona = str(persona_text or "").strip()
+    context = str(memory_context or "").strip()
+    if not persona:
+        return context
+    if context:
+        return f"【用户个性化偏好】\n{persona}\n\n{context}"
+    return f"【用户个性化偏好】\n{persona}"
+
+
 class _StreamV2Handled(Exception):
     """内部控制流异常：标记 stream_v2 已完成并跳过 legacy 主流程。"""
 
@@ -704,6 +783,11 @@ async def chat_stream_endpoint(request: Request):
     logger.info(f"收到对话请求")
     body = await request.json()
     session_id = body.get("session_id", "default")
+    username = normalize_username(body.get("username", ""))
+    user_profile_payload = get_user_profile_data(username)
+    user_profile = user_profile_payload.get("profile", {})
+    persona_text = build_persona_instructions(user_profile)
+    assistant_name = str(user_profile.get("assistant_name") or "DeepRevision")
     query = body.get("query", "")
     exam_stage_plan = bool(body.get("exam_stage_plan", True))
     exam_rerun_stage = body.get("exam_rerun_stage")
@@ -711,7 +795,7 @@ async def chat_stream_endpoint(request: Request):
     exam_fast_mode = bool(body.get("exam_fast_mode", True))  # True=快速路径(格式检查), False=完整路径(LLM Critique)
     # 兼容旧前端“full模式”只传 exam_fast_mode=false 的场景：quiz 也强制走 LLM Critic
     quiz_force_llm_critic = bool(body.get("quiz_force_llm_critic", not exam_fast_mode))
-    logger.info(f"session_id={session_id}, query={query[:50]}...")
+    logger.info(f"session_id={session_id}, username={username}, query={query[:50]}...")
 
     # 安全校验
     _validate_session_id(session_id)
@@ -733,7 +817,17 @@ async def chat_stream_endpoint(request: Request):
                 continue
             chat_history.append(AIMessage(content=msg["content"]))
 
-    graph_context = memory_manager.get_memory_context(session_id)
+    graph_context = _merge_persona_into_context(memory_manager.get_memory_context(session_id), persona_text)
+
+    def _attach_user_profile_meta(message_obj: Dict[str, Any]) -> Dict[str, Any]:
+        """把用户级人格标识注入消息 meta，便于前端展示助手名称。"""
+        meta = message_obj.get("meta") if isinstance(message_obj.get("meta"), dict) else {}
+        message_obj["meta"] = {
+            **meta,
+            "assistant_name": assistant_name,
+            "username": username,
+        }
+        return message_obj
 
     async def event_stream():
         """
@@ -787,7 +881,7 @@ async def chat_stream_endpoint(request: Request):
         route_params: Dict[str, Any] = {}
         route_reason = ""
         fallback_used = False
-        stream_sections: Dict[str, Any] = {"reasoning": "", "actions": [], "citations": [], "progress": []}
+        stream_sections: Dict[str, Any] = _create_stream_sections()
         rag_citations: List[Dict[str, Any]] = []
         v2_text_stream_started = False
         explicit_tool_cmd = _parse_explicit_tool_command(query)
@@ -830,6 +924,7 @@ async def chat_stream_endpoint(request: Request):
 
                 answer = _clean_answer(answer)
                 message = build_assistant_message(route, answer, session_id, route_params, structured_result=None)
+                message = _attach_user_profile_meta(message)
 
                 _mark_ttft_if_needed()
                 _record_stream_event("start")
@@ -969,6 +1064,21 @@ async def chat_stream_endpoint(request: Request):
                                 ),
                                 event_name="progress",
                             )
+                            route_summary = f"当前路由：{route}"
+                            if route_reason:
+                                route_summary += f"（{route_reason[:60]}）"
+                            _record_stream_event("progress")
+                            stream_sections["progress"].append(route_summary)
+                            yield _format_sse(
+                                _build_v2_event(
+                                    event="progress",
+                                    message_id=stream_v2_message_id,
+                                    seq=_next_v2_seq(),
+                                    route=route,
+                                    payload={"stage": "route", "status": "selected", "message": route_summary},
+                                ),
+                                event_name="progress",
+                            )
 
                         stream_model = chat_model or light_chat_model or backup_light_chat_model
                         if stream_model is None:
@@ -977,15 +1087,42 @@ async def chat_stream_endpoint(request: Request):
                         if route == "rag":
                             topic = str(route_params.get("topic") or rewritten_query).strip() or rewritten_query
                             if emit_sections:
+                                _record_stream_event("progress")
+                                stream_sections["progress"].append("开始检索课件上下文")
+                                yield _format_sse(
+                                    _build_v2_event(
+                                        event="progress",
+                                        message_id=stream_v2_message_id,
+                                        seq=_next_v2_seq(),
+                                        route=route,
+                                        payload={"stage": "retrieve_context", "status": "running", "message": "开始检索课件上下文"},
+                                    ),
+                                    event_name="progress",
+                                )
                                 _record_stream_event("action")
                                 stream_sections["actions"].append({"name": "retrieve_context", "status": "running", "detail": topic})
+                                stream_sections["tool_calls"].append(
+                                    {
+                                        "tool_name": "retrieve_context",
+                                        "status": "running",
+                                        "detail": topic,
+                                        "source": "stream_v2_rag",
+                                    }
+                                )
                                 yield _format_sse(
                                     _build_v2_event(
                                         event="action",
                                         message_id=stream_v2_message_id,
                                         seq=_next_v2_seq(),
                                         route=route,
-                                        payload={"name": "retrieve_context", "status": "running", "detail": topic},
+                                        payload={
+                                            "name": "retrieve_context",
+                                            "tool_name": "retrieve_context",
+                                            "kind": "tool_call",
+                                            "status": "running",
+                                            "detail": topic,
+                                            "source": "stream_v2_rag",
+                                        },
                                     ),
                                     event_name="action",
                                 )
@@ -999,8 +1136,23 @@ async def chat_stream_endpoint(request: Request):
                             retrieve_cost_ms = int((time.time() - retrieve_start) * 1000)
                             if emit_sections:
                                 _record_stream_event("action_result")
+                                retrieve_summary = f"命中引用 {len(rag_citations)} 条"
                                 stream_sections["actions"].append(
-                                    {"name": "retrieve_context", "status": "completed", "cost_ms": retrieve_cost_ms}
+                                    {
+                                        "name": "retrieve_context",
+                                        "status": "completed",
+                                        "cost_ms": retrieve_cost_ms,
+                                        "detail": retrieve_summary,
+                                    }
+                                )
+                                stream_sections["tool_calls"].append(
+                                    {
+                                        "tool_name": "retrieve_context",
+                                        "status": "completed",
+                                        "cost_ms": retrieve_cost_ms,
+                                        "result_summary": retrieve_summary,
+                                        "source": "stream_v2_rag",
+                                    }
                                 )
                                 yield _format_sse(
                                     _build_v2_event(
@@ -1008,9 +1160,34 @@ async def chat_stream_endpoint(request: Request):
                                         message_id=stream_v2_message_id,
                                         seq=_next_v2_seq(),
                                         route=route,
-                                        payload={"name": "retrieve_context", "status": "completed", "cost_ms": retrieve_cost_ms},
+                                        payload={
+                                            "name": "retrieve_context",
+                                            "tool_name": "retrieve_context",
+                                            "kind": "tool_call",
+                                            "status": "completed",
+                                            "cost_ms": retrieve_cost_ms,
+                                            "detail": retrieve_summary,
+                                            "result_summary": retrieve_summary,
+                                            "source": "stream_v2_rag",
+                                        },
                                     ),
                                     event_name="action_result",
+                                )
+                                _record_stream_event("progress")
+                                stream_sections["progress"].append(f"课件检索完成（{retrieve_summary}）")
+                                yield _format_sse(
+                                    _build_v2_event(
+                                        event="progress",
+                                        message_id=stream_v2_message_id,
+                                        seq=_next_v2_seq(),
+                                        route=route,
+                                        payload={
+                                            "stage": "retrieve_context",
+                                            "status": "completed",
+                                            "message": f"课件检索完成（{retrieve_summary}）",
+                                        },
+                                    ),
+                                    event_name="progress",
                                 )
                                 for citation in rag_citations:
                                     _record_stream_event("citation")
@@ -1025,7 +1202,7 @@ async def chat_stream_endpoint(request: Request):
                                         ),
                                         event_name="citation",
                                     )
-                                reasoning_hint = "已完成课件检索，正在组织答案。"
+                                reasoning_hint = "已完成课件检索，正在基于引用内容组织答案。"
                                 _record_stream_event("reasoning_delta")
                                 stream_sections["reasoning"] += reasoning_hint
                                 yield _format_sse(
@@ -1080,6 +1257,21 @@ async def chat_stream_endpoint(request: Request):
                                 ).strip(),
                             }
 
+                        generate_start = time.time()
+                        if emit_sections:
+                            _record_stream_event("progress")
+                            stream_sections["progress"].append("开始流式生成回答")
+                            yield _format_sse(
+                                _build_v2_event(
+                                    event="progress",
+                                    message_id=stream_v2_message_id,
+                                    seq=_next_v2_seq(),
+                                    route=route,
+                                    payload={"stage": "generation", "status": "running", "message": "开始流式生成回答"},
+                                ),
+                                event_name="progress",
+                            )
+
                         async for chunk in chain.astream(stream_inputs):
                             if await request.is_disconnected():
                                 client_disconnected = True
@@ -1110,6 +1302,40 @@ async def chat_stream_endpoint(request: Request):
                                 _record_stream_event("delta")
                                 yield _format_sse({"event": "delta", "text": chunk_text}, event_name="delta")
 
+                        if emit_sections:
+                            generate_cost_ms = int((time.time() - generate_start) * 1000)
+                            _record_stream_event("action_result")
+                            stream_sections["actions"].append(
+                                {"name": "generate_answer", "status": "completed", "cost_ms": generate_cost_ms}
+                            )
+                            yield _format_sse(
+                                _build_v2_event(
+                                    event="action_result",
+                                    message_id=stream_v2_message_id,
+                                    seq=_next_v2_seq(),
+                                    route=route,
+                                    payload={
+                                        "name": "generate_answer",
+                                        "kind": "model_generation",
+                                        "status": "completed",
+                                        "cost_ms": generate_cost_ms,
+                                    },
+                                ),
+                                event_name="action_result",
+                            )
+                            _record_stream_event("progress")
+                            stream_sections["progress"].append("回答生成完成")
+                            yield _format_sse(
+                                _build_v2_event(
+                                    event="progress",
+                                    message_id=stream_v2_message_id,
+                                    seq=_next_v2_seq(),
+                                    route=route,
+                                    payload={"stage": "generation", "status": "completed", "message": "回答生成完成"},
+                                ),
+                                event_name="progress",
+                            )
+
                         answer = _clean_answer(answer)
                         if not answer and sent_content.strip():
                             answer = sent_content.strip()
@@ -1138,6 +1364,7 @@ async def chat_stream_endpoint(request: Request):
                                 )
                         if answer:
                             message = build_assistant_message(route, answer, session_id, route_params, structured_result=None)
+                            message = _attach_user_profile_meta(message)
                             payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
                             if bool(stream_v2_cfg.get("emit_sections", True)):
                                 payload = {**payload, "stream_sections": stream_sections}
@@ -1181,7 +1408,7 @@ async def chat_stream_endpoint(request: Request):
                         sent_content = ""
                         message = None
                         rag_citations = []
-                        stream_sections = {"reasoning": "", "actions": [], "citations": [], "progress": []}
+                        stream_sections = _create_stream_sections()
                         fallback_used = True
 
                 if route_state is not None:
@@ -1252,10 +1479,20 @@ async def chat_stream_endpoint(request: Request):
             answer = _clean_answer(answer)
             logger.info(f"[Final Answer] length={len(answer)}, content={answer}")
 
+            # V1 非真流式也补齐分区：尤其是 ops 的工具轨迹，前端可直接展示“工具调用”分区。
+            if structured_result is not None:
+                payload_obj = structured_result.get("payload") if isinstance(structured_result.get("payload"), dict) else {}
+                ops_trace = payload_obj.get("ops_trace") if isinstance(payload_obj, dict) else None
+                if isinstance(ops_trace, list):
+                    ops_sections = _ops_trace_to_stream_sections(ops_trace)
+                    payload_obj = {**payload_obj, "stream_sections": ops_sections}
+                    structured_result = {**structured_result, "payload": payload_obj}
+
             if answer:
                 if structured_result is not None:
                     structured_result = {**structured_result, "text": answer}
                 message = build_assistant_message(route, answer, session_id, route_params, structured_result)
+                message = _attach_user_profile_meta(message)
                 _mark_ttft_if_needed()
                 _record_stream_event("start")
                 yield _format_sse(
@@ -1646,6 +1883,28 @@ async def submit_practice_records(req: PracticeSubmitRequest = Body(...)):
         )
 
 
+@router.post("/practice/backfill-kp")
+async def backfill_practice_knowledge_points(req: PracticeBackfillRequest = Body(...)):
+    """
+    回填历史练习记录的 knowledge_point 字段（历史脏数据治理）。
+    dry_run=true 时仅预览，不落库。
+    """
+    session_id = req.session_id or "default"
+    _validate_session_id(session_id)
+    summary = memory_manager.backfill_practice_knowledge_points(
+        session_id=session_id,
+        limit=max(1, min(int(req.limit or 2000), 20000)),
+        dry_run=bool(req.dry_run),
+    )
+    stats = memory_manager.get_knowledge_point_stats(session_id)
+    return {
+        "code": 200,
+        "message": "dry-run 已完成" if bool(req.dry_run) else "回填完成",
+        "data": summary,
+        "stats_count": len(stats),
+    }
+
+
 @router.post("/practice/similar")
 async def get_similar_questions_batch(req: SimilarBatchRequest = Body(...)):
     """
@@ -1925,6 +2184,22 @@ async def get_all_sessions():
     """返回全部会话列表（含层级关系字段）。"""
     sessions = memory_manager.get_all_sessions()
     return {"code": 200, "data": sessions}
+
+
+@router.get("/user-profile")
+async def get_user_profile_endpoint(username: str = "default_user"):
+    """获取用户级人格配置（与会话无关）。"""
+    user = normalize_username(username)
+    data = get_user_profile_data(user)
+    return {"code": 200, "data": data}
+
+
+@router.put("/user-profile")
+async def update_user_profile_endpoint(req: UserProfileUpdateRequest = Body(...)):
+    """更新用户级人格配置（白名单字段）。"""
+    user = normalize_username(req.username)
+    data = update_user_profile_data(user, req.profile or {})
+    return {"code": 200, "message": "用户人格配置已更新", "data": data}
 
 
 # ==================== 消息管理 ====================

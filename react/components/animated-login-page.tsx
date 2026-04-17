@@ -317,6 +317,9 @@ export default function LoginPage() {
       const data = await res.json();
 
       if (data.code === 200) {
+        try {
+          window.localStorage.setItem("dr_username", String(email || "").trim() || "default_user");
+        } catch {}
         window.location.href = '/chat';
       } else {
         setError(data.message || "登录失败，请重试");

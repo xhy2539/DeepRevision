@@ -5,6 +5,7 @@ Supervisor Agent 分析用户意图，路由到对应 SubAgent：
   - rag_agent    : 知识问答、概念解释、复习某知识点
   - quiz_agent   : 出单道或少量题目（调用 Reflexion 出题工作流）
   - exam_agent   : 生成完整试卷（调用 Reflexion 出卷工作流）
+  - ops_agent    : 管理操作（会话/历史 CRUD，ReAct 工具决策）
   - planner_agent: 制定复习计划、推荐学习顺序
   - history_agent: 查看练习历史、答题记录、错题分析
   - chitchat     : 闲聊、感谢、无关话题
@@ -22,7 +23,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import HumanMessage
 
 from model.factory import chat_model, backup_chat_model, light_chat_model, backup_light_chat_model
-from agent.tools.agent_tools import get_rag_service
+from agent.tools.agent_tools import get_rag_service, tools as registered_tools
 from agent.tools.history_action_parser import parse_history_action
 from utils.logger_handler import logger
 from utils.session_context import current_session_id
@@ -42,7 +43,7 @@ class SupervisorState(TypedDict):
     exam_fast_mode: bool   # True=快速路径(格式检查), False=完整路径(LLM Critique)
     quiz_force_llm_critic: bool  # True=quiz强制走LLM Critic，不走本地快速质检短路
     # Supervisor 决策
-    route: str              # "rag" | "quiz" | "exam" | "planner" | "chitchat"
+    route: str              # "rag" | "quiz" | "exam" | "ops" | "planner" | "history" | "chitchat"
     route_reason: str       # 路由原因（用于日志）
     route_params: dict      # 从用户输入中提取的参数
     supervisor_precomputed: bool  # 外层已完成路由判定时跳过重复 supervisor 调用
@@ -85,17 +86,20 @@ SUPERVISOR_PROMPT = """你是【复习助手】的智能调度中心。
 - rag：知识点问答、概念讲解、解释名词、复习某个知识点 → 用"rag"
 - quiz：用户明确要求"出题"、"做题"、"练习"、"给我几道题" → 用"quiz"
 - exam：用户明确要求"出试卷"、"生成试卷"、"期末考试"、"给我出一份试卷" → 用"exam"
+- ops：用户要执行管理/工具操作（会话与历史 CRUD、课件文件管理、诊断统计、样卷/相似题查询、试卷导出等）→ 用"ops"
 - planner：用户说"复习计划"、"学习计划"、"怎么复习" → 用"planner"
 - history：用户说"历史"、"错题"、"练习记录" → 用"history"
 - chitchat：问候（你好/hi/hello）、感谢、闲聊、无关话题、无法分类 → 用"chitchat"
 
 ## 关键词触发规则（优先级从高到低）：
-1. "试卷"、"考试" → exam
-2. "出题"、"做题"、"练习题" → quiz
-3. "复习计划"、"学习计划" → planner
-4. "历史"、"错题" → history
-5. "解释"、"什么是"、"概念"、"知识点" → rag
-6. 其他 → chitchat
+1. "导出/下载" 且包含 "试卷/答案卷/答题卡/docx/word" → ops（高优先级，覆盖 exam）
+2. "试卷"、"考试" → exam
+3. "出题"、"做题"、"练习题" → quiz
+4. "创建会话"、"重命名会话"、"删除会话"、"清空历史记录"、"删除第N条错题/消息/记录"、"会话列表"、"系统诊断"、"删除课件"、"查看样卷" → ops
+5. "复习计划"、"学习计划" → planner
+6. "历史"、"错题" → history
+7. "解释"、"什么是"、"概念"、"知识点" → rag
+8. 其他 → chitchat
 
 ## 菜单选择理解（重要）：
 - 如果用户输入只是单个数字（1-9）或简单回复（如"第一个"、"第二个"）
@@ -103,9 +107,10 @@ SUPERVISOR_PROMPT = """你是【复习助手】的智能调度中心。
 - 则应将用户回复理解为选择该菜单项，并按对应意图路由
 - 例如：历史中助手提供了"1.复习 2.做题 3.聊天"，用户回复"2" → 应路由到 quiz
 
-## 参数提取规则（仅对 quiz/exam 路由）：
+## 参数提取规则（仅对 quiz/exam/ops 路由）：
 - quiz_params: {{"topic": "从用户输入中提取的知识点/科目", "quiz_type": "题型", "num": 数量}}
 - exam_params: {{"topics": ["知识点列表"], "quiz_types": ["题型列表"], "total_questions": 总题数, "quantity_dist": {{"choice": 数量, "fill": 数量, "judge": 数量, "essay": 数量}}}}
+- ops_params: {{"target":"practice|messages|session|knowledge","action":"list|create|delete|clear|rename","limit":20}}
 - 如果用户没有指定具体知识点，topic/topics 设为空字符串/空列表
 
 ## rewritten_query 规则：
@@ -172,32 +177,37 @@ RAG_SUBAGENT_PROMPT = """你是知识问答专家。你必须基于检索到的�
 - 不要输出 JSON 之外的任何文字。"""
 
 
-PLANNER_SUBAGENT_PROMPT = """你是学习规划专家，根据学生的复习目标制定具体可执行的学习计划。
+PLANNER_SUBAGENT_PROMPT = """你是学习规划专家，请根据学生需求输出结构化复习计划（JSON）。
 
 【历史记忆摘要】
 {memory_context}
 
+【练习数据快照】
+{practice_snapshot}
+
+【计划约束】
+{planner_constraints}
+
 【学生需求】
 {input}
 
-## 你需要做的：
-
-1. **分析需求**：理解学生想要复习什么、目标是什么、时间紧迫程度
-2. **智能规划**：根据内容复杂度推荐复习顺序
-3. **优先级排序**：区分哪些必须掌握、哪些了解即可
-4. **提供建议**：时间分配、重点难点、学习技巧
-
-## 输出要求（严格遵守）：
-
-- **禁止输出思考过程**：不要写"根据你的需求"、"我来帮你规划"、"首先...然后..."等思考过程
-- **直接输出计划内容**：切入正题，给出具体的复习计划
-- 计划要具体、可执行
-- 给出清晰的学习路径
-- 标注每个阶段的重点
-- 适当提醒常见误区
-- 如果学生没有明确目标，可以主动推荐适合的学习路径
-
-请直接输出复习计划，不要输出任何思考过程。"""
+输出要求：
+1) 仅输出 JSON，不要解释文字。
+2) 字段必须齐全：
+{{
+  "title": "计划标题",
+  "goal": "本轮目标",
+  "cycle_days": 7,
+  "daily_plan": [
+    {{"day": 1, "focus": "主题", "tasks": ["任务1", "任务2"], "duration_min": 60}}
+  ],
+  "milestones": ["里程碑1", "里程碑2"],
+  "review_strategy": "复盘方式",
+  "next_action": "用户现在就可以执行的一步"
+}}
+3) cycle_days 范围 1-30；daily_plan 的 day 从 1 开始连续。
+4) 必须优先覆盖薄弱知识点，且每天都要包含“复习+练习+复盘”三类动作。
+5) 任务必须可执行且简洁，不输出思考过程。"""
 
 
 CHITCHAT_PROMPT = """你是期末复习助手的智能闲聊助手。
@@ -233,6 +243,38 @@ HISTORY_SUBAGENT_PROMPT = """你是练习历史分析专家。根据用户的请
 - 回答要清晰、有条理
 
 **直接输出内容，不要输出思考过程。**"""
+
+
+OPS_REACT_DECISION_PROMPT = """你是复习助手的管理操作代理（ReAct）。
+
+目标：在会话/历史管理任务中，自动决定是否调用工具并给出最终结果。
+
+可用工具：
+{tool_specs}
+
+当前用户请求：
+{input}
+
+近期对话（可选）：
+{recent_history}
+
+已执行轨迹：
+{trace}
+
+请输出严格 JSON（不要任何额外文本）：
+{{
+  "done": true/false,
+  "thought": "一句话说明当前判断",
+  "tool_name": "当 done=false 时填写工具名，否则空字符串",
+  "tool_args": {{}},
+  "final_answer": "当 done=true 时填写给用户的最终回复，否则空字符串"
+}}
+
+规则：
+1) 最多执行一个工具后就应尝试收敛为最终回答，避免无限循环。
+2) 删除/清空类操作必须先确认对象明确（例如“第N条/ID”或“全部”）。
+3) 若请求不属于管理操作，done=true 并建议用户改用问答/出题指令。
+"""
 
 
 # ==================== 工具函数 ====================
@@ -278,6 +320,220 @@ def _build_provider_chain(primary, backup):
         seen.add(model_id)
         providers.append((name, model))
     return providers
+
+
+OPS_TOOL_EXCLUDELIST = {
+    # 预留排除位；默认空表示 ops 可使用全部已注册工具。
+}
+
+OPS_DANGEROUS_TOOLS = {
+    "delete_practice_record_tool",
+    "clear_practice_history_tool",
+    "delete_chat_message_tool",
+    "clear_chat_history_tool",
+    "delete_session_tool",
+    "delete_knowledge_file_tool",
+}
+
+
+def _tool_accepts_argument(tool_obj: Any, arg_name: str) -> bool:
+    """判断工具是否声明了指定参数（兼容 pydantic v1/v2 args_schema）。"""
+    try:
+        schema = getattr(tool_obj, "args_schema", None)
+        if schema is None:
+            return False
+        fields = getattr(schema, "model_fields", None)  # pydantic v2
+        if isinstance(fields, dict):
+            return arg_name in fields
+        fields_v1 = getattr(schema, "__fields__", None)  # pydantic v1
+        if isinstance(fields_v1, dict):
+            return arg_name in fields_v1
+    except Exception:
+        return False
+    return False
+
+
+def _build_ops_tool_map() -> Dict[str, Any]:
+    """构建 ops 子代理可用工具映射（默认覆盖全部注册工具）。"""
+    tool_map: Dict[str, Any] = {}
+    for tool_obj in registered_tools:
+        name = str(getattr(tool_obj, "name", "") or "").strip()
+        if not name or name in OPS_TOOL_EXCLUDELIST:
+            continue
+        tool_map[name] = tool_obj
+    return tool_map
+
+
+def _format_ops_tool_specs(tool_map: Dict[str, Any]) -> str:
+    """将工具清单格式化为 prompt 文本。"""
+    lines: List[str] = []
+    for name in sorted(tool_map.keys()):
+        tool_obj = tool_map[name]
+        desc = str(getattr(tool_obj, "description", "") or "").strip()
+        try:
+            schema = getattr(tool_obj, "args_schema", None)
+            if schema is not None:
+                fields = getattr(schema, "model_fields", None) or getattr(schema, "__fields__", None) or {}
+                args = ", ".join(str(k) for k in fields.keys()) if isinstance(fields, dict) else ""
+            else:
+                args = ""
+        except Exception:
+            args = ""
+        lines.append(f"- {name}({args})：{desc}")
+    return "\n".join(lines) if lines else "- （无可用工具）"
+
+
+def _safe_json_dumps(value: Any) -> str:
+    """安全序列化对象，避免日志或提示词构建阶段抛错。"""
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return str(value)
+
+
+def _ops_required_confirmation_phrase(tool_name: str, args: Dict[str, Any]) -> tuple[str, str]:
+    """生成危险操作确认短语；返回 (required_phrase, error_message)。"""
+    if tool_name == "delete_session_tool":
+        sid = str(args.get("session_id", "") or "").strip()
+        if not sid:
+            return "", "删除会话需要显式提供 session_id。"
+        return f"确认删除会话:{sid}", ""
+    if tool_name == "clear_practice_history_tool":
+        sid = str(args.get("session_id", "") or "").strip()
+        if not sid:
+            return "", "清空练习记录需要显式提供 session_id。"
+        return f"确认清空练习记录:{sid}", ""
+    if tool_name == "clear_chat_history_tool":
+        sid = str(args.get("session_id", "") or "").strip()
+        if not sid:
+            return "", "清空对话记录需要显式提供 session_id。"
+        return f"确认清空对话记录:{sid}", ""
+    if tool_name == "delete_practice_record_tool":
+        rid = str(args.get("record_id", "") or "").strip()
+        if not rid.isdigit():
+            return "", "删除错题需要显式提供 record_id。"
+        return f"确认删除错题:{rid}", ""
+    if tool_name == "delete_chat_message_tool":
+        ts = str(args.get("timestamp", "") or "").strip()
+        if not ts.isdigit():
+            return "", "删除消息需要显式提供 timestamp。"
+        return f"确认删除消息:{ts}", ""
+    if tool_name == "delete_knowledge_file_tool":
+        filename = str(args.get("filename", "") or "").strip()
+        if not filename:
+            return "", "删除课件需要显式提供 filename。"
+        return f"确认删除课件:{filename}", ""
+    return "", ""
+
+
+def _is_ops_confirmation_match(user_input: str, required_phrase: str, tool_name: str) -> bool:
+    """确认口令严格匹配：避免“引用口令提问”被误判为已确认。"""
+    required = str(required_phrase or "").strip().replace("：", ":").rstrip("。.!！")
+    if not required:
+        return False
+    user_text = str(user_input or "").strip().replace("：", ":").rstrip("。.!！")
+    if not user_text:
+        return False
+    # 删除会话允许附加“连同知识库”，其余危险工具必须严格等于确认口令。
+    if tool_name == "delete_session_tool":
+        return bool(re.fullmatch(rf"{re.escape(required)}(?:\s*连同知识库)?", user_text))
+    return user_text == required
+
+
+def _build_ops_guard_reply(
+    *,
+    trace: List[Dict[str, Any]],
+    tool_name: str,
+    pending_args: Dict[str, Any],
+    required_phrase: str,
+    reason: str,
+) -> Dict[str, Any]:
+    """构造 ops 安全闸回执（结构化 payload/meta）。"""
+    required = bool(required_phrase)
+    confirm_hint = f"\n请发送：`{required_phrase}`" if required else ""
+    text = f"{reason}{confirm_hint}"
+    payload = {
+        "ops_trace": trace,
+        "ops_confirmation_required": True,
+        "pending_tool": tool_name,
+        "pending_args": pending_args,
+        "required_confirmation_phrase": required_phrase,
+    }
+    meta = {
+        "ops_react": True,
+        "ops_confirmation_required": True,
+        "pending_tool": tool_name,
+        "pending_args": pending_args,
+        "required_confirmation_phrase": required_phrase,
+    }
+    return {
+        "kind": "chat",
+        "render_mode": "markdown",
+        "text": text,
+        "payload": payload,
+        "meta": meta,
+    }
+
+
+def _resolve_ops_history_tool_call(
+    *,
+    action: Dict[str, Any],
+    session_id: str,
+    limit: int,
+) -> tuple[str, Dict[str, Any], str]:
+    """把 history 解析动作映射为 ops 工具调用。"""
+    action_name = str(action.get("action", "none") or "none")
+    safe_limit = max(1, min(int(limit or 20), 200))
+
+    if action_name == "list_practice":
+        return "get_practice_history", {"session_id": session_id, "limit": safe_limit}, ""
+    if action_name == "clear_practice":
+        return "clear_practice_history_tool", {"session_id": session_id}, ""
+    if action_name == "list_messages":
+        return "get_chat_history_tool", {"session_id": session_id, "limit": min(safe_limit, 50)}, ""
+    if action_name == "clear_messages":
+        return "clear_chat_history_tool", {"session_id": session_id}, ""
+
+    if action_name == "delete_practice":
+        record_id = action.get("record_id")
+        if record_id is None and action.get("record_index") is not None:
+            from utils.memory_service import memory_manager
+            history = memory_manager.get_practice_history(session_id, 200)
+            record_id = _resolve_practice_id_by_index(history, int(action.get("record_index")))
+        if record_id is None:
+            return "", {}, "请提供要删除的错题 ID，或说“删除第N条错题”。"
+        return "delete_practice_record_tool", {"record_id": int(record_id), "session_id": session_id}, ""
+
+    if action_name == "delete_message":
+        timestamp = action.get("timestamp")
+        if timestamp is None and action.get("message_index") is not None:
+            from utils.memory_service import memory_manager
+            messages = memory_manager.get_messages(session_id)
+            _, ordered_messages = _format_message_rows(messages, limit=200)
+            timestamp = _resolve_message_ts_by_index(ordered_messages, int(action.get("message_index")))
+        if timestamp is None:
+            return "", {}, "请提供要删除的消息 timestamp，或说“删除第N条消息”。"
+        return "delete_chat_message_tool", {"timestamp": int(timestamp), "session_id": session_id}, ""
+
+    return "", {}, ""
+
+
+def _ops_query_requires_tool(query: str) -> bool:
+    """判断当前 ops 文本是否属于应当调用工具的执行型请求。"""
+    text = str(query or "").strip()
+    if not text:
+        return False
+    return bool(
+        re.search(r"(清空|清除|清理|删除|移除)\s*(错题|练习记录|历史记录|历史对话|聊天记录|消息|会话)", text)
+        or re.search(r"(查看|列出|展示|显示)\s*(会话|历史|记录|错题|消息)", text)
+        or re.search(r"(会话列表|查看会话|列出会话)", text)
+        or re.search(r"(创建|新建|重命名)\s*会话", text)
+        or re.search(r"删除第\s*\d+\s*条", text)
+        or re.search(r"(查看|获取|查询|分析|统计|搜索)\s*(系统诊断|token|课件|课件文件|样卷|薄弱点|相似题)", text)
+        or re.search(r"(删除|移除)\s*(课件|文件)", text)
+        or re.search(r"(导出|下载|保存为|另存为)\s*(试卷|答案卷|答题卡|word|docx)", text, flags=re.IGNORECASE)
+    )
+
 
 def _is_incomplete_response(text: str) -> bool:
     """检测响应是否不完整（LLM 想说但被截断）"""
@@ -507,7 +763,7 @@ def _validate_supervisor_decision(decision: dict, original_query: str) -> dict:
     if not isinstance(decision, dict) or not decision:
         raise ValueError("empty supervisor decision")
 
-    valid_routes = {'rag', 'quiz', 'exam', 'planner', 'history', 'chitchat'}
+    valid_routes = {'rag', 'quiz', 'exam', 'ops', 'planner', 'history', 'chitchat'}
     route = str(decision.get('route', '')).strip().lower()
     if route not in valid_routes:
         raise ValueError(f"invalid supervisor route: {route or 'empty'}")
@@ -534,6 +790,12 @@ def _validate_supervisor_decision(decision: dict, original_query: str) -> dict:
             "quiz_types": quiz_types or ["选择题", "填空题", "判断题", "简答题"],
             "total_questions": _safe_int(params.get("total_questions", 23), default=23, minimum=1, maximum=60),
             "quantity_dist": params.get("quantity_dist", {}) if isinstance(params.get("quantity_dist", {}), dict) else {},
+        }
+    elif route == "ops":
+        params = {
+            "target": str(params.get("target", "") or "").strip().lower(),
+            "action": str(params.get("action", "") or "").strip().lower(),
+            "limit": _safe_int(params.get("limit", 20), default=20, minimum=1, maximum=200),
         }
 
     rewritten_query = _validate_rewritten_query(
@@ -642,16 +904,43 @@ def _check_token_budget(input_query: str, history: str, memory: str) -> bool:
     return True
 
 
+def _is_ops_export_intent(query: str) -> bool:
+    """判断是否属于导出/下载试卷类文件的管理操作。"""
+    text = str(query or "").strip()
+    if not text:
+        return False
+
+    has_export_verb = bool(
+        re.search(
+            r"(导出|下载|导出来|保存为|另存为|生成)\s*(word|docx|试卷|答案卷|答题卡)?",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    has_exam_artifact = bool(re.search(r"(试卷|答案卷|答题卡|答案纸|word|docx)", text, flags=re.IGNORECASE))
+    return has_export_verb and has_exam_artifact
+
+
 def _get_route_fallback(error: str, original_query: str) -> str:
     """根据错误类型返回合适的 fallback 路由"""
     error_lower = error.lower()
     query = str(original_query or "")
+    is_ops_export_intent = _is_ops_export_intent(query)
+    is_ops_delete_intent = bool(
+        re.search(r"删除第\s*\d+\s*条\s*(错题|练习记录|消息|对话|聊天记录)", query)
+        or re.search(r"(删除|移除)\s*(错题|练习记录|消息|对话|聊天记录)", query)
+        or re.search(r"(清空|清除)\s*(历史记录|练习记录|历史对话|聊天记录|对话记录)", query)
+    )
 
     # 先按 query 关键词兜底，避免模型暂时失败时误路由到 chitchat
+    if is_ops_export_intent:
+        return 'ops'
     if any(kw in query for kw in ['出题', '做题', '练习', '刷题']):
         return 'quiz'
     if any(kw in query for kw in ['试卷', '考试', '出卷']):
         return 'exam'
+    if any(kw in query for kw in ['创建会话', '删除会话', '重命名会话', '会话列表', '系统诊断', '删除课件', '查看样卷', 'token统计', '薄弱点']) or is_ops_delete_intent:
+        return 'ops'
     if any(kw in query for kw in ['计划', '复习计划', '学习计划']):
         return 'planner'
     if any(kw in query for kw in ['错题', '历史', '记录', '统计', '正确率']):
@@ -679,7 +968,7 @@ async def supervisor_node(state: SupervisorState) -> SupervisorState:
     # 允许外层先做一次路由判定，然后在 workflow 内复用，避免 quiz/exam 回退路径重复调用 LLM 路由。
     if bool(state.get("supervisor_precomputed", False)):
         precomputed_route = str(state.get("route", "") or "").strip()
-        valid_routes = {"rag", "quiz", "exam", "planner", "history", "chitchat"}
+        valid_routes = {"rag", "quiz", "exam", "ops", "planner", "history", "chitchat"}
         if precomputed_route in valid_routes:
             precomputed_reason = str(state.get("route_reason", "") or "预路由命中")
             precomputed_params = state.get("route_params", {}) if isinstance(state.get("route_params"), dict) else {}
@@ -700,6 +989,16 @@ async def supervisor_node(state: SupervisorState) -> SupervisorState:
     if input_lower in greeting_keywords or input_lower.startswith('你好，') or input_lower.startswith('hi,'):
         logger.info(f"[Supervisor] 检测到打招呼，直接路由 chitchat")
         return {"route": "chitchat", "route_reason": "打招呼问候", "route_params": {}, "input": state['input']}
+
+    # 预检：导出试卷/答案卷属于管理操作，优先进入 ops，避免被 exam 关键词误吸走。
+    if _is_ops_export_intent(state.get("input", "")):
+        logger.info("[Supervisor] 命中导出试卷意图，优先路由 ops")
+        return {
+            "route": "ops",
+            "route_reason": "导出试卷意图（预检强制ops）",
+            "route_params": {"target": "exam_export", "action": "export", "limit": 20},
+            "input": state["input"],
+        }
 
     # 预检：按句子边界截断历史，保留语义完整性
     recent_history = _format_history_with_limit(state.get('chat_history', []))
@@ -1008,16 +1307,608 @@ async def exam_subagent_node(state: SupervisorState) -> SupervisorState:
     return {"subagent_result": exam_result, "final_answer": exam_text}
 
 
+async def ops_subagent_node(state: SupervisorState) -> SupervisorState:
+    """Ops SubAgent：使用 ReAct 样式自动决策并执行管理工具。"""
+    logger.info("[Ops SubAgent] 启动 ReAct 管理操作流程...")
+
+    sid = state.get('session_id') or current_session_id.get() or 'default'
+    current_session_id.set(sid)
+    user_input = str(state.get("input", "") or "").strip()
+    tool_map = _build_ops_tool_map()
+    if not tool_map:
+        text = "当前未注册可用的管理工具，请稍后重试。"
+        return {"subagent_result": text, "final_answer": text}
+
+    tool_specs = _format_ops_tool_specs(tool_map)
+    recent_history = _format_history_with_limit(state.get('chat_history', []), max_chars=500)
+    trace: List[Dict[str, Any]] = []
+    max_steps = 2
+    params = state.get("route_params", {}) if isinstance(state.get("route_params", {}), dict) else {}
+    limit = _safe_int(params.get("limit", 20), default=20, minimum=1, maximum=200)
+
+    # 对明确的历史管理动作走确定性工具调用，避免 LLM 口头宣告“已完成”。
+    deterministic_action = parse_history_action(user_input)
+    deterministic_tool, deterministic_args, deterministic_error = _resolve_ops_history_tool_call(
+        action=deterministic_action,
+        session_id=sid,
+        limit=limit,
+    )
+    if deterministic_error:
+        return {"subagent_result": deterministic_error, "final_answer": deterministic_error}
+    if deterministic_tool:
+        logger.info(
+            f"[Ops SubAgent] 命中确定性历史动作 action={deterministic_action.get('action')} -> tool={deterministic_tool}"
+        )
+        tool_obj = tool_map.get(deterministic_tool)
+        if tool_obj is None:
+            text = f"管理工具未注册：{deterministic_tool}"
+            return {"subagent_result": text, "final_answer": text}
+
+        call_args = dict(deterministic_args)
+        is_dangerous = deterministic_tool in OPS_DANGEROUS_TOOLS
+        if is_dangerous:
+            required_phrase, arg_error = _ops_required_confirmation_phrase(deterministic_tool, call_args)
+            if arg_error:
+                trace.append(
+                    {
+                        "step": 1,
+                        "tool": deterministic_tool,
+                        "args": call_args,
+                        "guard_blocked": True,
+                        "reason": arg_error,
+                    }
+                )
+                structured = _build_ops_guard_reply(
+                    trace=trace,
+                    tool_name=deterministic_tool,
+                    pending_args=call_args,
+                    required_phrase=required_phrase,
+                    reason=arg_error,
+                )
+                return {"subagent_result": structured, "final_answer": structured["text"]}
+            if not _is_ops_confirmation_match(user_input, required_phrase, deterministic_tool):
+                reason = f"检测到高风险操作 `{deterministic_tool}`，需要二次确认后执行。"
+                trace.append(
+                    {
+                        "step": 1,
+                        "tool": deterministic_tool,
+                        "args": call_args,
+                        "guard_blocked": True,
+                        "required_confirmation_phrase": required_phrase,
+                    }
+                )
+                structured = _build_ops_guard_reply(
+                    trace=trace,
+                    tool_name=deterministic_tool,
+                    pending_args=call_args,
+                    required_phrase=required_phrase,
+                    reason=reason,
+                )
+                return {"subagent_result": structured, "final_answer": structured["text"]}
+
+        try:
+            result = await tool_obj.ainvoke(call_args)
+            result_text = _safe_json_dumps(result) if isinstance(result, (dict, list)) else str(result)
+            trace.append(
+                {
+                    "step": 1,
+                    "tool": deterministic_tool,
+                    "args": call_args,
+                    "observation": result_text[:1200],
+                }
+            )
+            structured = {
+                "kind": "chat",
+                "render_mode": "markdown",
+                "text": result_text,
+                "payload": {"ops_trace": trace},
+                "meta": {"ops_react": True, "ops_steps": 1, "ops_deterministic": True},
+            }
+            return {"subagent_result": structured, "final_answer": result_text}
+        except Exception as e:
+            trace.append(
+                {
+                    "step": 1,
+                    "tool": deterministic_tool,
+                    "args": call_args,
+                    "error": str(e),
+                }
+            )
+            text = f"管理操作执行失败：`{deterministic_tool}`\n原因：{str(e)}"
+            structured = {
+                "kind": "chat",
+                "render_mode": "markdown",
+                "text": text,
+                "payload": {"ops_trace": trace},
+                "meta": {"ops_react": True, "ops_steps": 1, "ops_deterministic": True},
+            }
+            return {"subagent_result": structured, "final_answer": text}
+
+    for step in range(max_steps):
+        decision_raw = await _call_llm(
+            OPS_REACT_DECISION_PROMPT,
+            tool_specs=tool_specs,
+            input=user_input,
+            recent_history=recent_history,
+            trace=_safe_json_dumps(trace),
+        )
+        decision = _extract_json(decision_raw)
+        done = bool(decision.get("done", False))
+        final_answer = str(decision.get("final_answer", "") or "").strip()
+        tool_name = str(decision.get("tool_name", "") or "").strip()
+        tool_args = decision.get("tool_args", {}) if isinstance(decision.get("tool_args", {}), dict) else {}
+
+        if done:
+            claimed_success_without_tool = bool(
+                final_answer and any(token in final_answer for token in ["已清空", "已删除", "已创建", "已重命名", "已执行"])
+            )
+            if not trace and (_ops_query_requires_tool(user_input) or claimed_success_without_tool):
+                final_answer = "未执行任何管理工具，无法确认管理操作结果。请明确说明要查看/删除/清空的对象后重试。"
+                trace.append(
+                    {
+                        "step": step + 1,
+                        "guard_blocked": True,
+                        "reason": "模型在未调用工具的情况下提前结束。",
+                    }
+                )
+            if not final_answer:
+                final_answer = "管理操作已结束，但未生成明确结果。请重试并给出更具体指令。"
+            structured = {
+                "kind": "chat",
+                "render_mode": "markdown",
+                "text": final_answer,
+                "payload": {"ops_trace": trace},
+                "meta": {"ops_react": True, "ops_steps": len(trace)},
+            }
+            return {"subagent_result": structured, "final_answer": final_answer}
+
+        if not tool_name:
+            trace.append({"step": step + 1, "error": "模型未返回 tool_name"})
+            continue
+
+        tool_obj = tool_map.get(tool_name)
+        if tool_obj is None:
+            trace.append({"step": step + 1, "tool": tool_name, "error": "工具不存在或不在白名单"})
+            continue
+
+        call_args = dict(tool_args)
+        is_dangerous = tool_name in OPS_DANGEROUS_TOOLS
+        # 高风险操作禁止自动补 session_id，避免误删放大。
+        if (not is_dangerous) and "session_id" not in call_args and _tool_accepts_argument(tool_obj, "session_id"):
+            call_args["session_id"] = sid
+
+        if is_dangerous:
+            required_phrase, arg_error = _ops_required_confirmation_phrase(tool_name, call_args)
+            if arg_error:
+                trace.append(
+                    {
+                        "step": step + 1,
+                        "tool": tool_name,
+                        "args": call_args,
+                        "guard_blocked": True,
+                        "reason": arg_error,
+                    }
+                )
+                structured = _build_ops_guard_reply(
+                    trace=trace,
+                    tool_name=tool_name,
+                    pending_args=call_args,
+                    required_phrase=required_phrase,
+                    reason=arg_error,
+                )
+                return {"subagent_result": structured, "final_answer": structured["text"]}
+            if not _is_ops_confirmation_match(user_input, required_phrase, tool_name):
+                reason = f"检测到高风险操作 `{tool_name}`，需要二次确认后执行。"
+                trace.append(
+                    {
+                        "step": step + 1,
+                        "tool": tool_name,
+                        "args": call_args,
+                        "guard_blocked": True,
+                        "required_confirmation_phrase": required_phrase,
+                    }
+                )
+                structured = _build_ops_guard_reply(
+                    trace=trace,
+                    tool_name=tool_name,
+                    pending_args=call_args,
+                    required_phrase=required_phrase,
+                    reason=reason,
+                )
+                return {"subagent_result": structured, "final_answer": structured["text"]}
+
+            # 删除会话默认不删知识库，仅在用户明确写“连同知识库”时才清理知识库。
+            if tool_name == "delete_session_tool":
+                call_args["purge_knowledge_base"] = bool("连同知识库" in user_input)
+
+        try:
+            result = await tool_obj.ainvoke(call_args)
+            if isinstance(result, (dict, list)):
+                result_text = _safe_json_dumps(result)
+            else:
+                result_text = str(result)
+            trace.append(
+                {
+                    "step": step + 1,
+                    "tool": tool_name,
+                    "args": call_args,
+                    "observation": result_text[:1200],
+                }
+            )
+        except Exception as e:
+            trace.append(
+                {
+                    "step": step + 1,
+                    "tool": tool_name,
+                    "args": call_args,
+                    "error": str(e),
+                }
+            )
+
+    if trace:
+        last = trace[-1]
+        if last.get("observation"):
+            final_text = f"已执行管理操作：`{last.get('tool', 'unknown')}`\n\n{last.get('observation')}"
+        else:
+            final_text = (
+                f"管理操作尝试失败：`{last.get('tool', 'unknown')}`\n"
+                f"原因：{last.get('error', '未知错误')}\n"
+                "请补充更明确的对象（例如第几条/具体会话名）后再试。"
+            )
+    else:
+        final_text = "未能解析出可执行的管理操作。请明确说明是查看、删除还是清空哪类记录。"
+
+    structured = {
+        "kind": "chat",
+        "render_mode": "markdown",
+        "text": final_text,
+        "payload": {"ops_trace": trace},
+        "meta": {"ops_react": True, "ops_steps": len(trace), "ops_fallback": True},
+    }
+    return {"subagent_result": structured, "final_answer": final_text}
+
+
+def _extract_planner_constraints(user_input: str) -> Dict[str, Any]:
+    """从自然语言中提取计划约束（周期、每日时长、目标模式）。"""
+    text = str(user_input or "").strip()
+    cycle_days = 0
+    daily_minutes = 0
+    target_mode = "balanced"
+
+    day_match = re.search(r"(\d{1,2})\s*(?:天|日)(?:内|计划|冲刺|复习)?", text)
+    week_match = re.search(r"(\d{1,2})\s*周(?:内|计划|冲刺|复习)?", text)
+    if week_match:
+        cycle_days = _safe_int(int(week_match.group(1)) * 7, default=7, minimum=1, maximum=30)
+    elif day_match:
+        cycle_days = _safe_int(day_match.group(1), default=7, minimum=1, maximum=30)
+
+    min_match = re.search(r"(?:每天|每日)\s*(\d{2,3})\s*分钟", text) or re.search(r"(\d{2,3})\s*分钟\s*(?:每天|每日)", text)
+    if min_match:
+        daily_minutes = _safe_int(min_match.group(1), default=60, minimum=10, maximum=300)
+
+    if any(token in text for token in ["冲刺", "临考", "考试前", "最后"]):
+        target_mode = "sprint"
+    elif any(token in text for token in ["查漏", "补缺", "薄弱", "错题"]):
+        target_mode = "patch_weakness"
+
+    return {
+        "cycle_days": cycle_days,
+        "daily_minutes": daily_minutes,
+        "target_mode": target_mode,
+    }
+
+
+def _build_planner_practice_snapshot(session_id: str, history_limit: int = 200) -> Dict[str, Any]:
+    """汇总当前会话练习画像，供 planner 做数据驱动决策。"""
+    from utils.memory_service import memory_manager
+
+    sid = str(session_id or "").strip() or "default"
+    history = memory_manager.get_practice_history(sid, max(20, min(int(history_limit or 200), 500)))
+    kp_stats = memory_manager.get_knowledge_point_stats(sid)
+
+    total = len(history)
+    correct = sum(1 for item in history if bool(item.get("is_correct")))
+    accuracy = round((correct / total) * 100.0, 2) if total > 0 else 0.0
+    recent = history[: min(20, total)]
+    recent_correct = sum(1 for item in recent if bool(item.get("is_correct")))
+    recent_accuracy = round((recent_correct / len(recent)) * 100.0, 2) if recent else 0.0
+
+    weak_items = [
+        (kp, data)
+        for kp, data in kp_stats.items()
+        if float(data.get("accuracy", 0.0)) < 60.0 and int(data.get("total", 0)) > 0
+    ]
+    weak_items.sort(key=lambda kv: (float(kv[1].get("accuracy", 0.0)), -int(kv[1].get("total", 0)), kv[0]))
+    weak_points = [kp for kp, _ in weak_items[:8]]
+
+    reason_counts: Dict[str, int] = {}
+    for row in history:
+        if bool(row.get("is_correct")):
+            continue
+        label = _classify_wrong_reason(str(row.get("wrong_reason") or ""))
+        reason_counts[label] = int(reason_counts.get(label, 0)) + 1
+    top_wrong_reasons = [f"{label}:{count}" for label, count in sorted(reason_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:4]]
+
+    return {
+        "session_id": sid,
+        "total_attempts": total,
+        "accuracy": accuracy,
+        "recent_accuracy": recent_accuracy,
+        "weak_points": weak_points,
+        "top_wrong_reasons": top_wrong_reasons,
+    }
+
+
+def _render_planner_snapshot(snapshot: Dict[str, Any]) -> str:
+    """将练习画像渲染为紧凑文本，降低模型理解成本。"""
+    weak_points = snapshot.get("weak_points", []) if isinstance(snapshot.get("weak_points", []), list) else []
+    wrong_reasons = snapshot.get("top_wrong_reasons", []) if isinstance(snapshot.get("top_wrong_reasons", []), list) else []
+    lines = [
+        f"- session_id: {snapshot.get('session_id', 'default')}",
+        f"- total_attempts: {snapshot.get('total_attempts', 0)}",
+        f"- accuracy: {snapshot.get('accuracy', 0.0)}%",
+        f"- recent_accuracy: {snapshot.get('recent_accuracy', 0.0)}%",
+        f"- weak_points: {', '.join(weak_points) if weak_points else 'none'}",
+        f"- top_wrong_reasons: {', '.join(wrong_reasons) if wrong_reasons else 'none'}",
+    ]
+    return "\n".join(lines)
+
+
+def _build_default_day_tasks(focus: str) -> List[str]:
+    """生成默认日任务，保证包含复习、练习、复盘三动作。"""
+    item = str(focus or "").strip() or "核心主题"
+    return [
+        f"复习「{item}」核心概念并整理 1 页笔记（15 分钟）",
+        f"让 DR 出 3 道「{item}」练习题并完成作答（30 分钟）",
+        "复盘错因并记录 2 条改进点（10 分钟）",
+    ]
+
+
+def _build_default_planner_payload(user_input: str, snapshot: Dict[str, Any], constraints: Dict[str, Any]) -> Dict[str, Any]:
+    """在模型输出异常时提供可执行的稳态计划。"""
+    weak_points = snapshot.get("weak_points", []) if isinstance(snapshot.get("weak_points", []), list) else []
+    hinted_days = _safe_int(constraints.get("cycle_days", 0), default=0, minimum=0, maximum=30)
+    if hinted_days > 0:
+        cycle_days = hinted_days
+    elif len(weak_points) >= 6:
+        cycle_days = 14
+    elif len(weak_points) >= 3:
+        cycle_days = 10
+    else:
+        cycle_days = 7
+
+    hinted_minutes = _safe_int(constraints.get("daily_minutes", 0), default=0, minimum=0, maximum=300)
+    if hinted_minutes > 0:
+        daily_minutes = hinted_minutes
+    else:
+        daily_minutes = 80 if constraints.get("target_mode") == "sprint" else 60
+
+    daily_plan: List[Dict[str, Any]] = []
+    for day in range(1, cycle_days + 1):
+        if day == 1:
+            focus = weak_points[0] if weak_points else "基线诊断与知识框架梳理"
+        elif day == cycle_days:
+            focus = "综合模拟与错题回归"
+        else:
+            focus = weak_points[(day - 2) % len(weak_points)] if weak_points else f"核心主题 {day - 1}"
+        daily_plan.append(
+            {
+                "day": day,
+                "focus": focus,
+                "tasks": _build_default_day_tasks(focus),
+                "duration_min": daily_minutes,
+            }
+        )
+
+    return {
+        "title": "数据驱动复习计划",
+        "goal": "优先修复薄弱知识点并稳定提升正确率",
+        "cycle_days": cycle_days,
+        "daily_plan": daily_plan,
+        "milestones": [
+            "完成 Day1 基线诊断并确认薄弱点优先级",
+            f"在周期中段将薄弱点正确率提升到 60%+（当前 {snapshot.get('accuracy', 0.0)}%）",
+            "完成综合模拟并输出最终错因清单",
+        ],
+        "review_strategy": "采用 1-3-7 复盘节奏：当天、3天后、7天后各做一次同类回顾。",
+        "next_action": f"先执行 Day1：{daily_plan[0]['tasks'][0]}",
+    }
+
+
+def _inject_weak_points_into_plan(plan: Dict[str, Any], weak_points: List[str]) -> Dict[str, Any]:
+    """把高优先级薄弱点注入计划前几天，避免计划泛化。"""
+    if not weak_points:
+        return plan
+    updated = dict(plan)
+    raw_daily = updated.get("daily_plan", []) if isinstance(updated.get("daily_plan", []), list) else []
+    daily_plan: List[Dict[str, Any]] = []
+    for row in raw_daily:
+        daily_plan.append(dict(row) if isinstance(row, dict) else {})
+    if not daily_plan:
+        return updated
+
+    for idx, kp in enumerate(weak_points[: min(3, len(daily_plan))]):
+        row = dict(daily_plan[idx])
+        row["focus"] = kp
+        tasks = row.get("tasks", []) if isinstance(row.get("tasks", []), list) else []
+        task_list = [str(item).strip() for item in tasks if str(item).strip()]
+        if not any(kp in item for item in task_list):
+            task_list = [f"复习「{kp}」核心概念并做 3 道同类题"] + task_list
+        row["tasks"] = task_list[:4] if task_list else _build_default_day_tasks(kp)
+        daily_plan[idx] = row
+
+    updated["daily_plan"] = daily_plan
+    return updated
+
+
+def _normalize_planner_payload(
+    parsed: Dict[str, Any],
+    fallback_text: str,
+    *,
+    cycle_days_hint: int = 0,
+    daily_minutes_hint: int = 0,
+    weak_points: List[str] | None = None,
+) -> Dict[str, Any]:
+    """规范化 planner 结构，保证字段完整并限制异常值。"""
+    weak_points = [str(item).strip() for item in (weak_points or []) if str(item).strip()]
+    title = str(parsed.get("title", "") or "复习计划").strip() or "复习计划"
+    goal = str(parsed.get("goal", "") or "完成本轮复习目标").strip() or "完成本轮复习目标"
+    hinted_days = _safe_int(cycle_days_hint, default=0, minimum=0, maximum=30)
+    cycle_default = hinted_days if hinted_days > 0 else 7
+    cycle_days = _safe_int(parsed.get("cycle_days", cycle_default), default=cycle_default, minimum=1, maximum=30)
+    hinted_minutes = _safe_int(daily_minutes_hint, default=0, minimum=0, maximum=300)
+    duration_default = hinted_minutes if hinted_minutes > 0 else 60
+
+    raw_daily = parsed.get("daily_plan", []) if isinstance(parsed.get("daily_plan", []), list) else []
+    day_map: Dict[int, Dict[str, Any]] = {}
+    for idx, row in enumerate(raw_daily, start=1):
+        if not isinstance(row, dict):
+            continue
+        day = _safe_int(row.get("day", idx), default=idx, minimum=1, maximum=30)
+        if day > cycle_days or day in day_map:
+            continue
+        focus = str(row.get("focus", "") or "").strip() or f"第{day}天复习"
+        raw_tasks = row.get("tasks", [])
+        if isinstance(raw_tasks, list):
+            tasks = [str(item).strip() for item in raw_tasks if str(item).strip()]
+        else:
+            tasks = [str(raw_tasks).strip()] if str(raw_tasks).strip() else []
+        duration = _safe_int(row.get("duration_min", duration_default), default=duration_default, minimum=10, maximum=300)
+        day_map[day] = {"day": day, "focus": focus, "tasks": tasks or _build_default_day_tasks(focus), "duration_min": duration}
+
+    daily_plan: List[Dict[str, Any]] = []
+    for day in range(1, cycle_days + 1):
+        if day in day_map:
+            daily_plan.append(day_map[day])
+            continue
+        focus = weak_points[(day - 1) % len(weak_points)] if weak_points else f"第{day}天复习"
+        daily_plan.append(
+            {
+                "day": day,
+                "focus": focus,
+                "tasks": _build_default_day_tasks(focus),
+                "duration_min": duration_default,
+            }
+        )
+
+    milestones_raw = parsed.get("milestones", [])
+    milestones = [str(item).strip() for item in milestones_raw if str(item).strip()] if isinstance(milestones_raw, list) else []
+    if not milestones:
+        milestones = ["完成基线诊断", "中期薄弱点纠偏", "完成综合复盘"]
+    review_strategy = str(parsed.get("review_strategy", "") or "每日结束后做 5 分钟错因复盘。").strip()
+    next_action = str(parsed.get("next_action", "") or "先完成第 1 天第 1 个任务。").strip()
+    if not next_action:
+        next_action = "先完成第 1 天第 1 个任务。"
+
+    if not daily_plan:
+        daily_plan = [{"day": 1, "focus": "核心概念梳理", "tasks": [fallback_text[:80] or "完成核心知识点复习"], "duration_min": duration_default}]
+
+    return {
+        "title": title,
+        "goal": goal,
+        "cycle_days": cycle_days,
+        "daily_plan": daily_plan,
+        "milestones": milestones[:6],
+        "review_strategy": review_strategy,
+        "next_action": next_action,
+    }
+
+
+def _render_planner_markdown(plan: Dict[str, Any]) -> str:
+    """将结构化计划渲染为用户可读 Markdown。"""
+    lines = [
+        f"## {plan.get('title', '复习计划')}",
+        f"- 目标：{plan.get('goal', '')}",
+        f"- 周期：{plan.get('cycle_days', 7)} 天",
+        "",
+        "### 每日安排",
+    ]
+    for row in plan.get("daily_plan", []):
+        day = int(row.get("day", 0) or 0)
+        focus = str(row.get("focus", "") or "")
+        duration = int(row.get("duration_min", 60) or 60)
+        tasks = row.get("tasks", []) if isinstance(row.get("tasks", []), list) else []
+        task_text = "；".join(str(item) for item in tasks if str(item).strip()) or "完成当日练习"
+        lines.append(f"- Day {day}（{duration} 分钟）：{focus}；{task_text}")
+
+    milestones = plan.get("milestones", []) if isinstance(plan.get("milestones", []), list) else []
+    if milestones:
+        lines.extend(["", "### 里程碑"])
+        for item in milestones:
+            lines.append(f"- {item}")
+
+    lines.extend(
+        [
+            "",
+            "### 复盘策略",
+            f"- {plan.get('review_strategy', '')}",
+            "",
+            "### 现在就做",
+            f"- {plan.get('next_action', '')}",
+        ]
+    )
+    return "\n".join(lines).strip()
+
+
 async def planner_subagent_node(state: SupervisorState) -> SupervisorState:
-    """Planner SubAgent: 制定复习计划"""
+    """Planner SubAgent: 制定结构化复习计划并落入消息 payload。"""
     logger.info("[Planner SubAgent] 生成复习计划...")
 
-    result = await _call_llm(
-        PLANNER_SUBAGENT_PROMPT,
-        memory_context=state.get('memory_context', ''),
-        input=state['input'],
-    )
-    return {"subagent_result": result, "final_answer": result}
+    sid = state.get("session_id") or current_session_id.get() or "default"
+    constraints = _extract_planner_constraints(state.get("input", ""))
+    snapshot = _build_planner_practice_snapshot(sid)
+    snapshot_text = _render_planner_snapshot(snapshot)
+    default_plan = _build_default_planner_payload(state.get("input", ""), snapshot, constraints)
+
+    result_raw = ""
+    parsed: Dict[str, Any] = {}
+    try:
+        result_raw = await _call_llm(
+            PLANNER_SUBAGENT_PROMPT,
+            memory_context=state.get('memory_context', ''),
+            practice_snapshot=snapshot_text,
+            planner_constraints=_safe_json_dumps(constraints),
+            input=state['input'],
+        )
+        extracted = _extract_json(result_raw)
+        if isinstance(extracted, dict):
+            parsed = extracted
+    except Exception as e:
+        logger.warning(f"[Planner SubAgent] LLM 生成失败，回退默认计划: {e}")
+        result_raw = str(e)
+
+    if parsed:
+        plan = _normalize_planner_payload(
+            parsed,
+            result_raw,
+            cycle_days_hint=default_plan.get("cycle_days", 7),
+            daily_minutes_hint=(default_plan.get("daily_plan", [{}])[0] or {}).get("duration_min", 60),
+            weak_points=snapshot.get("weak_points", []),
+        )
+        plan = _inject_weak_points_into_plan(plan, snapshot.get("weak_points", []))
+    else:
+        plan = default_plan
+
+    if not str(plan.get("next_action", "")).strip():
+        first_tasks = (plan.get("daily_plan", [{}])[0] or {}).get("tasks", [])
+        if isinstance(first_tasks, list) and first_tasks:
+            plan["next_action"] = str(first_tasks[0])
+        else:
+            plan["next_action"] = default_plan.get("next_action", "先完成第 1 天第 1 个任务。")
+
+    plan_text = _render_planner_markdown(plan)
+    structured = {
+        "kind": "chat",
+        "render_mode": "markdown",
+        "text": plan_text,
+        "payload": {
+            "planner_data": plan,
+            "planner_constraints": constraints,
+            "planner_snapshot": snapshot,
+        },
+        "meta": {"planner_structured": True, "planner_data_driven": True},
+    }
+    return {"subagent_result": structured, "final_answer": plan_text}
 
 
 async def chitchat_node(state: SupervisorState) -> SupervisorState:
@@ -1351,7 +2242,7 @@ async def history_subagent_node(state: SupervisorState) -> SupervisorState:
 def route_to_subagent(state: SupervisorState) -> str:
     """根据 Supervisor 决策路由到对应 SubAgent"""
     route = state.get('route', 'rag')
-    valid = {"rag", "quiz", "exam", "planner", "history", "chitchat"}
+    valid = {"rag", "quiz", "exam", "ops", "planner", "history", "chitchat"}
     return route if route in valid else "rag"
 
 
@@ -1360,7 +2251,7 @@ def route_to_subagent(state: SupervisorState) -> str:
 def build_supervisor_graph() -> StateGraph:
     """
     Supervisor 工作流：
-    supervisor → (路由判断) → [rag_agent | quiz_agent | exam_agent | planner_agent | history_agent | chitchat] → END
+    supervisor → (路由判断) → [rag_agent | quiz_agent | exam_agent | ops_agent | planner_agent | history_agent | chitchat] → END
     """
     graph = StateGraph(SupervisorState)
 
@@ -1369,6 +2260,7 @@ def build_supervisor_graph() -> StateGraph:
     graph.add_node("rag_agent", rag_subagent_node)
     graph.add_node("quiz_agent", quiz_subagent_node)
     graph.add_node("exam_agent", exam_subagent_node)
+    graph.add_node("ops_agent", ops_subagent_node)
     graph.add_node("planner_agent", planner_subagent_node)
     graph.add_node("history_agent", history_subagent_node)
     graph.add_node("chitchat", chitchat_node)
@@ -1384,6 +2276,7 @@ def build_supervisor_graph() -> StateGraph:
             "rag": "rag_agent",
             "quiz": "quiz_agent",
             "exam": "exam_agent",
+            "ops": "ops_agent",
             "planner": "planner_agent",
             "history": "history_agent",
             "chitchat": "chitchat",
@@ -1391,7 +2284,7 @@ def build_supervisor_graph() -> StateGraph:
     )
 
     # 所有 SubAgent 执行完毕后结束
-    for node in ("rag_agent", "quiz_agent", "exam_agent", "planner_agent", "history_agent", "chitchat"):
+    for node in ("rag_agent", "quiz_agent", "exam_agent", "ops_agent", "planner_agent", "history_agent", "chitchat"):
         graph.add_edge(node, END)
 
     return graph.compile()

@@ -1,50 +1,25 @@
 # DeepRevision
 
-DeepRevision 是一个面向大学课程复习场景的智能出题与练习系统。用户上传课件后，系统基于课件检索进行问答、出题、组卷、练习记录与薄弱点分析。
+DeepRevision 是一个面向高校课程复习场景的智能问答与出题系统。核心思路是“课件锚定 + 练习闭环”：先用课件构建检索知识库，再把练习记录反哺到后续出题与计划。
 
-## 项目目标
+## 当前实现概览
 
-- 课件内可追溯：回答与题目尽量锚定已上传资料。
-- 练习可闭环：做题结果进入历史统计，反向影响后续出题。
-- 多会话隔离：每个 session 独立知识库、独立练习历史。
+- 多 Agent 路由：`supervisor` 在 `rag / quiz / exam / ops / planner / history / chitchat` 之间分流。
+- 课件知识库：支持 `pdf/docx/txt/ppt/pptx/图片` 上传，单次最多 5 个文件，按 MD5 去重，后台向量化并维护状态（`processing/completed/failed`）。
+- 失败文件重试：支持对失败或异常状态文件执行重试入库（`/api/knowledge/retry-failed`）。
+- RAG 检索：BM25 + 向量检索 + RRF 融合，低召回场景可触发 HyDE，带会话级上下文缓存与语义缓存。
+- 智能出题与组卷：基于 Reflexion（Generate -> Critique -> Revise）链路生成题目和试卷，支持按题型与数量控制。
+- 练习闭环：提交作答、错因、相似题推荐、薄弱点统计、知识点回填（`/practice/backfill-kp`）。
+- 用户画像：支持用户级助手人格配置（语气、详略、教学风格、称呼等）。
+- 导出能力：支持试卷格式化、试卷 Word 导出、答案卷导出与下载。
+- 运行观测：提供健康检查、token 统计与运行指标接口。
 
-## 当前能力
-
-- 课件上传与向量化：支持 PDF / Word / PPT / TXT / 图片。
-- RAG 问答：Supervisor 路由到检索子代理生成回答。
-- 智能出题（quiz）：支持按题型和数量生成练习题。
-- 综合组卷（exam）：按题型分布生成整套试卷并可导出 Word。
-- 练习历史管理：保存作答记录、错因、相似题推荐。
-- 薄弱点统计：基于练习记录聚合知识点正确率。
-- 随机练习策略：40% 薄弱点 + 60% 课件随机考点。
-
-## 核心架构
+## 技术栈
 
 - 后端：FastAPI + LangGraph + LangChain
-- 前端：React + Tailwind CSS
-- 向量库：ChromaDB（按 session 隔离）
-- 存储：SQLite（会话消息、练习记录、题库）
-
-主流程：
-
-1. 前端请求 `/api/chat/stream`（SSE）。
-2. Supervisor 判别意图并路由到 rag/quiz/exam/planner/history/chitchat。
-3. 子代理调用检索、出题或组卷链路。
-4. 结构化结果回传前端渲染（题卡/试卷画布/普通消息）。
-5. 对话与练习记录落库，供后续复习策略使用。
-
-## 出题与组卷策略（当前实现）
-
-- Quiz：Reflexion 流程（Generate -> Critique -> 可选 Revise）。
-- Exam：分阶段生成并合并交付，修订链路默认最多 1 轮。
-- 泛化随机请求：基于课件预热池随机抽文件和考点，不使用固定抽象锚点词。
-- 质量控制：数量、编号、重复、基础结构校验；优先可交付。
-
-## 历史与统计
-
-- 会话消息历史：`messages`（通过 `/api/chat/messages` 获取）。
-- 练习历史面板：当前前端“历史”按钮管理的是练习记录。
-- 练习统计：按知识点聚合正确率并识别 weak points。
+- 前端：Next.js 14（React 18 + Tailwind CSS）
+- 向量库：ChromaDB（按会话隔离 collection）
+- 持久化：SQLite（会话、消息、练习记录、题库）
 
 ## 目录结构
 
@@ -53,31 +28,30 @@ DeepRevision/
 ├── api/
 │   ├── main.py
 │   └── routers/
+│       ├── auth.py
 │       ├── chat.py
 │       ├── knowledge.py
 │       └── exam_export.py
 ├── agent/
-│   ├── tools/
-│   └── multi_agent/
-│       ├── supervisor.py
-│       ├── quiz_agent.py
-│       ├── quiz_quality.py
-│       └── quiz_normalization.py
+│   ├── multi_agent/
+│   │   ├── supervisor.py
+│   │   └── quiz_agent.py
+│   └── tools/
 ├── rag/
 │   ├── rag_service.py
 │   └── vector_store.py
-├── model/
-│   └── factory.py
 ├── utils/
 │   ├── memory_service.py
-│   ├── file_handler.py
-│   └── session_context.py
+│   ├── user_profile_service.py
+│   └── kb_version.py
 ├── react/
-├── config/
-└── data/
+├── deploy/ecs/docker-compose.prod.yml
+├── Dockerfile.backend
+├── run.py
+└── tests/
 ```
 
-## 快速启动
+## 快速开始
 
 ### 1) 安装依赖
 
@@ -86,65 +60,131 @@ python -m venv venv
 # Windows:
 venv\Scripts\activate
 pip install -r requirements.txt
+
+cd react
+npm install
+cd ..
 ```
 
 ### 2) 配置环境变量
 
-在项目根目录创建 `.env`，配置模型密钥（按你的模型工厂配置）：
+在项目根目录创建 `.env`（`model/factory.py` 会自动读取）：
 
 ```bash
+# 聊天模型（至少配置一个）
 MINIMAX_API_KEY=xxx
-# 可选：QWEN_API_KEY=xxx
+# 或
+QWEN_API_KEY=xxx
+
+# 默认 embedding/视觉模型依赖 DashScope，建议配置
+DASHSCOPE_API_KEY=xxx
+
+# 可选：主模型优先级（minimax | qwen）
+PRIMARY_LLM_PROVIDER=minimax
 ```
 
 ### 3) 启动服务
 
+方式 A：一键启动（推荐）
+
+```bash
+python run.py
+```
+
+- 自动拉起后端（`8001`）与前端（`3000`）
+- 自动打开浏览器到前端页面
+
+方式 B：前后端分开启动
+
 ```bash
 # 后端
-python run.py
-# 或
-uvicorn api.main:app --reload --port 8001
+uvicorn api.main:app --host 0.0.0.0 --port 8001
 
 # 前端
 cd react
-npm install
 npm run dev
 ```
 
-访问：`http://127.0.0.1:3000`
+访问地址：
 
-## 主要 API
+- 前端：`http://127.0.0.1:3000/chat`
+- 健康检查：`http://127.0.0.1:8001/health`
 
-### 会话与对话
+## Docker 部署（当前仓库实现）
 
-- `POST /api/chat/stream`：SSE 对话入口（Supervisor 路由）
-- `GET /api/chat/sessions`：会话列表
-- `POST /api/chat/session`：创建会话
-- `PUT /api/chat/session/{id}`：重命名会话
-- `DELETE /api/chat/session/{id}`：删除会话及相关数据
-- `GET /api/chat/messages`：获取会话消息历史
-- `DELETE /api/chat/message`：删除单条消息
-- `DELETE /api/chat/messages`：清空会话消息
+```bash
+# 构建镜像
+docker build -f Dockerfile.backend -t deeprevision-backend:latest .
+docker build -f react/Dockerfile -t deeprevision-frontend:latest ./react
 
-### 练习与分析
+# 运行（使用 deploy/ecs/docker-compose.prod.yml）
+cd deploy/ecs
+$env:BACKEND_IMAGE="deeprevision-backend:latest"
+$env:FRONTEND_IMAGE="deeprevision-frontend:latest"
+docker compose -f docker-compose.prod.yml up -d
+```
 
-- `POST /api/chat/practice/submit`：提交练习记录
-- `POST /api/chat/practice/similar`：批量获取相似题
-- `GET /api/chat/practice/stats`：获取练习统计与薄弱点
-- `GET /api/chat/practice/history`：获取练习历史
-- `DELETE /api/chat/practice/history/item`：删除单条练习历史
-- `DELETE /api/chat/practice/history`：清空练习历史
+## 主要 API（按模块）
 
-### 知识库与导出
+### 认证
 
-- `POST /api/knowledge/upload`：上传课件
-- `GET /api/knowledge/list`：课件列表
-- `DELETE /api/knowledge/file/{filename}`：删除课件
-- `POST /api/knowledge/sample/upload`：上传样卷
-- `GET /api/knowledge/sample`：获取样卷
-- `POST /api/exam/export/docx`：导出试卷 Word
-- `POST /api/exam/answersheet`：导出答案卷 Word
+- `POST /api/auth/login`
+- `POST /api/auth/register`
+- `GET /api/auth/check`
+
+### 对话 / 会话 / 画像
+
+- `POST /api/chat/stream`
+- `GET /api/chat/sessions`
+- `POST /api/chat/session`
+- `PUT /api/chat/session/{session_id}`
+- `DELETE /api/chat/session/{session_id}`
+- `POST /api/chat/session/cleanup`
+- `GET /api/chat/messages`
+- `DELETE /api/chat/message`
+- `DELETE /api/chat/messages`
+- `GET /api/chat/user-profile`
+- `PUT /api/chat/user-profile`
+- `GET /api/chat/tokens`
+- `GET /api/chat/metrics`
+
+### 练习
+
+- `POST /api/chat/practice/submit`
+- `POST /api/chat/practice/backfill-kp`
+- `POST /api/chat/practice/similar`
+- `GET /api/chat/practice/stats`
+- `GET /api/chat/practice/history`
+- `DELETE /api/chat/practice/history/item`
+- `DELETE /api/chat/practice/history`
+
+### 知识库
+
+- `POST /api/knowledge/upload`
+- `GET /api/knowledge/list`
+- `POST /api/knowledge/retry-failed`
+- `DELETE /api/knowledge/file/{filename}`
+- `POST /api/knowledge/sample/upload`
+- `GET /api/knowledge/sample`
+- `DELETE /api/knowledge/sample`
+
+### 试卷导出
+
+- `POST /api/exam/format`
+- `POST /api/exam/export/docx`
+- `POST /api/exam/answersheet`
+- `GET /api/exam/download/{filename}`
+
+## 测试
+
+当前仓库内已有的基础测试：
+
+```bash
+pytest tests/test_history_action_parser.py tests/test_kb_version.py tests/test_user_profile_service.py -q
+```
 
 ## 说明
 
-README 只描述当前项目实现与运行方式。设计细节、实验对比或历史演进建议放到单独文档（如 `docs/`）维护。
+- 当前前端首页会直接跳转到 `/chat`（开发阶段跳过登录页）。
+- 认证模块是轻量本地实现（用户信息存储在 `data/users`），未接入完整会话态鉴权。
+- 本 README 只描述仓库当前实现；若后续功能变更，请同步更新本文件。

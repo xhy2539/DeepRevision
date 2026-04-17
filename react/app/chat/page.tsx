@@ -26,6 +26,19 @@ interface StreamSectionAction {
   status?: string;
   detail?: string;
   cost_ms?: number;
+  kind?: string;
+  tool_name?: string;
+  result_summary?: string;
+  source?: string;
+}
+
+interface StreamSectionToolCall {
+  tool_name?: string;
+  status?: string;
+  detail?: string;
+  result_summary?: string;
+  cost_ms?: number;
+  source?: string;
 }
 
 interface StreamSectionCitation {
@@ -39,6 +52,16 @@ interface StreamSections {
   actions: StreamSectionAction[];
   citations: StreamSectionCitation[];
   progress: string[];
+  tool_calls: StreamSectionToolCall[];
+}
+
+interface UserAssistantProfile {
+  assistant_name: string;
+  tone: "warm" | "professional" | "strict" | "encouraging";
+  verbosity: "concise" | "normal" | "detailed";
+  teaching_style: "coach" | "socratic" | "step_by_step" | "exam_oriented";
+  emoji_level: "none" | "light" | "normal";
+  call_user_name: string;
 }
 
 interface AssistantPayload {
@@ -227,6 +250,7 @@ function createEmptyStreamSections(): StreamSections {
     actions: [],
     citations: [],
     progress: [],
+    tool_calls: [],
   };
 }
 
@@ -243,7 +267,10 @@ function normalizeStreamSections(value: unknown): StreamSections {
   const progress = Array.isArray(raw.progress)
     ? raw.progress.map((item) => String(item || "")).filter((item) => item.trim().length > 0)
     : [];
-  return { reasoning, actions, citations, progress };
+  const toolCalls = Array.isArray(raw.tool_calls)
+    ? raw.tool_calls.filter((item): item is StreamSectionToolCall => !!item && typeof item === "object")
+    : [];
+  return { reasoning, actions, citations, progress, tool_calls: toolCalls };
 }
 
 function hasStreamSections(sections: StreamSections | undefined): boolean {
@@ -252,8 +279,37 @@ function hasStreamSections(sections: StreamSections | undefined): boolean {
     sections.reasoning.trim() ||
     sections.actions.length > 0 ||
     sections.citations.length > 0 ||
-    sections.progress.length > 0
+    sections.progress.length > 0 ||
+    sections.tool_calls.length > 0
   );
+}
+
+const DEFAULT_USER_ASSISTANT_PROFILE: UserAssistantProfile = {
+  assistant_name: "DeepRevision",
+  tone: "warm",
+  verbosity: "normal",
+  teaching_style: "coach",
+  emoji_level: "light",
+  call_user_name: "",
+};
+
+function normalizeUserAssistantProfile(value: unknown): UserAssistantProfile {
+  if (!value || typeof value !== "object") return { ...DEFAULT_USER_ASSISTANT_PROFILE };
+  const raw = value as Record<string, unknown>;
+  const profile: UserAssistantProfile = { ...DEFAULT_USER_ASSISTANT_PROFILE };
+  const assistantName = String(raw.assistant_name || "").trim();
+  if (assistantName) profile.assistant_name = assistantName.slice(0, 20);
+  const callName = String(raw.call_user_name || "").trim();
+  profile.call_user_name = callName.slice(0, 20);
+  const tone = String(raw.tone || "").trim() as UserAssistantProfile["tone"];
+  const verbosity = String(raw.verbosity || "").trim() as UserAssistantProfile["verbosity"];
+  const style = String(raw.teaching_style || "").trim() as UserAssistantProfile["teaching_style"];
+  const emoji = String(raw.emoji_level || "").trim() as UserAssistantProfile["emoji_level"];
+  if (["warm", "professional", "strict", "encouraging"].includes(tone)) profile.tone = tone;
+  if (["concise", "normal", "detailed"].includes(verbosity)) profile.verbosity = verbosity;
+  if (["coach", "socratic", "step_by_step", "exam_oriented"].includes(style)) profile.teaching_style = style;
+  if (["none", "light", "normal"].includes(emoji)) profile.emoji_level = emoji;
+  return profile;
 }
 
 const SESSION_ID_REGEX = /^[\u4e00-\u9fa5a-zA-Z0-9_-]{1,64}$/;
@@ -293,10 +349,73 @@ function ThoughtChain({ thoughts }: { thoughts: string[] }) {
   );
 }
 
+function summarizeStatus(status: string | undefined): string {
+  if (!status) return "进行中";
+  if (status === "completed" || status === "success") return "已完成";
+  if (status === "running") return "进行中";
+  if (status === "blocked") return "已拦截";
+  if (status === "failed" || status === "error") return "失败";
+  return status;
+}
+
+function deriveToolCallFromAction(action: StreamSectionAction): StreamSectionToolCall | null {
+  const explicitTool = typeof action.tool_name === "string" ? action.tool_name.trim() : "";
+  const byKind = action.kind === "tool_call" && typeof action.name === "string" ? action.name.trim() : "";
+  const toolName = explicitTool || byKind;
+  if (!toolName) return null;
+  return {
+    tool_name: toolName,
+    status: typeof action.status === "string" ? action.status : "running",
+    detail: typeof action.detail === "string" ? action.detail : "",
+    result_summary: typeof action.result_summary === "string" ? action.result_summary : "",
+    cost_ms: typeof action.cost_ms === "number" ? action.cost_ms : undefined,
+    source: typeof action.source === "string" ? action.source : "",
+  };
+}
+
 function StreamSectionsPanel({ sections }: { sections: StreamSections }) {
   if (!hasStreamSections(sections)) return null;
+  const mergedToolCalls = [...sections.tool_calls];
+  for (const action of sections.actions) {
+    const derived = deriveToolCallFromAction(action);
+    if (!derived) continue;
+    const key = `${derived.tool_name || ""}|${derived.status || ""}|${derived.result_summary || derived.detail || ""}`;
+    const exists = mergedToolCalls.some(
+      (item) =>
+        `${item.tool_name || ""}|${item.status || ""}|${item.result_summary || item.detail || ""}` === key
+    );
+    if (!exists) mergedToolCalls.push(derived);
+  }
+
   return (
     <div className="mt-3 space-y-2">
+      {sections.progress.length > 0 && (
+        <details className="rounded-lg border border-sky-200 bg-sky-50/40 px-3 py-2" open>
+          <summary className="cursor-pointer text-xs font-semibold text-sky-700">{`流程进度 (${sections.progress.length})`}</summary>
+          <div className="mt-2 space-y-1 text-xs text-sky-900">
+            {sections.progress.map((item, idx) => (
+              <div key={`progress-${idx}`}>{item}</div>
+            ))}
+          </div>
+        </details>
+      )}
+      {mergedToolCalls.length > 0 && (
+        <details className="rounded-lg border border-violet-200 bg-violet-50/40 px-3 py-2" open>
+          <summary className="cursor-pointer text-xs font-semibold text-violet-700">{`工具调用 (${mergedToolCalls.length})`}</summary>
+          <div className="mt-2 space-y-2 text-xs text-violet-900">
+            {mergedToolCalls.map((call, idx) => (
+              <div key={`${call.tool_name || "tool"}-${idx}`} className="rounded border border-violet-200 bg-white px-2 py-1">
+                <div className="font-medium">
+                  {`${call.tool_name || "unknown_tool"} · ${summarizeStatus(call.status)}`}
+                  {typeof call.cost_ms === "number" ? ` · ${call.cost_ms}ms` : ""}
+                </div>
+                {call.detail ? <div className="mt-1 text-violet-800">{call.detail}</div> : null}
+                {call.result_summary ? <div className="mt-1 text-violet-700">{call.result_summary}</div> : null}
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
       {sections.reasoning.trim() && (
         <details className="rounded-lg border border-teal-200 bg-teal-50/40 px-3 py-2" open>
           <summary className="cursor-pointer text-xs font-semibold text-teal-700">推理摘要</summary>
@@ -305,11 +424,11 @@ function StreamSectionsPanel({ sections }: { sections: StreamSections }) {
       )}
       {sections.actions.length > 0 && (
         <details className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
-          <summary className="cursor-pointer text-xs font-semibold text-slate-700">执行轨迹</summary>
+          <summary className="cursor-pointer text-xs font-semibold text-slate-700">{`执行轨迹 (${sections.actions.length})`}</summary>
           <div className="mt-2 space-y-1 text-xs text-slate-600">
             {sections.actions.map((action, idx) => (
               <div key={`${action.name || "action"}-${idx}`}>
-                {`${action.name || "action"} · ${action.status || "running"}${action.detail ? ` · ${action.detail}` : ""}${typeof action.cost_ms === "number" ? ` · ${action.cost_ms}ms` : ""}`}
+                {`${action.name || "action"} · ${summarizeStatus(action.status)}${action.detail ? ` · ${action.detail}` : ""}${typeof action.cost_ms === "number" ? ` · ${action.cost_ms}ms` : ""}`}
               </div>
             ))}
           </div>
@@ -324,16 +443,6 @@ function StreamSectionsPanel({ sections }: { sections: StreamSections }) {
                 <div className="font-medium">{citation.source || `参考资料${idx + 1}`}</div>
                 {citation.quote ? <div className="mt-1 text-amber-800">{citation.quote}</div> : null}
               </div>
-            ))}
-          </div>
-        </details>
-      )}
-      {sections.progress.length > 0 && (
-        <details className="rounded-lg border border-sky-200 bg-sky-50/40 px-3 py-2">
-          <summary className="cursor-pointer text-xs font-semibold text-sky-700">流程进度</summary>
-          <div className="mt-2 space-y-1 text-xs text-sky-900">
-            {sections.progress.map((item, idx) => (
-              <div key={`progress-${idx}`}>{item}</div>
             ))}
           </div>
         </details>
@@ -1830,12 +1939,141 @@ function SessionModal({
   );
 }
 
+/** 用户级人格设置面板：对所有会话生效。 */
+function PersonaModal({
+  isOpen,
+  username,
+  profile,
+  saving,
+  onClose,
+  onChange,
+  onSave,
+}: {
+  isOpen: boolean;
+  username: string;
+  profile: UserAssistantProfile;
+  saving: boolean;
+  onClose: () => void;
+  onChange: (patch: Partial<UserAssistantProfile>) => void;
+  onSave: () => void;
+}) {
+  if (!isOpen) return null;
+  return (
+    <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center animate-fadeIn">
+      <div className="bg-white rounded-xl shadow-2xl w-full max-w-lg overflow-hidden animate-slideUp">
+        <div className="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-slate-50">
+          <h3 className="text-sm font-bold text-slate-900">DR 个性化（用户级）</h3>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-900">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+        <div className="p-5 space-y-4 text-sm">
+          <div className="text-xs text-slate-500">{`当前用户：${username || "default_user"}`}</div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <label className="flex flex-col gap-1">
+              <span className="text-xs text-slate-500">助手名称</span>
+              <input
+                value={profile.assistant_name}
+                onChange={(e) => onChange({ assistant_name: e.target.value })}
+                className="border border-slate-200 rounded-md px-3 py-2 focus:outline-none focus:ring-1 focus:ring-teal-500"
+                maxLength={20}
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs text-slate-500">对你的称呼</span>
+              <input
+                value={profile.call_user_name}
+                onChange={(e) => onChange({ call_user_name: e.target.value })}
+                className="border border-slate-200 rounded-md px-3 py-2 focus:outline-none focus:ring-1 focus:ring-teal-500"
+                maxLength={20}
+                placeholder="同学"
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs text-slate-500">语气</span>
+              <select
+                value={profile.tone}
+                onChange={(e) => onChange({ tone: e.target.value as UserAssistantProfile["tone"] })}
+                className="border border-slate-200 rounded-md px-3 py-2 focus:outline-none focus:ring-1 focus:ring-teal-500"
+              >
+                <option value="warm">温和</option>
+                <option value="professional">专业</option>
+                <option value="strict">严格</option>
+                <option value="encouraging">鼓励</option>
+              </select>
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs text-slate-500">详略</span>
+              <select
+                value={profile.verbosity}
+                onChange={(e) => onChange({ verbosity: e.target.value as UserAssistantProfile["verbosity"] })}
+                className="border border-slate-200 rounded-md px-3 py-2 focus:outline-none focus:ring-1 focus:ring-teal-500"
+              >
+                <option value="concise">简洁</option>
+                <option value="normal">适中</option>
+                <option value="detailed">详细</option>
+              </select>
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs text-slate-500">讲解风格</span>
+              <select
+                value={profile.teaching_style}
+                onChange={(e) => onChange({ teaching_style: e.target.value as UserAssistantProfile["teaching_style"] })}
+                className="border border-slate-200 rounded-md px-3 py-2 focus:outline-none focus:ring-1 focus:ring-teal-500"
+              >
+                <option value="coach">教练式</option>
+                <option value="socratic">苏格拉底式提问</option>
+                <option value="step_by_step">分步讲解</option>
+                <option value="exam_oriented">应试导向</option>
+              </select>
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs text-slate-500">Emoji 强度</span>
+              <select
+                value={profile.emoji_level}
+                onChange={(e) => onChange({ emoji_level: e.target.value as UserAssistantProfile["emoji_level"] })}
+                className="border border-slate-200 rounded-md px-3 py-2 focus:outline-none focus:ring-1 focus:ring-teal-500"
+              >
+                <option value="none">关闭</option>
+                <option value="light">轻量</option>
+                <option value="normal">正常</option>
+              </select>
+            </label>
+          </div>
+          <div className="flex justify-end gap-2 pt-2">
+            <button
+              onClick={onClose}
+              className="px-3 py-2 text-xs font-medium rounded-md border border-slate-200 text-slate-600 hover:bg-slate-50"
+              disabled={saving}
+            >
+              取消
+            </button>
+            <button
+              onClick={onSave}
+              className="px-3 py-2 text-xs font-bold rounded-md bg-teal-600 text-white hover:bg-teal-700 disabled:opacity-60"
+              disabled={saving}
+            >
+              {saving ? "保存中..." : "保存设置"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ============== 主页面组件 ==============
 /** 聊天主页：会话管理 + SSE 流式对话 + 练习闭环入口。 */
 export default function ChatPage() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [currentSession, setCurrentSession] = useState<string>("default");
   const [currentSessionName, setCurrentSessionName] = useState<string>("默认科目");
+  const [currentUsername, setCurrentUsername] = useState<string>("default_user");
+  const [userProfile, setUserProfile] = useState<UserAssistantProfile>({ ...DEFAULT_USER_ASSISTANT_PROFILE });
+  const [showPersonaModal, setShowPersonaModal] = useState(false);
+  const [isSavingUserProfile, setIsSavingUserProfile] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -1874,6 +2112,64 @@ export default function ChatPage() {
       streamAbortRef.current.abort();
     }
   }, []);
+
+  const resolveClientUsername = useCallback((): string => {
+    try {
+      const saved = window.localStorage.getItem("dr_username") || "";
+      const candidate = String(saved || "").trim();
+      return candidate || "default_user";
+    } catch {
+      return "default_user";
+    }
+  }, []);
+
+  const loadUserProfile = useCallback(async (username: string) => {
+    const safeUser = (username || "").trim() || "default_user";
+    try {
+      const res = await fetch(`/api/chat/user-profile?username=${encodeURIComponent(safeUser)}`);
+      const data = await res.json();
+      if (res.ok && data?.code === 200) {
+        setUserProfile(normalizeUserAssistantProfile(data?.data?.profile));
+      } else {
+        setUserProfile({ ...DEFAULT_USER_ASSISTANT_PROFILE });
+      }
+    } catch {
+      setUserProfile({ ...DEFAULT_USER_ASSISTANT_PROFILE });
+    }
+  }, []);
+
+  const saveUserProfile = useCallback(async () => {
+    const safeUser = (currentUsername || "").trim() || "default_user";
+    setIsSavingUserProfile(true);
+    try {
+      const res = await fetch("/api/chat/user-profile", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: safeUser,
+          profile: userProfile,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || data?.code !== 200) {
+        throw new Error(data?.message || `HTTP ${res.status}`);
+      }
+      setUserProfile(normalizeUserAssistantProfile(data?.data?.profile));
+      showToast("个性化设置已保存（用户级）", "success");
+      setShowPersonaModal(false);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : "保存失败";
+      showToast(`保存个性化设置失败：${msg}`, "error");
+    } finally {
+      setIsSavingUserProfile(false);
+    }
+  }, [currentUsername, userProfile]);
+
+  // 打开个性化面板前刷新一次用户配置，确保跨页修改可见。
+  const openPersonaSettings = useCallback(async () => {
+    setShowPersonaModal(true);
+    await loadUserProfile(currentUsername);
+  }, [currentUsername, loadUserProfile]);
 
   // 缺省知识点提取：优先后端返回，其次题干首行降级。
   const inferKnowledgePoint = (question: ExamPracticeQuestion): string => {
@@ -2006,6 +2302,23 @@ export default function ChatPage() {
         setSessions([{ id: "default", name: "默认科目" }]);
       });
   }, []);
+
+  useEffect(() => {
+    const user = resolveClientUsername();
+    setCurrentUsername(user);
+    void loadUserProfile(user);
+  }, [resolveClientUsername, loadUserProfile]);
+
+  useEffect(() => {
+    const onStorage = (evt: StorageEvent) => {
+      if (evt.key !== "dr_username") return;
+      const user = resolveClientUsername();
+      setCurrentUsername(user);
+      void loadUserProfile(user);
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [resolveClientUsername, loadUserProfile]);
 
   // 加载会话消息历史
   const loadSessionMessages = (sessionId: string) => {
@@ -2235,6 +2548,7 @@ export default function ChatPage() {
       const requestBody = {
         query: outgoingText,
         session_id: currentSession,
+        username: currentUsername,
         exam_fast_mode: resolvedExamFastMode, // 快速/完整模式开关
         quiz_force_llm_critic: resolvedQuizForceCritic, // quiz 与模式联动：完整=强制 LLM Critic
         ...extra,
@@ -2391,10 +2705,16 @@ export default function ChatPage() {
           }
 
           if (semanticEvent === "action" || semanticEvent === "action_result") {
-            const action = parsedPayload || parsed;
+            const action = (parsedPayload || parsed) as StreamSectionAction;
+            const mergedActions = [...liveSections.actions, action];
+            const derivedToolCall = deriveToolCallFromAction(action);
+            const mergedToolCalls = derivedToolCall
+              ? [...liveSections.tool_calls, derivedToolCall]
+              : liveSections.tool_calls;
             liveSections = {
               ...liveSections,
-              actions: [...liveSections.actions, action as StreamSectionAction],
+              actions: mergedActions,
+              tool_calls: mergedToolCalls,
             };
             updateAssistantSections(liveSections);
             return;
@@ -3038,6 +3358,21 @@ ${sampleHint}
               历史
             </span>
           </button>
+          <button
+            onClick={() => {
+              void openPersonaSettings();
+            }}
+            title="用户级个性化设置"
+            className="group relative px-3 py-1.5 text-xs font-medium text-slate-600 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-md transition-all ease-out duration-200"
+          >
+            <span className="flex items-center gap-1.5">
+              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4a4 4 0 110 8 4 4 0 010-8zm0 10c-4.418 0-8 1.79-8 4v2h16v-2c0-2.21-3.582-4-8-4z" />
+              </svg>
+              个性化
+            </span>
+            <span className="sr-only">{`当前用户 ${currentUsername}`}</span>
+          </button>
           {/* 出题按钮组 */}
           <div className="relative group">
             <button
@@ -3132,7 +3467,13 @@ ${sampleHint}
                         </>
                       ) : (
                         <>
-                          <span style={{ color: '#0d9488', fontWeight: 600 }}>DeepRevision</span>
+                          <span style={{ color: '#0d9488', fontWeight: 600 }}>
+                            {String(
+                              ((message.meta as Record<string, unknown> | undefined)?.assistant_name as string) ||
+                              userProfile.assistant_name ||
+                              "DeepRevision"
+                            )}
+                          </span>
                           <span style={{ opacity: 0.5 }}>·</span>
                           <span style={{ color: '#a0a0a0' }}>AI 助手</span>
                         </>
@@ -3403,6 +3744,19 @@ ${sampleHint}
         sessionId={currentSession}
         isOpen={showHistoryPanel}
         onClose={() => setShowHistoryPanel(false)}
+      />
+      <PersonaModal
+        isOpen={showPersonaModal}
+        username={currentUsername}
+        profile={userProfile}
+        saving={isSavingUserProfile}
+        onClose={() => setShowPersonaModal(false)}
+        onChange={(patch) => {
+          setUserProfile((prev) => normalizeUserAssistantProfile({ ...prev, ...patch }));
+        }}
+        onSave={() => {
+          void saveUserProfile();
+        }}
       />
       <ToastContainer />
 

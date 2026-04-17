@@ -5,6 +5,7 @@ import hashlib
 import shutil
 import time
 from typing import List, Dict, Any
+from urllib.parse import unquote
 
 from fastapi import APIRouter, File, UploadFile, BackgroundTasks, Query, HTTPException
 from fastapi.responses import JSONResponse
@@ -13,6 +14,8 @@ from utils.session_context import current_session_id
 from utils.config_handler import chroma_conf
 from utils.path_tool import get_abs_path
 from utils.logger_handler import logger
+from utils.kb_version import bump_kb_version
+from utils.knowledge_ingest_policy import should_treat_batch_duplicate, can_retry_failed_meta
 from agent.tools.agent_tools import _rag_cache
 
 router = APIRouter()
@@ -32,6 +35,27 @@ def _validate_session_id(session_id: str) -> str:
             detail="session_id 格式非法，只允许字母、数字、中文、下划线和连字符（最长64位）",
         )
     return session_id
+
+
+def _resolve_session_file_path(session_data_dir: str, raw_filename: str) -> tuple[str, str]:
+    """解析并校验会话内文件路径，阻止路径穿越。"""
+    decoded_filename = unquote(str(raw_filename or "")).strip()
+    if not decoded_filename:
+        raise HTTPException(status_code=400, detail="文件名不能为空")
+
+    normalized = decoded_filename.replace("\\", "/")
+    if "/" in normalized or normalized in {".", ".."}:
+        raise HTTPException(status_code=400, detail="文件名非法，不支持路径片段")
+
+    base_dir = os.path.abspath(session_data_dir)
+    target_path = os.path.abspath(os.path.join(base_dir, decoded_filename))
+    try:
+        in_scope = os.path.commonpath([base_dir, target_path]) == base_dir
+    except ValueError:
+        in_scope = False
+    if not in_scope:
+        raise HTTPException(status_code=400, detail="文件名非法，超出会话目录范围")
+    return decoded_filename, target_path
 
 
 def _compute_bytes_md5(data: bytes) -> str:
@@ -61,6 +85,21 @@ def _remove_md5(md5_path: str, target_md5: str):
         logger.warning(f"[上传去重] 移除旧MD5失败: {e}")
 
 
+def _append_md5_if_missing(md5_path: str, target_md5: str):
+    """在 md5_store 里追加 md5（若不存在则追加）。"""
+    if not target_md5:
+        return
+    try:
+        os.makedirs(os.path.dirname(md5_path), exist_ok=True)
+        existing = _load_existing_md5s(md5_path)
+        if target_md5 in existing:
+            return
+        with open(md5_path, "a", encoding="utf-8") as f:
+            f.write(target_md5 + "\n")
+    except Exception as e:
+        logger.warning(f"[上传去重] 追加MD5失败: {e}")
+
+
 def _load_file_vector_map(session_data_dir: str) -> Dict[str, List[str]]:
     map_path = os.path.join(session_data_dir, ".file_vector_map.json")
     if not os.path.exists(map_path):
@@ -71,6 +110,46 @@ def _load_file_vector_map(session_data_dir: str) -> Dict[str, List[str]]:
             return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _save_file_vector_map(session_data_dir: str, mapping: Dict[str, List[str]]):
+    """保存文件->向量ID映射。"""
+    map_path = os.path.join(session_data_dir, ".file_vector_map.json")
+    with open(map_path, "w", encoding="utf-8") as f:
+        json.dump(mapping, f, ensure_ascii=False)
+
+
+def _collect_vector_presence(session_id: str) -> tuple[Dict[str, List[str]], bool]:
+    """
+    扫描当前 session 向量库，返回 {source_filename: [doc_id...]}。
+    用于校验“文件状态”与“真实向量”是否一致。
+    """
+    token = current_session_id.set(session_id)
+    try:
+        vs = VectorStoreService()
+        data = vs.vector_store.get(include=["metadatas"])
+        ids = data.get("ids", []) if isinstance(data, dict) else []
+        metadatas = data.get("metadatas", []) if isinstance(data, dict) else []
+        if not isinstance(ids, list) or not isinstance(metadatas, list):
+            return {}, False
+
+        presence: Dict[str, List[str]] = {}
+        for idx, meta in enumerate(metadatas):
+            if not isinstance(meta, dict):
+                continue
+            source_filename = str(meta.get("source_filename") or "").strip()
+            if not source_filename:
+                continue
+            doc_id = str(ids[idx]) if idx < len(ids) else ""
+            if not doc_id:
+                continue
+            presence.setdefault(source_filename, []).append(doc_id)
+        return presence, True
+    except Exception as e:
+        logger.warning(f"[知识库状态] 读取向量存在性失败（session={session_id}）: {e}")
+        return {}, False
+    finally:
+        current_session_id.reset(token)
 
 def _count_md5_references(session_data_dir: str, target_md5: str, exclude_filename: str = "") -> int:
     """统计会话目录内（允许类型）引用某个 MD5 的文件数量。"""
@@ -100,7 +179,8 @@ def _has_vectorized_peer_for_md5(
     session_data_dir: str,
     target_md5: str,
     file_vector_map: Dict[str, List[str]],
-    ingest_status: Dict[str, Any],
+    vector_presence: Dict[str, List[str]],
+    vector_probe_ok: bool,
     exclude_filename: str = "",
 ) -> bool:
     """
@@ -127,9 +207,11 @@ def _has_vectorized_peer_for_md5(
                 continue
         except Exception:
             continue
-        has_mapping = bool(file_vector_map.get(fname))
-        is_completed = str((ingest_status.get(fname) or {}).get("status", "")).strip() == "completed"
-        if has_mapping or is_completed:
+        has_live_vectors = bool(vector_presence.get(fname))
+        if has_live_vectors:
+            return True
+        # 向量探测失败时，退化为映射兜底；探测成功时不再信任“仅映射”。
+        if (not vector_probe_ok) and bool(file_vector_map.get(fname)):
             return True
     return False
 
@@ -176,6 +258,8 @@ def process_document_task(filenames: list, session_id: str = "default"):
     async def _run():
         task_start = time.time()
         current_session_id.set(session_id)
+        data_root = get_abs_path(chroma_conf['data_path'])
+        session_data_dir = os.path.join(data_root, session_id)
         vs = VectorStoreService()
         # 标记为处理开始
         _update_ingest_status(
@@ -198,6 +282,17 @@ def process_document_task(filenames: list, session_id: str = "default"):
                 "detail": info.get("detail", ""),
             }
         _update_ingest_status(session_id, status_patch)
+        completed_files = [name for name, meta in status_patch.items() if str(meta.get("status", "")).strip() == "completed"]
+        if completed_files:
+            try:
+                version = bump_kb_version(
+                    session_data_dir,
+                    reason=f"vectorize:{','.join(completed_files[:3])}",
+                )
+                logger.info(f"[知识库版本] session={session_id}, version={version}, completed={len(completed_files)}")
+            except Exception as e:
+                # 版本号写入失败不影响主任务结果，避免误把已完成文件标记为失败。
+                logger.warning(f"[知识库版本] bump失败（session={session_id}）: {e}")
 
         # 触发 RAG 缓存刷新，确保 BM25 索引同步更新
         # fix: 即使 _rag_cache 中没有该 session，也需要刷新或创建新实例
@@ -251,6 +346,7 @@ async def upload_documents(
     status_store_path = os.path.join(session_data_dir, "ingest_status.json")
     ingest_status = _load_ingest_status(status_store_path)
     file_vector_map = _load_file_vector_map(session_data_dir)
+    vector_presence, vector_probe_ok = _collect_vector_presence(session_id)
     # 需要写入 md5_store 的新 MD5（包含重复文件的 MD5，确保前端状态准确）
     md5s_to_persist = set()
 
@@ -261,10 +357,11 @@ async def upload_documents(
         # --- 校验后缀 ---
         ext = os.path.splitext(file.filename or "")[1].lower()
         if ext not in ALLOWED_SUFFIX:
+            allow_hint = " / ".join(sorted(ALLOWED_SUFFIX))
             results.append({
                 "filename": file.filename,
                 "status": "rejected",
-                "reason": f"不支持的文件类型 {ext}，仅允许 .pdf / .docx / .txt"
+                "reason": f"不支持的文件类型 {ext}，仅允许 {allow_hint}"
             })
             continue
 
@@ -272,16 +369,32 @@ async def upload_documents(
         content = await file.read()
         md5_hex = _compute_bytes_md5(content)
 
+        # 批内去重：同一请求已出现过该 MD5，则直接视为重复，避免重复向量化。
+        if should_treat_batch_duplicate(md5_hex, md5s_to_persist):
+            results.append({
+                "filename": file.filename,
+                "status": "duplicate",
+                "reason": "文件内容与当前批次已上传文件重复，已跳过"
+            })
+            logger.info(f"[上传去重] {file.filename} MD5={md5_hex} 与本批次重复，跳过")
+            continue
+
         if md5_hex in existing_md5s:
             safe_name = os.path.basename(file.filename)
             status_entry = ingest_status.get(safe_name, {})
             is_failed_file = status_entry.get("status") == "failed"
+            has_live_vectors = bool(vector_presence.get(safe_name))
             has_vector_mapping = bool(file_vector_map.get(safe_name))
+            # 仅在探测成功时，才把“仅映射无向量”视为异常。
+            if vector_probe_ok and has_vector_mapping and not has_live_vectors:
+                logger.warning(f"[上传重试] {safe_name} 映射存在但未检测到真实向量，允许重建")
+                has_vector_mapping = False
             peer_vectorized = _has_vectorized_peer_for_md5(
                 session_data_dir=session_data_dir,
                 target_md5=md5_hex,
                 file_vector_map=file_vector_map,
-                ingest_status=ingest_status,
+                vector_presence=vector_presence,
+                vector_probe_ok=vector_probe_ok,
                 exclude_filename=safe_name,
             )
 
@@ -336,6 +449,10 @@ async def upload_documents(
                 dup_updates[r["filename"]] = {"status": "completed", "detail": "内容重复，复用已有向量"}
     if dup_updates:
         _update_ingest_status(session_id, dup_updates)
+
+    # 将本批次涉及的 MD5 落盘，后续请求可正确命中去重。
+    for md5_hex in md5s_to_persist:
+        _append_md5_if_missing(md5_store_path, md5_hex)
 
     accepted = sum(1 for r in results if r["status"] == "accepted")
     duplicate = sum(1 for r in results if r["status"] == "duplicate")
@@ -583,58 +700,120 @@ async def list_documents(session_id: str = Query(default="default")):
     data_root = get_abs_path(chroma_conf['data_path'])
     session_data_dir = os.path.join(data_root, session_id)
     md5_store_name = chroma_conf.get('md5_hex_store', '.md5_hex_store')
-    md5_store_path = os.path.join(session_data_dir, md5_store_name)
     status_store_path = os.path.join(session_data_dir, "ingest_status.json")
 
     if not os.path.isdir(session_data_dir):
         return {"code": 200, "files": [], "total": 0}
 
-    # 读取已完成向量化的 MD5 集合（用于标记状态）
-    embedded_md5s = _load_existing_md5s(md5_store_path)
     ingest_status = _load_ingest_status(status_store_path)
     file_vector_map = _load_file_vector_map(session_data_dir)
+    vector_presence, vector_probe_ok = _collect_vector_presence(session_id)
 
-    files = []
-    now = int(time.time())
-    processing_timeout_sec = 600  # 10 分钟未完成则判定为失败，避免永久“处理中”
-    status_changed = False
+    raw_files: List[Dict[str, Any]] = []
+    md5_to_files: Dict[str, List[str]] = {}
     for fname in os.listdir(session_data_dir):
         if fname == md5_store_name or fname.startswith('.'):
             continue
         ext = os.path.splitext(fname)[1].lower()
         if ext not in ALLOWED_SUFFIX:
             continue
-
         fpath = os.path.join(session_data_dir, fname)
-
+        if not os.path.isfile(fpath):
+            continue
         try:
             with open(fpath, "rb") as f:
                 file_md5 = hashlib.md5(f.read()).hexdigest()
         except Exception:
             continue
-
         stat = os.stat(fpath)
-        # 检查是否已完成向量化
-        # 优先用文件->向量映射判断是否真正入库；旧数据回退到 md5 标记
-        # 注意：历史版本可能没有 file_vector_map，不能因此误判为失败
-        md5_embedded = file_md5 in embedded_md5s
-        embedded = bool(file_vector_map.get(fname)) or md5_embedded
-        state = ingest_status.get(fname, {})
-        status = "completed" if embedded else state.get("status", "processing")
-        detail = state.get("detail", "")
-        updated_at = int(state.get("updated_at", int(stat.st_mtime)))
+        raw_files.append(
+            {
+                "filename": fname,
+                "size": int(stat.st_size),
+                "modified_at": int(stat.st_mtime),
+                "md5": file_md5,
+            }
+        )
+        md5_to_files.setdefault(file_md5, []).append(fname)
 
-        # 历史数据修复：若已入库但状态仍为 failed/processing，自动回填 completed
-        if embedded and state.get("status") != "completed":
+    files = []
+    now = int(time.time())
+    processing_timeout_sec = 600  # 10 分钟未完成则判定为失败，避免永久“处理中”
+    status_changed = False
+    map_changed = False
+
+    for item in raw_files:
+        fname = str(item["filename"])
+        file_md5 = str(item["md5"])
+        modified_at = int(item["modified_at"])
+
+        state = ingest_status.get(fname, {}) if isinstance(ingest_status.get(fname, {}), dict) else {}
+        status = str(state.get("status", "processing") or "processing")
+        detail = str(state.get("detail", "") or "")
+        updated_at = int(state.get("updated_at", modified_at))
+
+        # 映射与真实向量双校验，避免“状态显示完成但实际无向量”。
+        mapped_ids = list(file_vector_map.get(fname) or [])
+        live_ids = list(vector_presence.get(fname) or [])
+        has_mapping = bool(mapped_ids)
+        has_live_vectors = bool(live_ids)
+
+        # 探测成功时，主动清理“仅映射无向量”的陈旧映射。
+        if vector_probe_ok and has_mapping and not has_live_vectors:
+            file_vector_map.pop(fname, None)
+            mapped_ids = []
+            has_mapping = False
+            map_changed = True
+
+        # 自愈：若向量库存在但映射缺失，回填映射，避免后续误判。
+        if has_live_vectors and not has_mapping:
+            file_vector_map[fname] = live_ids
+            mapped_ids = live_ids
+            has_mapping = True
+            map_changed = True
+
+        peers = md5_to_files.get(file_md5, [])
+        if vector_probe_ok:
+            peer_vectorized = any(
+                peer != fname and bool(vector_presence.get(peer))
+                for peer in peers
+            )
+            embedded = has_live_vectors or peer_vectorized
+        else:
+            # 探测失败时降级使用映射，避免误把全部文件打成 failed。
+            peer_vectorized = any(
+                peer != fname and (bool(file_vector_map.get(peer)) or bool(vector_presence.get(peer)))
+                for peer in peers
+            )
+            embedded = has_mapping or has_live_vectors or peer_vectorized
+
+        # 历史数据修复：确实有向量但状态非 completed -> 自动修复 completed。
+        if embedded and status != "completed":
+            if peer_vectorized and not has_live_vectors:
+                detail = detail or "内容重复，复用已有向量"
+            else:
+                chunk_count = len(mapped_ids)
+                detail = detail or (f"向量化已完成，共{chunk_count}个片段" if chunk_count > 0 else "向量化已完成")
             ingest_status[fname] = {
                 "status": "completed",
-                "detail": state.get("detail", "") if state.get("status") == "failed" else "向量化已完成",
+                "detail": detail,
                 "updated_at": now,
             }
             status = "completed"
             status_changed = True
 
-        # 兜底：历史遗留文件无状态文件/状态长期不更新，自动从 processing 转 failed
+        # 状态矫正：显示 completed 但未检测到向量，回退为 failed，允许“重试失败”补齐。
+        if (not embedded) and status == "completed":
+            status = "failed"
+            detail = detail or "状态异常：未检测到有效向量，请点击“重试失败”重新入库。"
+            ingest_status[fname] = {
+                "status": status,
+                "detail": detail,
+                "updated_at": now,
+            }
+            status_changed = True
+
+        # 兜底：processing 长时间不更新 -> failed
         if (not embedded) and status == "processing" and (now - updated_at) > processing_timeout_sec:
             status = "failed"
             detail = detail or "处理超时或后台任务中断，请重试上传（建议删除后重新上传）"
@@ -647,16 +826,19 @@ async def list_documents(session_id: str = Query(default="default")):
 
         files.append({
             "filename": fname,
-            "size": stat.st_size,
-            "modified_at": int(stat.st_mtime),
-            "embedded": embedded,  # 标记是否已完成向量化
+            "size": int(item["size"]),
+            "modified_at": modified_at,
+            "embedded": embedded,
             "status": status,
             "detail": detail,
+            "vector_chunks": len(live_ids) if has_live_vectors else 0,
         })
 
     # 按修改时间倒序（最新在前）
     files.sort(key=lambda x: x["modified_at"], reverse=True)
 
+    if map_changed:
+        _save_file_vector_map(session_data_dir, file_vector_map)
     if status_changed:
         _save_ingest_status(status_store_path, ingest_status)
 
@@ -681,10 +863,64 @@ async def retry_failed_documents(
         )
 
     status_data = _load_ingest_status(status_store_path)
+    vector_presence, vector_probe_ok = _collect_vector_presence(session_id)
+
+    md5_by_file: Dict[str, str] = {}
+    md5_to_files: Dict[str, List[str]] = {}
+    for fname in os.listdir(session_data_dir):
+        if fname.startswith(".") or fname == os.path.basename(chroma_conf.get("md5_hex_store", ".md5_hex_store")):
+            continue
+        ext = os.path.splitext(fname)[1].lower()
+        if ext not in ALLOWED_SUFFIX:
+            continue
+        fpath = os.path.join(session_data_dir, fname)
+        if not os.path.isfile(fpath):
+            continue
+        try:
+            with open(fpath, "rb") as f:
+                file_md5 = hashlib.md5(f.read()).hexdigest()
+        except Exception:
+            continue
+        md5_by_file[fname] = file_md5
+        md5_to_files.setdefault(file_md5, []).append(fname)
+
     retry_files = []
     for fname, meta in status_data.items():
-        if meta.get("status") == "failed" and os.path.exists(os.path.join(session_data_dir, fname)):
+        if can_retry_failed_meta(meta) and os.path.exists(os.path.join(session_data_dir, fname)):
             retry_files.append(fname)
+
+    status_changed = False
+    if vector_probe_ok:
+        # 将“completed 但无真实向量”的伪完成文件纳入重试，避免界面误导。
+        for fname, file_md5 in md5_by_file.items():
+            meta = status_data.get(fname, {}) if isinstance(status_data.get(fname, {}), dict) else {}
+            status = str(meta.get("status", "processing") or "processing")
+            if status != "completed":
+                continue
+
+            has_live_vectors = bool(vector_presence.get(fname))
+            if has_live_vectors:
+                continue
+
+            peers = md5_to_files.get(file_md5, [])
+            peer_vectorized = any(
+                peer != fname and bool(vector_presence.get(peer))
+                for peer in peers
+            )
+            if peer_vectorized:
+                continue
+
+            retry_files.append(fname)
+            status_data[fname] = {
+                "status": "failed",
+                "detail": "状态异常：未检测到有效向量，已自动加入重试队列",
+                "updated_at": int(time.time()),
+            }
+            status_changed = True
+
+    retry_files = list(dict.fromkeys(retry_files))
+    if status_changed:
+        _save_ingest_status(status_store_path, status_data)
 
     if not retry_files:
         return {"code": 200, "message": "没有可重试的失败文件", "retry_count": 0}
@@ -715,15 +951,11 @@ async def delete_file(
     _validate_session_id(session_id)
     current_session_id.set(session_id)
 
-    # URL 解码文件名
-    from urllib.parse import unquote
-    decoded_filename = unquote(filename)
-
     data_root = get_abs_path(chroma_conf['data_path'])
     session_data_dir = os.path.join(data_root, session_id)
     md5_store_path = os.path.join(session_data_dir, chroma_conf['md5_hex_store'])
     status_store_path = os.path.join(session_data_dir, "ingest_status.json")
-    file_path = os.path.join(session_data_dir, decoded_filename)
+    decoded_filename, file_path = _resolve_session_file_path(session_data_dir, filename)
 
     # 1. 检查文件是否存在
     if not os.path.exists(file_path):
@@ -757,6 +989,13 @@ async def delete_file(
         if decoded_filename in status_data:
             del status_data[decoded_filename]
             _save_ingest_status(status_store_path, status_data)
+
+        try:
+            version = bump_kb_version(session_data_dir, reason=f"delete:{decoded_filename}")
+            logger.info(f"[知识库版本] session={session_id}, version={version}, action=delete_file")
+        except Exception as e:
+            # 删除流程已完成时，不应因版本号写入失败而返回 500。
+            logger.warning(f"[知识库版本] delete后bump失败（session={session_id}）: {e}")
 
         # 6. 刷新 RAG 缓存
         from agent.tools.agent_tools import _rag_cache as rag_cache_ref

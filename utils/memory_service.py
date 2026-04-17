@@ -809,6 +809,60 @@ class SessionMemoryManager:
         finally:
             conn.close()
 
+    def backfill_practice_knowledge_points(
+        self,
+        session_id: str,
+        limit: int = 2000,
+        dry_run: bool = True,
+    ) -> Dict[str, int]:
+        """回填练习记录考点字段，修复历史脏数据（支持 dry-run）。"""
+        safe_limit = max(1, min(int(limit or 2000), 20000))
+        conn = sqlite3.connect(self.db)
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, knowledge_point, question_content
+                FROM practice_records
+                WHERE session_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (session_id, safe_limit),
+            ).fetchall()
+            scanned = len(rows)
+            unchanged = 0
+            candidates: List[tuple[str, int]] = []
+            for rec_id, raw_kp, question_content in rows:
+                old_kp = str(raw_kp or "").strip()
+                normalized = (
+                    _clean_knowledge_point_phrase(old_kp)
+                    or _clean_knowledge_point_phrase(str(question_content or ""))
+                    or "未标注"
+                )
+                if normalized == old_kp:
+                    unchanged += 1
+                    continue
+                candidates.append((normalized, int(rec_id)))
+
+            updated = 0
+            if not dry_run and candidates:
+                conn.executemany(
+                    "UPDATE practice_records SET knowledge_point = ? WHERE id = ? AND session_id = ?",
+                    [(kp, rec_id, session_id) for kp, rec_id in candidates],
+                )
+                conn.commit()
+                updated = int(len(candidates))
+
+            return {
+                "scanned": int(scanned),
+                "candidate_updates": int(len(candidates)),
+                "updated": int(updated),
+                "unchanged": int(unchanged),
+                "dry_run": int(bool(dry_run)),
+            }
+        finally:
+            conn.close()
+
     def get_knowledge_point_stats(self, session_id: str) -> Dict[str, Dict]:
         """获取知识点统计：每个知识点的练习次数、正确率"""
         conn = sqlite3.connect(self.db)
