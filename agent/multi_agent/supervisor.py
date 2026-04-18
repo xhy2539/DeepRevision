@@ -15,7 +15,7 @@ Supervisor Agent 分析用户意图，路由到对应 SubAgent：
 import json
 import time
 import re
-from typing import TypedDict, List, Dict, Any
+from typing import TypedDict, List, Dict, Any, Optional
 
 from langgraph.graph import StateGraph, END
 from langchain_core.prompts import PromptTemplate
@@ -1826,6 +1826,7 @@ def _build_planner_practice_snapshot(session_id: str, history_limit: int = 200) 
     sid = str(session_id or "").strip() or "default"
     history = memory_manager.get_practice_history(sid, max(20, min(int(history_limit or 200), 500)))
     kp_stats = memory_manager.get_knowledge_point_stats(sid)
+    mastery_priority = memory_manager.get_priority_review_points(sid, limit=8)
 
     total = len(history)
     correct = sum(1 for item in history if bool(item.get("is_correct")))
@@ -1840,7 +1841,11 @@ def _build_planner_practice_snapshot(session_id: str, history_limit: int = 200) 
         if float(data.get("accuracy", 0.0)) < 60.0 and int(data.get("total", 0)) > 0
     ]
     weak_items.sort(key=lambda kv: (float(kv[1].get("accuracy", 0.0)), -int(kv[1].get("total", 0)), kv[0]))
-    weak_points = [kp for kp, _ in weak_items[:8]]
+    if mastery_priority:
+        weak_points = [str(item.get("knowledge_point", "")).strip() for item in mastery_priority if str(item.get("knowledge_point", "")).strip()]
+    else:
+        weak_points = [kp for kp, _ in weak_items[:8]]
+    weak_points = weak_points[:8]
 
     reason_counts: Dict[str, int] = {}
     for row in history:
@@ -1850,12 +1855,23 @@ def _build_planner_practice_snapshot(session_id: str, history_limit: int = 200) 
         reason_counts[label] = int(reason_counts.get(label, 0)) + 1
     top_wrong_reasons = [f"{label}:{count}" for label, count in sorted(reason_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:4]]
 
+    mastery_view = [
+        {
+            "knowledge_point": item.get("knowledge_point", ""),
+            "mastery_score": float(item.get("mastery_score", 0.0)),
+            "review_urgency": float(item.get("review_urgency", 0.0)),
+            "days_since_last_seen": float(item.get("days_since_last_seen", 0.0)),
+        }
+        for item in mastery_priority[:8]
+    ]
+
     return {
         "session_id": sid,
         "total_attempts": total,
         "accuracy": accuracy,
         "recent_accuracy": recent_accuracy,
         "weak_points": weak_points,
+        "mastery_priority": mastery_view,
         "top_wrong_reasons": top_wrong_reasons,
     }
 
@@ -1863,13 +1879,23 @@ def _build_planner_practice_snapshot(session_id: str, history_limit: int = 200) 
 def _render_planner_snapshot(snapshot: Dict[str, Any]) -> str:
     """将练习画像渲染为紧凑文本，降低模型理解成本。"""
     weak_points = snapshot.get("weak_points", []) if isinstance(snapshot.get("weak_points", []), list) else []
+    mastery_priority = snapshot.get("mastery_priority", []) if isinstance(snapshot.get("mastery_priority", []), list) else []
     wrong_reasons = snapshot.get("top_wrong_reasons", []) if isinstance(snapshot.get("top_wrong_reasons", []), list) else []
+    mastery_preview = []
+    for item in mastery_priority[:3]:
+        if not isinstance(item, dict):
+            continue
+        kp = str(item.get("knowledge_point", "")).strip()
+        if not kp:
+            continue
+        mastery_preview.append(f"{kp}:{float(item.get('mastery_score', 0.0)):.2f}")
     lines = [
         f"- session_id: {snapshot.get('session_id', 'default')}",
         f"- total_attempts: {snapshot.get('total_attempts', 0)}",
         f"- accuracy: {snapshot.get('accuracy', 0.0)}%",
         f"- recent_accuracy: {snapshot.get('recent_accuracy', 0.0)}%",
         f"- weak_points: {', '.join(weak_points) if weak_points else 'none'}",
+        f"- mastery_priority: {', '.join(mastery_preview) if mastery_preview else 'none'}",
         f"- top_wrong_reasons: {', '.join(wrong_reasons) if wrong_reasons else 'none'}",
     ]
     return "\n".join(lines)
@@ -2241,6 +2267,7 @@ def _build_practice_analysis_report(
     stats: Dict[str, Dict[str, Any]],
     history: List[Dict[str, Any]],
     *,
+    mastery_priority: Optional[List[Dict[str, Any]]] = None,
     max_weak: int = 8,
     max_recent_wrong: int = 6,
 ) -> str:
@@ -2261,6 +2288,10 @@ def _build_practice_analysis_report(
         if float(item.get("accuracy", 0.0)) < 60.0 and int(item.get("total", 0)) > 0
     ]
     weak_items.sort(key=lambda kv: (float(kv[1].get("accuracy", 0.0)), -int(kv[1].get("total", 0)), kv[0]))
+    safe_mastery_priority = []
+    for row in mastery_priority or []:
+        if isinstance(row, dict) and str(row.get("knowledge_point", "")).strip():
+            safe_mastery_priority.append(row)
 
     strong_items = [
         (kp, item)
@@ -2290,7 +2321,18 @@ def _build_practice_analysis_report(
 
     lines.append("")
     lines.append("【薄弱知识点优先级】")
-    if weak_items:
+    if safe_mastery_priority:
+        for i, item in enumerate(safe_mastery_priority[:max_weak], 1):
+            kp = str(item.get("knowledge_point") or "未标注")
+            mastery_score = float(item.get("mastery_score", 0.0))
+            accuracy_pct = float(item.get("accuracy", 0.0))
+            correct_cnt = int(item.get("correct_count", 0))
+            attempt_cnt = int(item.get("attempt_count", 0))
+            urgency = float(item.get("review_urgency", 0.0))
+            lines.append(
+                f"{i}. {kp}：掌握度 {mastery_score:.2f}，正确率 {accuracy_pct:.1f}%（{correct_cnt}/{attempt_cnt}），紧迫度 {urgency:.2f}"
+            )
+    elif weak_items:
         for i, (kp, item) in enumerate(weak_items[:max_weak], 1):
             lines.append(
                 f"{i}. {kp}：{int(item.get('correct', 0))}/{int(item.get('total', 0))}（{float(item.get('accuracy', 0.0)):.1f}%）"
@@ -2331,8 +2373,13 @@ def _build_practice_analysis_report(
 
     lines.append("")
     lines.append("【下一步建议】")
-    if weak_items:
+    if safe_mastery_priority:
+        top_targets = [str(item.get("knowledge_point", "")).strip() for item in safe_mastery_priority if str(item.get("knowledge_point", "")).strip()][:3]
+    elif weak_items:
         top_targets = [kp for kp, _ in weak_items[:3]]
+    else:
+        top_targets = []
+    if top_targets:
         for kp in top_targets:
             lines.append(f"- 先复习「{kp}」10 分钟，再做 2 道同考点题并立即对照错因。")
         lines.append("- 若仍连续错 2 次以上，请发“讲解 + 出1道同类题”进行纠偏。")
@@ -2419,17 +2466,38 @@ async def history_subagent_node(state: SupervisorState) -> SupervisorState:
         if action_name == "analyze_practice":
             stats = memory_manager.get_knowledge_point_stats(sid)
             history_rows = memory_manager.get_practice_history(sid, max(50, min(int(limit or 120), 200)))
-            text = _build_practice_analysis_report(stats, history_rows)
+            mastery_priority = memory_manager.get_priority_review_points(sid, limit=8)
+            text = _build_practice_analysis_report(
+                stats,
+                history_rows,
+                mastery_priority=mastery_priority,
+            )
             return {"subagent_result": text, "final_answer": text}
 
     # 获取统计数据和历史记录
     stats = memory_manager.get_knowledge_point_stats(sid)
+    mastery_priority = memory_manager.get_priority_review_points(
+        sid,
+        limit=max(8, min(len(stats) + 4, 60)) if stats else 8,
+    )
     history = memory_manager.get_practice_history(sid, limit)
 
     # 格式化统计数据
     if stats:
+        priority_order = [str(item.get("knowledge_point", "")).strip() for item in mastery_priority if str(item.get("knowledge_point", "")).strip()]
+        ordered_stats: List[tuple[str, Dict[str, Any]]] = []
+        seen_kp = set()
+        for kp in priority_order:
+            if kp in stats and kp not in seen_kp:
+                ordered_stats.append((kp, stats[kp]))
+                seen_kp.add(kp)
+        for kp, data in sorted(stats.items(), key=lambda kv: kv[0]):
+            if kp in seen_kp:
+                continue
+            ordered_stats.append((kp, data))
+
         stats_lines = []
-        for kp, data in stats.items():
+        for kp, data in ordered_stats:
             weak = "🔴 薄弱" if data.get('weak') else "🟢 掌握"
             stats_lines.append(f"- {kp}: {data['correct']}/{data['total']} ({data['accuracy']:.1f}%) {weak}")
         stats_str = "\n".join(stats_lines)

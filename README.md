@@ -160,9 +160,16 @@ docker compose -f docker-compose.prod.yml up -d
 - `POST /api/chat/practice/backfill-kp`
 - `POST /api/chat/practice/similar`
 - `GET /api/chat/practice/stats`
+- `GET /api/chat/mastery`
 - `GET /api/chat/practice/history`
 - `DELETE /api/chat/practice/history/item`
 - `DELETE /api/chat/practice/history`
+
+补充说明（Phase 1）：
+- `GET /api/chat/mastery` 返回会话级 mastery 快照与 `priority_review_points`。
+- mastery 初版计分公式：`accuracy - streak_penalty - recency_penalty`，分数区间 `[0,1]`。
+- `GET /api/chat/practice/stats` 现已附带 `mastery_rows_total` 与 `priority_review_points` 字段（兼容增量）。
+- `POST /api/chat/practice/submit` 响应体会附带 `mastery_rows_total` 与 `priority_review_points`，可直接用于前端“下一步复习点”提示。
 
 ### 知识库
 
