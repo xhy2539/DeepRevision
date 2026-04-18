@@ -1942,6 +1942,9 @@ async def get_practice_stats(session_id: str):
 
     history = memory_manager.get_practice_history(session_id, limit=500)
     kp_stats = memory_manager.get_knowledge_point_stats(session_id)
+    mastery_rows_total = memory_manager.get_mastery_rows_count(session_id)
+    priority_review_points = memory_manager.get_priority_review_points(session_id, limit=10)
+    RUNTIME_METRICS["mastery_rows_total"] = mastery_rows_total
     total = len(history)
     wrong = sum(1 for h in history if not h.get("is_correct"))
     accuracy = round(((total - wrong) / total) * 100, 2) if total > 0 else 0.0
@@ -1958,6 +1961,8 @@ async def get_practice_stats(session_id: str):
             "retry_rate": retry_rate,
             "weak_points": weak_points,
             "knowledge_point_stats": kp_stats,
+            "mastery_rows_total": mastery_rows_total,
+            "priority_review_points": priority_review_points,
         },
     }
 
