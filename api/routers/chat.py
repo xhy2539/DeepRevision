@@ -88,6 +88,7 @@ RUNTIME_METRICS: Dict[str, Any] = {
     "stream_v2_requests_total": 0,
     "stream_v2_activated_total": 0,
     "stream_event_counts_by_type": {},
+    "mastery_rows_total": 0,
 }
 
 
@@ -1837,7 +1838,7 @@ async def submit_practice_records(req: PracticeSubmitRequest = Body(...)):
             kp_key = f"{str(record.knowledge_point or '')}|||{str(record.question_content or '')[:160]}"
             normalized_kp = kp_map.get(kp_key) or _extract_kp_rule(record.knowledge_point or "", record.question_content or "")
             try:
-                memory_manager.add_practice_record(
+                memory_manager.add_practice_record_sync(
                     session_id=session_id,
                     question_id=qid,
                     question_content=record.question_content,
@@ -1865,6 +1866,9 @@ async def submit_practice_records(req: PracticeSubmitRequest = Body(...)):
 
         stats = memory_manager.get_knowledge_point_stats(session_id)
         weak_points = [kp for kp, data in stats.items() if data.get("weak")]
+        mastery_rows_total = memory_manager.get_mastery_rows_count(session_id)
+        priority_review_points = memory_manager.get_priority_review_points(session_id, limit=10)
+        RUNTIME_METRICS["mastery_rows_total"] = mastery_rows_total
         logger.info(f"[Practice] session={session_id}, saved={saved}, weak_points={weak_points}")
         return {
             "code": 200,
@@ -1872,6 +1876,8 @@ async def submit_practice_records(req: PracticeSubmitRequest = Body(...)):
             "saved": saved,
             "weak_points": weak_points,
             "stats": stats,
+            "mastery_rows_total": mastery_rows_total,
+            "priority_review_points": priority_review_points,
         }
     except HTTPException:
         raise
@@ -1952,6 +1958,28 @@ async def get_practice_stats(session_id: str):
             "retry_rate": retry_rate,
             "weak_points": weak_points,
             "knowledge_point_stats": kp_stats,
+        },
+    }
+
+
+@router.get("/mastery")
+async def get_mastery_snapshot(session_id: str, limit: int = 200, priority_limit: int = 10):
+    """获取 mastery 快照与优先复习考点。"""
+    _validate_session_id(session_id)
+    safe_limit = max(1, min(int(limit or 200), 2000))
+    safe_priority_limit = max(1, min(int(priority_limit or 10), 100))
+    snapshot = memory_manager.get_mastery_snapshot(session_id, limit=safe_limit)
+    priority_points = memory_manager.get_priority_review_points(session_id, limit=safe_priority_limit)
+    mastery_rows_total = memory_manager.get_mastery_rows_count(session_id)
+    RUNTIME_METRICS["mastery_rows_total"] = mastery_rows_total
+    return {
+        "code": 200,
+        "data": {
+            "session_id": session_id,
+            "count": len(snapshot),
+            "mastery_rows_total": mastery_rows_total,
+            "mastery": snapshot,
+            "priority_review_points": priority_points,
         },
     }
 
