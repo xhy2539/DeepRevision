@@ -34,6 +34,8 @@ class KnowledgeGraphNode(BaseModel):
 
 # ==================== SQLite 辅助（同步，在线程池中运行）====================
 
+_DAY_SECONDS = 24 * 60 * 60
+
 def _db_path() -> str:
     path = os.path.join(os.getcwd(), "data", "sessions.db")
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -80,6 +82,20 @@ def _create_tables(conn: sqlite3.Connection):
             wrong_reason    TEXT,
             created_at      INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS knowledge_mastery (
+            session_id            TEXT    NOT NULL,
+            knowledge_point       TEXT    NOT NULL,
+            attempt_count         INTEGER NOT NULL DEFAULT 0,
+            correct_count         INTEGER NOT NULL DEFAULT 0,
+            recent_wrong_streak   INTEGER NOT NULL DEFAULT 0,
+            recent_correct_streak INTEGER NOT NULL DEFAULT 0,
+            last_seen_at          INTEGER NOT NULL DEFAULT 0,
+            last_correct_at       INTEGER,
+            last_wrong_at         INTEGER,
+            mastery_score         REAL    NOT NULL DEFAULT 0,
+            next_review_at        INTEGER,
+            PRIMARY KEY (session_id, knowledge_point)
+        );
         CREATE TABLE IF NOT EXISTS quiz_round_questions (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id        TEXT    NOT NULL,
@@ -94,6 +110,8 @@ def _create_tables(conn: sqlite3.Connection):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_graph_sid ON graph_nodes(session_id);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_practice_sid ON practice_records(session_id);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_practice_kp ON practice_records(knowledge_point);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mastery_sid ON knowledge_mastery(session_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mastery_score ON knowledge_mastery(session_id, mastery_score ASC, last_seen_at ASC);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_quiz_round_sid ON quiz_round_questions(session_id);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_quiz_round_sid_created ON quiz_round_questions(session_id, created_at DESC);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_quiz_round_sid_round ON quiz_round_questions(session_id, round_id);")
@@ -232,6 +250,91 @@ def _normalize_quiz_question_signature(text: str) -> str:
     src = re.sub(r'[（(]\s*\d+\s*[）)]', '', src)
     src = re.sub(r'[^\w\u4e00-\u9fff]+', '', src)
     return src
+
+
+def _safe_unix_ts(ts: Optional[int] = None) -> int:
+    """将输入时间戳标准化为秒级 Unix 时间。"""
+    if ts is None:
+        return int(time.time())
+    value = int(ts)
+    return max(value, 0)
+
+
+def _normalize_mastery_knowledge_point(knowledge_point: str, question_content: str = "") -> str:
+    """统一 mastery key，避免同义考点被拆散。"""
+    cleaned = _clean_knowledge_point_phrase(str(knowledge_point or "").strip())
+    if cleaned:
+        return cleaned
+    fallback = _clean_knowledge_point_phrase(str(question_content or "").strip())
+    return fallback or "未标注"
+
+
+def _compute_mastery_score(
+    attempt_count: int,
+    correct_count: int,
+    recent_wrong_streak: int,
+    last_seen_at: int,
+    *,
+    now_ts: Optional[int] = None,
+) -> float:
+    """按 Phase 1 公式计算 mastery 分数（0~1）。"""
+    safe_attempt = max(int(attempt_count or 0), 1)
+    safe_correct = max(0, min(int(correct_count or 0), safe_attempt))
+    safe_wrong_streak = max(int(recent_wrong_streak or 0), 0)
+    safe_last_seen = max(int(last_seen_at or 0), 0)
+    safe_now = _safe_unix_ts(now_ts)
+
+    accuracy_component = safe_correct / safe_attempt
+    streak_penalty = min(safe_wrong_streak * 0.12, 0.36)
+    days_since_last_seen = max(0.0, (safe_now - safe_last_seen) / _DAY_SECONDS) if safe_last_seen > 0 else 0.0
+    recency_penalty = min(days_since_last_seen * 0.015, 0.20)
+    score = accuracy_component - streak_penalty - recency_penalty
+    return round(max(0.0, min(1.0, score)), 4)
+
+
+def _compose_mastery_view(
+    *,
+    knowledge_point: str,
+    attempt_count: int,
+    correct_count: int,
+    recent_wrong_streak: int,
+    recent_correct_streak: int,
+    last_seen_at: int,
+    last_correct_at: Optional[int],
+    last_wrong_at: Optional[int],
+    stored_mastery_score: float,
+    now_ts: Optional[int] = None,
+) -> Dict[str, Any]:
+    """将 mastery 原始行转成对外可读结构（含动态衰减分）。"""
+    safe_now = _safe_unix_ts(now_ts)
+    safe_last_seen = max(int(last_seen_at or 0), 0)
+    days_since_last_seen = max(0.0, (safe_now - safe_last_seen) / _DAY_SECONDS) if safe_last_seen > 0 else 0.0
+    dynamic_score = _compute_mastery_score(
+        attempt_count=attempt_count,
+        correct_count=correct_count,
+        recent_wrong_streak=recent_wrong_streak,
+        last_seen_at=safe_last_seen,
+        now_ts=safe_now,
+    )
+    review_urgency = round(max(0.0, min(1.0, 1.0 - dynamic_score)), 4)
+    safe_attempt = max(int(attempt_count or 0), 0)
+    safe_correct = max(int(correct_count or 0), 0)
+    accuracy = round((safe_correct / safe_attempt) * 100.0, 1) if safe_attempt > 0 else 0.0
+    return {
+        "knowledge_point": str(knowledge_point or "").strip() or "未标注",
+        "attempt_count": safe_attempt,
+        "correct_count": safe_correct,
+        "recent_wrong_streak": max(int(recent_wrong_streak or 0), 0),
+        "recent_correct_streak": max(int(recent_correct_streak or 0), 0),
+        "last_seen_at": safe_last_seen,
+        "last_correct_at": int(last_correct_at) if last_correct_at is not None else None,
+        "last_wrong_at": int(last_wrong_at) if last_wrong_at is not None else None,
+        "mastery_score": dynamic_score,
+        "stored_mastery_score": round(float(stored_mastery_score or 0.0), 4),
+        "days_since_last_seen": round(days_since_last_seen, 2),
+        "accuracy": accuracy,
+        "review_urgency": review_urgency,
+    }
 
 
 def _load_session_sync(db: str, session_id: str) -> Dict:
@@ -393,8 +496,134 @@ def _delete_session_sync(db: str, session_id: str):
         conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM graph_nodes WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM practice_records WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM knowledge_mastery WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM quiz_round_questions WHERE session_id = ?", (session_id,))
         conn.commit()
+    finally:
+        conn.close()
+
+
+def _upsert_mastery_row_sync(
+    conn: sqlite3.Connection,
+    session_id: str,
+    knowledge_point: str,
+    *,
+    is_correct: bool,
+    event_ts: Optional[int] = None,
+) -> Dict[str, Any]:
+    """增量更新单个考点 mastery 行，供练习写入链路复用。"""
+    kp = _normalize_mastery_knowledge_point(knowledge_point)
+    ts = _safe_unix_ts(event_ts)
+    row = conn.execute(
+        """
+        SELECT attempt_count, correct_count, recent_wrong_streak, recent_correct_streak,
+               last_seen_at, last_correct_at, last_wrong_at
+        FROM knowledge_mastery
+        WHERE session_id = ? AND knowledge_point = ?
+        """,
+        (session_id, kp),
+    ).fetchone()
+
+    attempt_count = int((row[0] if row else 0) or 0) + 1
+    correct_count = int((row[1] if row else 0) or 0) + (1 if bool(is_correct) else 0)
+    if bool(is_correct):
+        recent_correct_streak = int((row[3] if row else 0) or 0) + 1
+        recent_wrong_streak = 0
+        last_correct_at = ts
+        last_wrong_at = int((row[6] if row else 0) or 0) or None
+    else:
+        recent_wrong_streak = int((row[2] if row else 0) or 0) + 1
+        recent_correct_streak = 0
+        last_correct_at = int((row[5] if row else 0) or 0) or None
+        last_wrong_at = ts
+
+    mastery_score = _compute_mastery_score(
+        attempt_count=attempt_count,
+        correct_count=correct_count,
+        recent_wrong_streak=recent_wrong_streak,
+        last_seen_at=ts,
+        now_ts=ts,
+    )
+    conn.execute(
+        """
+        INSERT INTO knowledge_mastery (
+            session_id, knowledge_point, attempt_count, correct_count,
+            recent_wrong_streak, recent_correct_streak, last_seen_at,
+            last_correct_at, last_wrong_at, mastery_score, next_review_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(session_id, knowledge_point) DO UPDATE SET
+            attempt_count = excluded.attempt_count,
+            correct_count = excluded.correct_count,
+            recent_wrong_streak = excluded.recent_wrong_streak,
+            recent_correct_streak = excluded.recent_correct_streak,
+            last_seen_at = excluded.last_seen_at,
+            last_correct_at = excluded.last_correct_at,
+            last_wrong_at = excluded.last_wrong_at,
+            mastery_score = excluded.mastery_score,
+            next_review_at = excluded.next_review_at
+        """,
+        (
+            session_id,
+            kp,
+            attempt_count,
+            correct_count,
+            recent_wrong_streak,
+            recent_correct_streak,
+            ts,
+            last_correct_at,
+            last_wrong_at,
+            mastery_score,
+            None,
+        ),
+    )
+    return {
+        "knowledge_point": kp,
+        "attempt_count": attempt_count,
+        "correct_count": correct_count,
+        "recent_wrong_streak": recent_wrong_streak,
+        "recent_correct_streak": recent_correct_streak,
+        "last_seen_at": ts,
+        "last_correct_at": last_correct_at,
+        "last_wrong_at": last_wrong_at,
+        "mastery_score": mastery_score,
+    }
+
+
+def _rebuild_mastery_for_session_sync(db: str, session_id: str) -> int:
+    """按历史练习重建会话 mastery，保证删改记录后的一致性。"""
+    conn = sqlite3.connect(db)
+    try:
+        rows = conn.execute(
+            """
+            SELECT knowledge_point, question_content, is_correct, created_at
+            FROM practice_records
+            WHERE session_id = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (session_id,),
+        ).fetchall()
+
+        conn.execute("DELETE FROM knowledge_mastery WHERE session_id = ?", (session_id,))
+        if not rows:
+            conn.commit()
+            return 0
+
+        for raw_kp, question_content, is_correct, created_at in rows:
+            kp = _normalize_mastery_knowledge_point(
+                str(raw_kp or ""),
+                question_content=str(question_content or ""),
+            )
+            _upsert_mastery_row_sync(
+                conn,
+                session_id=session_id,
+                knowledge_point=kp,
+                is_correct=bool(is_correct),
+                event_ts=_safe_unix_ts(created_at),
+            )
+        conn.commit()
+        return int(conn.execute("SELECT COUNT(*) FROM knowledge_mastery WHERE session_id = ?", (session_id,)).fetchone()[0] or 0)
     finally:
         conn.close()
 
@@ -828,6 +1057,56 @@ class SessionMemoryManager:
             # 兜底：写入失败时再尝试同步一次
             task()
 
+    def add_practice_record_sync(self, session_id: str, question_id: str, question_content: str,
+                                 knowledge_point: str, user_answer: str, correct_answer: str,
+                                 is_correct: bool, wrong_reason: str = None):
+        """同步写入练习并更新 mastery，便于提交接口拿到确定结果。"""
+        _add_practice_record_sync(
+            self.db,
+            session_id=session_id,
+            question_id=question_id,
+            question_content=question_content,
+            knowledge_point=knowledge_point,
+            user_answer=user_answer,
+            correct_answer=correct_answer,
+            is_correct=is_correct,
+            wrong_reason=wrong_reason,
+        )
+
+    def upsert_mastery_from_practice_record(
+        self,
+        session_id: str,
+        knowledge_point: str,
+        *,
+        is_correct: bool,
+        event_ts: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """单独更新 mastery（兼容后续链路单独调用）。"""
+        conn = sqlite3.connect(self.db)
+        try:
+            row = _upsert_mastery_row_sync(
+                conn,
+                session_id=str(session_id or "").strip() or "default",
+                knowledge_point=_normalize_mastery_knowledge_point(str(knowledge_point or "")),
+                is_correct=bool(is_correct),
+                event_ts=_safe_unix_ts(event_ts),
+            )
+            conn.commit()
+            return _compose_mastery_view(
+                knowledge_point=row["knowledge_point"],
+                attempt_count=row["attempt_count"],
+                correct_count=row["correct_count"],
+                recent_wrong_streak=row["recent_wrong_streak"],
+                recent_correct_streak=row["recent_correct_streak"],
+                last_seen_at=row["last_seen_at"],
+                last_correct_at=row["last_correct_at"],
+                last_wrong_at=row["last_wrong_at"],
+                stored_mastery_score=row["mastery_score"],
+                now_ts=row["last_seen_at"],
+            )
+        finally:
+            conn.close()
+
     def get_practice_history(self, session_id: str, limit: int = 20) -> List[Dict]:
         """获取练习历史"""
         conn = sqlite3.connect(self.db)
@@ -857,6 +1136,7 @@ class SessionMemoryManager:
 
     def delete_practice_record(self, session_id: str, record_id: int) -> bool:
         """删除一条练习记录"""
+        deleted = False
         conn = sqlite3.connect(self.db)
         try:
             cur = conn.execute(
@@ -864,12 +1144,19 @@ class SessionMemoryManager:
                 (session_id, int(record_id)),
             )
             conn.commit()
-            return int(cur.rowcount or 0) > 0
+            deleted = int(cur.rowcount or 0) > 0
         finally:
             conn.close()
+        if deleted:
+            try:
+                _rebuild_mastery_for_session_sync(self.db, session_id)
+            except Exception as e:
+                logger.warning(f"[Mastery] 删除练习后重建失败 session={session_id}: {e}")
+        return deleted
 
     def clear_practice_history(self, session_id: str) -> int:
         """清空会话下所有练习记录，返回删除条数"""
+        deleted = 0
         conn = sqlite3.connect(self.db)
         try:
             cur = conn.execute(
@@ -877,9 +1164,15 @@ class SessionMemoryManager:
                 (session_id,),
             )
             conn.commit()
-            return int(cur.rowcount or 0)
+            deleted = int(cur.rowcount or 0)
         finally:
             conn.close()
+        if deleted > 0:
+            try:
+                _rebuild_mastery_for_session_sync(self.db, session_id)
+            except Exception as e:
+                logger.warning(f"[Mastery] 清空练习后重建失败 session={session_id}: {e}")
+        return deleted
 
     def backfill_practice_knowledge_points(
         self,
@@ -889,6 +1182,8 @@ class SessionMemoryManager:
     ) -> Dict[str, int]:
         """回填练习记录考点字段，修复历史脏数据（支持 dry-run）。"""
         safe_limit = max(1, min(int(limit or 2000), 20000))
+        should_rebuild_mastery = False
+        result: Dict[str, int] = {}
         conn = sqlite3.connect(self.db)
         try:
             rows = conn.execute(
@@ -924,8 +1219,9 @@ class SessionMemoryManager:
                 )
                 conn.commit()
                 updated = int(len(candidates))
+                should_rebuild_mastery = True
 
-            return {
+            result = {
                 "scanned": int(scanned),
                 "candidate_updates": int(len(candidates)),
                 "updated": int(updated),
@@ -934,6 +1230,12 @@ class SessionMemoryManager:
             }
         finally:
             conn.close()
+        if should_rebuild_mastery:
+            try:
+                _rebuild_mastery_for_session_sync(self.db, session_id)
+            except Exception as e:
+                logger.warning(f"[Mastery] 回填后重建失败 session={session_id}: {e}")
+        return result
 
     def get_knowledge_point_stats(self, session_id: str) -> Dict[str, Dict]:
         """获取知识点统计：每个知识点的练习次数、正确率"""
@@ -969,6 +1271,85 @@ class SessionMemoryManager:
                     "weak": (correct / total < 0.6) if total > 0 else False
                 }
             return stats
+        finally:
+            conn.close()
+
+    def get_mastery_snapshot(
+        self,
+        session_id: str,
+        limit: int = 200,
+        *,
+        now_ts: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """返回会话 mastery 快照（包含动态遗忘衰减后的分数）。"""
+        safe_limit = max(1, min(int(limit or 200), 2000))
+        conn = sqlite3.connect(self.db)
+        try:
+            rows = conn.execute(
+                """
+                SELECT knowledge_point, attempt_count, correct_count, recent_wrong_streak,
+                       recent_correct_streak, last_seen_at, last_correct_at, last_wrong_at, mastery_score
+                FROM knowledge_mastery
+                WHERE session_id = ?
+                ORDER BY mastery_score ASC, last_seen_at ASC, attempt_count DESC, knowledge_point ASC
+                LIMIT ?
+                """,
+                (session_id, safe_limit),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        snapshot = [
+            _compose_mastery_view(
+                knowledge_point=str(row[0] or ""),
+                attempt_count=int(row[1] or 0),
+                correct_count=int(row[2] or 0),
+                recent_wrong_streak=int(row[3] or 0),
+                recent_correct_streak=int(row[4] or 0),
+                last_seen_at=int(row[5] or 0),
+                last_correct_at=int(row[6]) if row[6] is not None else None,
+                last_wrong_at=int(row[7]) if row[7] is not None else None,
+                stored_mastery_score=float(row[8] or 0.0),
+                now_ts=now_ts,
+            )
+            for row in rows
+        ]
+        snapshot.sort(
+            key=lambda item: (
+                float(item.get("mastery_score", 1.0)),
+                -int(item.get("recent_wrong_streak", 0)),
+                -float(item.get("days_since_last_seen", 0.0)),
+                -int(item.get("attempt_count", 0)),
+                str(item.get("knowledge_point", "")),
+            )
+        )
+        return snapshot
+
+    def get_priority_review_points(
+        self,
+        session_id: str,
+        limit: int = 10,
+        *,
+        now_ts: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """返回优先复习考点（按 mastery+错误连击+时效性排序）。"""
+        safe_limit = max(1, min(int(limit or 10), 100))
+        candidates = self.get_mastery_snapshot(
+            session_id=session_id,
+            limit=max(safe_limit * 4, 80),
+            now_ts=now_ts,
+        )
+        return candidates[:safe_limit]
+
+    def get_mastery_rows_count(self, session_id: str) -> int:
+        """返回当前会话 mastery 行数（用于指标观测）。"""
+        conn = sqlite3.connect(self.db)
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM knowledge_mastery WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return int((row[0] if row else 0) or 0)
         finally:
             conn.close()
 
@@ -1267,12 +1648,21 @@ def _add_practice_record_sync(db: str, session_id: str, question_id: str, questi
     """同步写入一条练习记录"""
     conn = sqlite3.connect(db)
     try:
+        normalized_kp = _normalize_mastery_knowledge_point(knowledge_point, question_content)
+        event_ts = _safe_unix_ts()
         conn.execute("""
             INSERT INTO practice_records (session_id, question_id, question_content, knowledge_point,
                                          user_answer, correct_answer, is_correct, wrong_reason, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (session_id, question_id, question_content, knowledge_point,
-              user_answer, correct_answer, int(is_correct), wrong_reason, int(time.time())))
+        """, (session_id, question_id, question_content, normalized_kp,
+              user_answer, correct_answer, int(is_correct), wrong_reason, event_ts))
+        _upsert_mastery_row_sync(
+            conn,
+            session_id=session_id,
+            knowledge_point=normalized_kp,
+            is_correct=bool(is_correct),
+            event_ts=event_ts,
+        )
         conn.commit()
     finally:
         conn.close()
