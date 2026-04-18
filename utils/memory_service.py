@@ -1285,16 +1285,15 @@ class SessionMemoryManager:
         safe_limit = max(1, min(int(limit or 200), 2000))
         conn = sqlite3.connect(self.db)
         try:
+            # 不能先按 stored_score + LIMIT 截断，否则会漏掉“久未复习导致动态分下降”的考点。
             rows = conn.execute(
                 """
                 SELECT knowledge_point, attempt_count, correct_count, recent_wrong_streak,
                        recent_correct_streak, last_seen_at, last_correct_at, last_wrong_at, mastery_score
                 FROM knowledge_mastery
                 WHERE session_id = ?
-                ORDER BY mastery_score ASC, last_seen_at ASC, attempt_count DESC, knowledge_point ASC
-                LIMIT ?
                 """,
-                (session_id, safe_limit),
+                (session_id,),
             ).fetchall()
         finally:
             conn.close()
@@ -1323,7 +1322,7 @@ class SessionMemoryManager:
                 str(item.get("knowledge_point", "")),
             )
         )
-        return snapshot
+        return snapshot[:safe_limit]
 
     def get_priority_review_points(
         self,

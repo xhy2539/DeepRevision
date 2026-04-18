@@ -1838,7 +1838,9 @@ async def submit_practice_records(req: PracticeSubmitRequest = Body(...)):
             kp_key = f"{str(record.knowledge_point or '')}|||{str(record.question_content or '')[:160]}"
             normalized_kp = kp_map.get(kp_key) or _extract_kp_rule(record.knowledge_point or "", record.question_content or "")
             try:
-                memory_manager.add_practice_record_sync(
+                # 在工作线程里执行同步写库，避免阻塞当前事件循环。
+                await asyncio.to_thread(
+                    memory_manager.add_practice_record_sync,
                     session_id=session_id,
                     question_id=qid,
                     question_content=record.question_content,
