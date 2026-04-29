@@ -62,6 +62,7 @@ from agent.multi_agent.quiz_normalization import (
     normalize_list_of_dicts as _normalize_list_of_dicts,
     normalize_reasoning_payload as _normalize_reasoning_payload,
     normalize_options as _normalize_options,
+    normalize_question_type as _normalize_question_type,
     normalize_question_item as _normalize_question_item,
     normalize_questions_payload as _normalize_questions_payload,
     sanitize_quiz_questions_for_delivery as _sanitize_quiz_questions_for_delivery,
@@ -915,8 +916,9 @@ def _quiz_quality_floor_flags(questions: List[dict], expected_type: str, expecte
     seen = set()
     duplicates = False
 
+    expected_type = _normalize_question_type(expected_type, "选择题")
     for q in questions:
-        qtype = str((q or {}).get("type") or "").strip() or expected_type or "选择题"
+        qtype = _normalize_question_type((q or {}).get("type"), expected_type or "选择题")
         if expected_type and qtype != expected_type:
             type_ok = False
         ans = str((q or {}).get("answer") or "").strip()
@@ -2978,6 +2980,7 @@ async def run_quiz_agent(
     流程：出题+推理链 → Critic质疑推理链 → Revise针对批评修订（最多2轮）
     """
     quiz_started_at = time.monotonic()
+    quiz_type = _normalize_question_type(quiz_type, "选择题")
     # 检索入口策略：泛化请求走综合检索，具体考点走常规检索。
     if _is_generic_topic_request(topic):
         rag_context = await _get_comprehensive_rag_context(topic)
@@ -3217,10 +3220,49 @@ async def run_quiz_agent(
         rag_context=rag_context,
         target_num=max(1, int(num)),
     )
+
+    floor_flags = _quiz_quality_floor_flags(parsed_questions, quiz_type, num)
+    if quiz_type == "选择题" and not bool(floor_flags.get("options_ok")):
+        logger.warning("[Quiz Agent] 选择题缺少选项，尝试课件锚定兜底替换")
+        anchored_fallback, anchored_reason = _build_retrieval_anchored_fallback_questions(
+            quiz_type=quiz_type,
+            num=max(1, int(num)),
+            start_num=1,
+            topic=topic or "本课程重点内容",
+            courseware_context=rag_context,
+            score_per_question=5,
+        )
+        if anchored_fallback:
+            parsed_questions = _dedupe_quiz_questions_across_rounds(
+                questions=anchored_fallback,
+                forbidden_question_signatures=forbidden_question_signatures,
+                quiz_type=quiz_type,
+                topic=topic,
+                rag_context=rag_context,
+                target_num=max(1, int(num)),
+            )
+            floor_flags = _quiz_quality_floor_flags(parsed_questions, quiz_type, num)
+            result = {**result, "delivery_mode": "partial_revised", "degrade_reason": "missing_choice_options_repaired"}
+        if not bool(floor_flags.get("options_ok")):
+            return {
+                "kind": "chat",
+                "render_mode": "markdown",
+                "text": f"本次选择题生成缺少完整选项，已停止交付题卡。{anchored_reason or '请换一个更具体的知识点后重试。'}",
+                "payload": {},
+                "meta": {
+                    "delivery_mode": "failed",
+                    "degrade_reason": "missing_choice_options",
+                    "quality_floor_passed": False,
+                    "evidence_source": evidence_source,
+                    "tool_calls": {"rag": 1, "web": 1 if web_context else 0},
+                    "quiz_end_to_end_ms": int((time.monotonic() - quiz_started_at) * 1000),
+                    "tool_gate_reason": gate_reason,
+                },
+            }
+
     final_payload = _build_quiz_payload(topic, parsed_questions)
     final_text = _build_quiz_text_from_questions(parsed_questions)
 
-    floor_flags = _quiz_quality_floor_flags(parsed_questions, quiz_type, num)
     term_style_ok = all(_question_term_style_ok(q) for q in parsed_questions)
     delivery_mode = result.get("delivery_mode") or ("full" if floor_flags.get("quality_floor_passed") else "partial_revised")
     degrade_reason = result.get("degrade_reason") or ("" if floor_flags.get("quality_floor_passed") else "budget_exhausted")

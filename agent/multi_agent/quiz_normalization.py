@@ -1,6 +1,34 @@
 import re
 from typing import Any, List, Optional
 
+_QUESTION_TYPE_ALIASES = {
+    "choice": "选择题",
+    "single_choice": "选择题",
+    "multiple_choice": "选择题",
+    "选择": "选择题",
+    "选择题": "选择题",
+    "fill": "填空题",
+    "blank": "填空题",
+    "填空": "填空题",
+    "填空题": "填空题",
+    "judge": "判断题",
+    "true_false": "判断题",
+    "判断": "判断题",
+    "判断题": "判断题",
+    "essay": "简答题",
+    "short": "简答题",
+    "short_answer": "简答题",
+    "简答": "简答题",
+    "简答题": "简答题",
+}
+
+
+def normalize_question_type(value: Any, default: str = "选择题") -> str:
+    """统一题型别名，避免英文 type 绕过选择题质量门。"""
+    raw = normalize_text_field(value, default)
+    key = raw.strip().lower()
+    return _QUESTION_TYPE_ALIASES.get(key, _QUESTION_TYPE_ALIASES.get(raw, raw or default))
+
 
 def normalize_text_field(value: Any, default: str = "") -> str:
     if value is None:
@@ -146,7 +174,7 @@ def normalize_question_item(item: Any, fallback_id: int) -> dict:
         item = {"question": str(item).strip()}
     return {
         "id": normalize_int_field(item.get("id"), fallback_id),
-        "type": normalize_text_field(item.get("type"), "选择题"),
+        "type": normalize_question_type(item.get("type"), "选择题"),
         "question": sanitize_user_visible_text(
             sanitize_question_text(normalize_text_field(item.get("question") or item.get("content"), ""))
         ),
@@ -174,7 +202,7 @@ def sanitize_quiz_questions_for_delivery(questions: Any) -> List[dict]:
         item["question"] = sanitize_user_visible_text(normalize_text_field(item.get("question"), ""))
         item["answer"] = sanitize_user_visible_text(normalize_text_field(item.get("answer"), ""))
         item["explanation"] = sanitize_user_visible_text(normalize_text_field(item.get("explanation"), ""))
-        qtype = str(item.get("type") or "").strip() or "选择题"
+        qtype = normalize_question_type(item.get("type"), "选择题")
         item["type"] = qtype
         if qtype == "选择题":
             opts = normalize_options(item.get("options")) or []
@@ -190,7 +218,7 @@ def normalize_exam_question_item(item: Any, fallback_id: int) -> dict:
         item = {"content": str(item).strip()}
     return {
         "id": normalize_int_field(item.get("id") or item.get("number"), fallback_id),
-        "type": normalize_text_field(item.get("type"), "选择题"),
+        "type": normalize_question_type(item.get("type"), "选择题"),
         "content": sanitize_question_text(normalize_text_field(item.get("content") or item.get("question"), "")),
         "options": normalize_options(item.get("options")),
         "answer": normalize_text_field(item.get("answer"), ""),
@@ -237,4 +265,3 @@ def normalize_addressed_issues(value: Any) -> List[str]:
         if text:
             normalized.append(text)
     return normalized
-

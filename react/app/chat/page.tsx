@@ -636,10 +636,24 @@ function parseQuizContent(content: string): {
 // 题型样式映射
 const quizTypeStyles: Record<string, { tag: string; border: string; bg: string }> = {
   "选择题": { tag: "quiz-tag-choice", border: "border-l-blue-500", bg: "bg-blue-50" },
+  "choice": { tag: "quiz-tag-choice", border: "border-l-blue-500", bg: "bg-blue-50" },
   "填空题": { tag: "quiz-tag-fill", border: "border-l-green-500", bg: "bg-green-50" },
   "判断题": { tag: "quiz-tag-judge", border: "border-l-orange-500", bg: "bg-orange-50" },
   "简答题": { tag: "quiz-tag-short", border: "border-l-purple-500", bg: "bg-purple-50" },
 };
+
+function normalizeQuizTypeLabel(type: string | undefined): string {
+  const raw = String(type || "").trim().toLowerCase();
+  if (raw === "choice" || raw === "single_choice" || raw === "选择") return "选择题";
+  if (raw === "fill" || raw === "blank" || raw === "填空") return "填空题";
+  if (raw === "judge" || raw === "true_false" || raw === "判断") return "判断题";
+  if (raw === "essay" || raw === "short" || raw === "short_answer" || raw === "简答") return "简答题";
+  return String(type || "选择题").trim() || "选择题";
+}
+
+function isChoiceQuestionType(type: string | undefined): boolean {
+  return normalizeQuizTypeLabel(type) === "选择题";
+}
 
 /** 清理选项前缀（A./A、 等），用于统一展示与判分。 */
 function stripChoiceOptionPrefix(text: string): string {
@@ -675,6 +689,7 @@ function QuizCard({
   const [selectedAnswers, setSelectedAnswers] = useState<Record<number, string>>({});
   const [submitted, setSubmitted] = useState(false);
   const [score, setScore] = useState(0);
+  const hasInvalidChoiceQuestion = questions.some((q) => isChoiceQuestionType(q.type) && (!q.options || q.options.length < 2));
 
   const normalizeAnswer = (a: string) => a.trim().replace(/\s+/g, " ").toUpperCase();
 
@@ -735,21 +750,21 @@ function QuizCard({
   };
 
   return (
-    <div className="space-y-4 my-4">
+    <div className="my-2 space-y-3">
       {/* 工具栏 */}
-      <div className="flex justify-between items-center mb-2">
+      <div className="flex items-center justify-end gap-2">
         {practiceMode ? (
-          <div className="flex gap-2">
+          <div className="mr-auto flex gap-2">
             <button
               onClick={submitPractice}
               disabled={submitted}
-              className="text-sm px-4 py-1.5 rounded-lg bg-teal-600 hover:bg-teal-700 disabled:bg-slate-300 text-white transition-colors"
+              className="rounded-full bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-slate-700 disabled:bg-slate-300"
             >
               提交答案
             </button>
             {submitted && (
-              <span className="text-sm py-1.5 px-3 rounded-lg bg-slate-100 text-slate-700 font-medium">
-                得分: {score}/{questions.length}
+              <span className="rounded-full bg-slate-100 px-3 py-1.5 text-xs font-medium text-slate-700">
+                {score}/{questions.length}
               </span>
             )}
           </div>
@@ -760,7 +775,9 @@ function QuizCard({
           {!practiceMode && !submitted && (
             <button
               onClick={startPractice}
-              className="text-sm px-3 py-1.5 rounded-lg border border-teal-400 bg-teal-50 hover:bg-teal-100 text-teal-700 transition-colors"
+              disabled={hasInvalidChoiceQuestion}
+              title={hasInvalidChoiceQuestion ? "选择题缺少选项，请重新生成" : "开始练习"}
+              className="rounded-full border border-teal-300 bg-teal-50 px-3 py-1.5 text-xs font-semibold text-teal-700 transition-colors hover:bg-teal-100 disabled:cursor-not-allowed disabled:opacity-45"
             >
               开始练习
             </button>
@@ -768,7 +785,7 @@ function QuizCard({
           {!practiceMode && (
             <button
               onClick={() => setShowAnswers(!showAnswers)}
-              className="text-sm px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-600 transition-colors flex items-center gap-1"
+              className="flex items-center gap-1 rounded-full border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition-colors hover:bg-slate-50"
             >
               <span>{showAnswers ? "隐藏答案" : "查看答案"}</span>
             </button>
@@ -777,26 +794,27 @@ function QuizCard({
       </div>
 
       {questions.map((q, idx) => {
-        const style = quizTypeStyles[q.type] || quizTypeStyles["选择题"];
+        const qTypeLabel = normalizeQuizTypeLabel(q.type);
+        const style = quizTypeStyles[qTypeLabel] || quizTypeStyles["选择题"];
         const userAnswer = selectedAnswers[idx];
 
         return (
           <div
             key={idx}
-            className="quiz-card border border-slate-200 rounded-xl p-5 bg-white shadow-sm hover:shadow-md transition-shadow"
+            className="quiz-card rounded-2xl border border-slate-200/80 bg-white p-4 shadow-[0_8px_24px_rgba(15,23,42,0.05)] transition-shadow hover:shadow-[0_12px_30px_rgba(15,23,42,0.08)]"
             style={{ "--card-index": idx } as React.CSSProperties}
           >
-            <div className="flex items-center justify-between mb-3">
+            <div className="mb-3 flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <span className={`text-xs px-2.5 py-1 rounded-full font-medium border ${style.tag}`}>{q.type}</span>
-                <span className="text-sm font-medium text-slate-500">第 {idx + 1} 题</span>
+                <span className={`rounded-full border px-2.5 py-0.5 text-[11px] font-medium ${style.tag}`}>{qTypeLabel}</span>
+                <span className="text-xs font-medium text-slate-500">第 {idx + 1} 题</span>
               </div>
-              <div className="flex items-center gap-3">
+              <div className="flex items-center gap-2">
                 {q.score && (
-                  <span className="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-medium">{q.score}</span>
+                  <span className="rounded bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-600">{q.score}</span>
                 )}
                 {q.difficulty && (
-                  <span className={`text-xs px-2 py-0.5 rounded font-medium ${
+                  <span className={`rounded px-2 py-0.5 text-[11px] font-medium ${
                     q.difficulty === '简单' ? 'bg-green-100 text-green-700' :
                     q.difficulty === '中等' ? 'bg-yellow-100 text-yellow-700' :
                     ['较难', '困难'].includes(q.difficulty) ? 'bg-red-100 text-red-700' :
@@ -806,10 +824,10 @@ function QuizCard({
               </div>
             </div>
 
-            <div className="text-slate-800 mb-4 whitespace-pre-wrap text-[15px] leading-relaxed font-medium">{q.question}</div>
+            <div className="mb-4 whitespace-pre-wrap text-[15px] font-medium leading-relaxed text-slate-800">{q.question}</div>
 
             {/* 选择题选项 */}
-            {q.options && q.options.length > 0 && (
+            {isChoiceQuestionType(q.type) && q.options && q.options.length > 0 && (
               <div className="space-y-2 mb-4 ml-1">
                 {q.options.map((opt, optIdx) => {
                   const optLetter = String.fromCharCode(65 + optIdx);
@@ -850,8 +868,14 @@ function QuizCard({
               </div>
             )}
 
+            {isChoiceQuestionType(q.type) && (!q.options || q.options.length === 0) && (
+              <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                这道选择题缺少选项，已停止练习交互。请重新生成题目。
+              </div>
+            )}
+
             {/* 非选择题 */}
-            {(!q.options || q.options.length === 0) && q.type === "判断题" && (
+            {(!q.options || q.options.length === 0) && qTypeLabel === "判断题" && (
               <div className="flex gap-4 mb-4 ml-1">
                 {["正确", "错误"].map((opt, i) => {
                   const optKey = opt;
@@ -891,7 +915,7 @@ function QuizCard({
               </div>
             )}
 
-            {(!q.options || q.options.length === 0) && q.type === "填空题" && (
+            {(!q.options || q.options.length === 0) && qTypeLabel === "填空题" && (
               <div className="ml-1 mb-4">
                 <input
                   type="text"
@@ -3507,9 +3531,9 @@ ${sampleHint}
           <div
             ref={messageScrollRef}
             onScroll={handleMessageScroll}
-            className="flex-1 overflow-y-auto p-4 md:p-8 lg:p-10"
+            className="flex-1 overflow-y-auto px-4 py-5 md:px-6 lg:px-8"
           >
-            <div className="max-w-5xl mx-auto conversation-lane">
+            <div className="mx-auto max-w-4xl conversation-lane">
               <div className="mb-4 xl:hidden">
                 <LearningLoopPanel
                   stats={learningPracticeStats}
@@ -3597,7 +3621,7 @@ ${sampleHint}
                       <ThoughtChain thoughts={thoughts} />
                     )}
 
-                    <div className={`inline-block px-5 py-3.5 rounded-2xl shadow-sm message-bubble ${
+                    <div className={`inline-block max-w-full rounded-2xl px-4 py-3 shadow-sm message-bubble ${
                       message.role === "user"
                         ? "rounded-tr-md"
                         : "rounded-tl-md border"
@@ -3748,7 +3772,7 @@ ${sampleHint}
           </div>
 
           {/* 输入框 - 精致日式风格 */}
-          <div className="flex-none w-full pb-6 pt-4 px-4 composer-wrap">
+          <div className="flex-none w-full px-4 pb-5 pt-3 composer-wrap">
             <div className="max-w-3xl mx-auto w-full relative">
               <div className="relative flex items-end gap-3 rounded-2xl transition-all duration-300 composer-shell">
                 <div className="flex-1 relative">

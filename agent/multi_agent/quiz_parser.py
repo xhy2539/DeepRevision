@@ -6,6 +6,7 @@ from typing import Any, List
 from agent.multi_agent.quiz_normalization import (
     format_score,
     normalize_int_field,
+    normalize_question_type,
     normalize_text_field,
     sanitize_question_text,
     sanitize_user_visible_text,
@@ -15,7 +16,7 @@ from agent.multi_agent.quiz_normalization import (
 def build_quiz_text_from_questions(questions: List[dict]) -> str:
     lines: List[str] = []
     for index, question in enumerate(questions, start=1):
-        qtype = question.get("type") or "选择题"
+        qtype = normalize_question_type(question.get("type"), "选择题")
         score = question.get("score") or "5分"
         difficulty = question.get("difficulty") or "中等"
         lines.append(f"{index}.（{qtype}，分值：{score}，难度：{difficulty}）")
@@ -83,7 +84,7 @@ def parse_questions_from_serialized_quiz(text: str) -> List[dict]:
 
         normalized.append({
             "id": normalize_int_field(item.get("id") or item.get("question_number"), idx),
-            "type": normalize_text_field(item.get("type"), "选择题"),
+            "type": normalize_question_type(item.get("type"), "选择题"),
             "question": sanitize_user_visible_text(sanitize_question_text(question)),
             "options": options or None,
             "answer": sanitize_user_visible_text(normalize_text_field(item.get("answer"), "")),
@@ -101,4 +102,3 @@ def questions_from_quiz_text(text: str, topic: str) -> dict:
     if not questions:
         questions = parse_questions_from_serialized_quiz(text)
     return build_quiz_payload(topic, questions)
-
