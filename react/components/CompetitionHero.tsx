@@ -14,33 +14,34 @@ export default function CompetitionHero({
   backendReady,
 }: CompetitionHeroProps) {
   const items = [
-    { label: "当前课程", value: sessionName || "默认科目" },
-    { label: "学习闭环", value: `${totalAttempts} 次练习` },
-    { label: "薄弱点", value: `${weakCount} 个` },
-    { label: "mastery", value: `${masteryCount} 个考点` },
+    { label: "练习", value: totalAttempts },
+    { label: "薄弱", value: weakCount },
+    { label: "考点", value: masteryCount },
   ];
 
   return (
-    <section className="border-b border-teal-100 bg-gradient-to-r from-teal-50 via-white to-amber-50 px-4 py-3 md:px-8">
-      <div className="mx-auto flex max-w-6xl flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <div>
-          <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-teal-700">期末冲刺驾驶舱</div>
-          <h2 className="mt-1 text-sm font-bold text-slate-900">
-            课件证据 &gt; 出题判分 &gt; mastery 更新 &gt; 个性化复习计划
-          </h2>
+    <section className="border-b border-slate-200/70 bg-white/70 px-4 py-2 backdrop-blur md:px-6">
+      <div className="mx-auto flex max-w-7xl items-center justify-between gap-4">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="h-1.5 w-1.5 rounded-full bg-teal-500" />
+            <span className="text-[11px] font-semibold tracking-[0.16em] text-teal-700">期末冲刺</span>
+          </div>
+          <div className="mt-0.5 truncate text-xs font-semibold text-slate-800">
+            {sessionName || "默认科目"}
+          </div>
         </div>
-        <div className="grid grid-cols-2 gap-2 md:grid-cols-5">
+        <div className="flex shrink-0 items-center gap-4">
           {items.map((item) => (
-            <div key={item.label} className="rounded-xl border border-white/70 bg-white/75 px-3 py-2 shadow-sm">
-              <div className="text-[10px] text-slate-500">{item.label}</div>
-              <div className="mt-0.5 truncate text-xs font-bold text-slate-800">{item.value}</div>
+            <div key={item.label} className="text-right">
+              <div className="text-[10px] text-slate-400">{item.label}</div>
+              <div className="text-sm font-bold text-slate-900">{item.value}</div>
             </div>
           ))}
-          <div className="rounded-xl border border-white/70 bg-white/75 px-3 py-2 shadow-sm">
-            <div className="text-[10px] text-slate-500">服务状态</div>
-            <div className={`mt-0.5 text-xs font-bold ${backendReady ? "text-emerald-700" : "text-red-600"}`}>
-              {backendReady ? "已连接" : "未连接"}
-            </div>
+          <div className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${
+            backendReady ? "bg-emerald-50 text-emerald-700" : "bg-red-50 text-red-600"
+          }`}>
+            {backendReady ? "在线" : "离线"}
           </div>
         </div>
       </div>

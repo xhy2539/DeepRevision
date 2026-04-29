@@ -3861,8 +3861,8 @@ ${sampleHint}
           </div>
         </div>
 
-        <aside className="hidden w-[22rem] shrink-0 border-l border-teal-100 bg-white/70 p-4 xl:block">
-          <div className="sticky top-4 space-y-4">
+        <aside className="hidden w-[20rem] shrink-0 border-l border-slate-200/70 bg-slate-50/50 p-4 xl:block">
+          <div className="sticky top-4">
             <LearningLoopPanel
               stats={learningPracticeStats}
               masteryCount={masterySnapshot.length}
@@ -3870,12 +3870,6 @@ ${sampleHint}
               disabled={isLoading}
               onSendPrompt={(prompt) => void sendMessage(prompt)}
             />
-            <div className="rounded-2xl border border-slate-100 bg-white/90 p-4 text-xs text-slate-600 shadow-sm">
-              <div className="font-semibold text-slate-800">演示提示</div>
-              <div className="mt-2 leading-relaxed">
-                先让系统基于课件回答，再出题并提交错题。右侧会同步显示 mastery 和优先复习点，随后可一键生成 3 天复习计划。
-              </div>
-            </div>
           </div>
         </aside>
       </main>
