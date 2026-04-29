@@ -945,6 +945,28 @@ def _quiz_quality_floor_flags(questions: List[dict], expected_type: str, expecte
     }
 
 
+def _final_quiz_delivery_state(result: dict, floor_flags: dict, term_style_ok: bool) -> Tuple[str, str, bool]:
+    """根据最终质检结果决定是否允许交付题卡。"""
+    result = result or {}
+    floor_flags = floor_flags or {}
+    result_mode = str(result.get("delivery_mode") or "").strip()
+    result_reason = str(result.get("degrade_reason") or "").strip()
+    quality_ok = bool(floor_flags.get("quality_floor_passed")) and bool(term_style_ok)
+    if quality_ok:
+        return result_mode or "full", result_reason, True
+
+    failed_reasons: List[str] = []
+    for key in ("quantity_ok", "type_ok", "answer_ok", "options_ok"):
+        if key in floor_flags and not bool(floor_flags.get(key)):
+            failed_reasons.append(key)
+    if floor_flags.get("duplicates"):
+        failed_reasons.append("duplicates")
+    if not term_style_ok:
+        failed_reasons.append("term_style_violation")
+    reason = result_reason or ("quality_floor_not_passed:" + ",".join(failed_reasons or ["unknown"]))
+    return "failed", reason, False
+
+
 def _dedupe_quiz_questions_across_rounds(
     questions: List[dict],
     forbidden_question_signatures: Optional[List[str]],
@@ -3137,14 +3159,37 @@ async def run_quiz_agent(
         payload = _build_quiz_payload(topic, questions)
         floor_flags = _quiz_quality_floor_flags(questions, quiz_type, num)
         term_style_ok = all(_question_term_style_ok(q) for q in questions)
+        delivery_mode, degrade_reason, can_deliver = _final_quiz_delivery_state(
+            {"delivery_mode": "partial_revised", "degrade_reason": "budget_exhausted"},
+            floor_flags,
+            term_style_ok,
+        )
+        if not can_deliver:
+            return {
+                "kind": "chat",
+                "render_mode": "markdown",
+                "text": f"本次出题未达到交付质量要求，已停止交付题卡。原因：{degrade_reason}。请换一个更具体的知识点后重试。",
+                "payload": {},
+                "meta": {
+                    "delivery_mode": delivery_mode,
+                    "degrade_reason": degrade_reason,
+                    "quality_floor_passed": False,
+                    "quality_floor_flags": floor_flags,
+                    "evidence_source": evidence_source,
+                    "tool_calls": {"rag": 1, "web": 1 if web_context else 0},
+                    "quiz_end_to_end_ms": int((time.monotonic() - quiz_started_at) * 1000),
+                    "tool_gate_reason": gate_reason,
+                    "term_style_ok": term_style_ok,
+                },
+            }
         return {
             "kind": "quiz_set",
             "render_mode": "interactive_cards",
             "text": _build_quiz_text_from_questions(questions),
             "payload": payload,
             "meta": {
-                "delivery_mode": "partial_revised",
-                "degrade_reason": "budget_exhausted",
+                "delivery_mode": delivery_mode,
+                "degrade_reason": degrade_reason,
                 "quality_floor_passed": bool(floor_flags.get("quality_floor_passed")),
                 "evidence_source": evidence_source,
                 "tool_calls": {"rag": 1, "web": 1 if web_context else 0},
@@ -3265,11 +3310,25 @@ async def run_quiz_agent(
     final_text = _build_quiz_text_from_questions(parsed_questions)
 
     term_style_ok = all(_question_term_style_ok(q) for q in parsed_questions)
-    delivery_mode = result.get("delivery_mode") or ("full" if floor_flags.get("quality_floor_passed") else "partial_revised")
-    degrade_reason = result.get("degrade_reason") or ("" if floor_flags.get("quality_floor_passed") else "budget_exhausted")
-    if not term_style_ok:
-        delivery_mode = "partial_revised"
-        degrade_reason = degrade_reason or "term_style_violation"
+    delivery_mode, degrade_reason, can_deliver = _final_quiz_delivery_state(result, floor_flags, term_style_ok)
+    if not can_deliver:
+        return {
+            "kind": "chat",
+            "render_mode": "markdown",
+            "text": f"本次出题未达到交付质量要求，已停止交付题卡。原因：{degrade_reason}。请换一个更具体的知识点后重试。",
+            "payload": {},
+            "meta": {
+                "delivery_mode": delivery_mode,
+                "degrade_reason": degrade_reason,
+                "quality_floor_passed": False,
+                "quality_floor_flags": floor_flags,
+                "evidence_source": evidence_source,
+                "tool_calls": {"rag": 1, "web": 1 if web_context else 0},
+                "quiz_end_to_end_ms": int((time.monotonic() - quiz_started_at) * 1000),
+                "tool_gate_reason": gate_reason,
+                "term_style_ok": term_style_ok,
+            },
+        }
     if (not ALLOW_DEGRADED_DELIVERY) and (delivery_mode != "full" or degrade_reason):
         raise RuntimeError(f"本次出题未达严格质量要求（delivery_mode={delivery_mode}, reason={degrade_reason or 'quality_floor_not_passed'}），已禁止降级交付，请重试。")
     end_to_end_ms = int((time.monotonic() - quiz_started_at) * 1000)

@@ -644,7 +644,7 @@ const quizTypeStyles: Record<string, { tag: string; border: string; bg: string }
 
 function normalizeQuizTypeLabel(type: string | undefined): string {
   const raw = String(type || "").trim().toLowerCase();
-  if (raw === "choice" || raw === "single_choice" || raw === "选择") return "选择题";
+  if (raw === "choice" || raw === "single_choice" || raw === "multiple_choice" || raw === "选择") return "选择题";
   if (raw === "fill" || raw === "blank" || raw === "填空") return "填空题";
   if (raw === "judge" || raw === "true_false" || raw === "判断") return "判断题";
   if (raw === "essay" || raw === "short" || raw === "short_answer" || raw === "简答") return "简答题";
@@ -689,7 +689,7 @@ function QuizCard({
   const [selectedAnswers, setSelectedAnswers] = useState<Record<number, string>>({});
   const [submitted, setSubmitted] = useState(false);
   const [score, setScore] = useState(0);
-  const hasInvalidChoiceQuestion = questions.some((q) => isChoiceQuestionType(q.type) && (!q.options || q.options.length < 2));
+  const hasInvalidChoiceQuestion = questions.some((q) => isChoiceQuestionType(q.type) && (!q.options || q.options.length < 4));
 
   const normalizeAnswer = (a: string) => a.trim().replace(/\s+/g, " ").toUpperCase();
 
@@ -868,9 +868,9 @@ function QuizCard({
               </div>
             )}
 
-            {isChoiceQuestionType(q.type) && (!q.options || q.options.length === 0) && (
+            {isChoiceQuestionType(q.type) && (!q.options || q.options.length < 4) && (
               <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
-                这道选择题缺少选项，已停止练习交互。请重新生成题目。
+                这道选择题选项不足 4 个，已停止练习交互。请重新生成题目。
               </div>
             )}
 
