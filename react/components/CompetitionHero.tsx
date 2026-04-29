@@ -23,11 +23,7 @@ export default function CompetitionHero({
     <section className="border-b border-slate-200/70 bg-white/70 px-4 py-2 backdrop-blur md:px-6">
       <div className="mx-auto flex max-w-7xl items-center justify-between gap-4">
         <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <span className="h-1.5 w-1.5 rounded-full bg-teal-500" />
-            <span className="text-[11px] font-semibold tracking-[0.16em] text-teal-700">期末冲刺</span>
-          </div>
-          <div className="mt-0.5 truncate text-xs font-semibold text-slate-800">
+          <div className="truncate text-xs font-semibold text-slate-800">
             {sessionName || "默认科目"}
           </div>
         </div>
