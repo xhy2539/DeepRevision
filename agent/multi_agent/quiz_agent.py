@@ -1122,14 +1122,14 @@ def _quick_quiz_quality_check(state: QuizState) -> Optional[dict]:
         return None
 
     expected_num = int(state.get("num", 0) or 0)
-    expected_type = str(state.get("quiz_type") or "").strip()
+    expected_type = _normalize_question_type(state.get("quiz_type"), "选择题")
     quantity_ok = (expected_num <= 0) or (len(questions) == expected_num)
     type_ok = True
     options_ok = True
     answer_ok = True
 
     for q in questions:
-        qtype = str((q or {}).get("type") or "")
+        qtype = _normalize_question_type((q or {}).get("type"), expected_type or "选择题")
         if expected_type and qtype and qtype != expected_type:
             type_ok = False
         if qtype == "选择题":
@@ -1506,7 +1506,7 @@ def _coerce_structured_payload(parsed: dict, schema: type[BaseModel]) -> dict:
 
 
 def _normalize_exam_question(question: dict, fallback_number: int) -> dict:
-    qtype = question.get("type") or "选择题"
+    qtype = _normalize_question_type(question.get("type"), "选择题")
     score = int(question.get("score") or (2 if qtype in {"选择题", "填空题", "判断题"} else 10))
     content = _sanitize_user_visible_text(question.get("content") or question.get("question") or "")
     options = question.get("options") or None
@@ -1643,7 +1643,8 @@ def _normalize_exam_scores_to_target(
     normalized: List[dict] = []
     for q in questions:
         qq = dict(q)
-        qtype = qq.get("type") or "选择题"
+        qtype = _normalize_question_type(qq.get("type"), "选择题")
+        qq["type"] = qtype
         if qtype in score_map:
             qq["score"] = int(score_map[qtype])
         else:
@@ -1790,7 +1791,7 @@ def _shorten_stem_for_exam(stem: str, max_len: int = 90) -> str:
 
 
 def _stem_max_len_for_question(question: dict, index: int) -> int:
-    qtype = str((question or {}).get("type") or "")
+    qtype = _normalize_question_type((question or {}).get("type"), "选择题")
     diff = str((question or {}).get("difficulty") or "中等")
     if qtype == "选择题":
         base = 62 if diff in {"简单", "基础"} else (82 if diff in {"中等"} else 96)
@@ -1847,7 +1848,7 @@ def _enforce_concept_uniqueness(
         qq = dict(q)
         ckey = _concept_key_for_question(qq)
         if used_concepts.get(ckey, 0) >= 1:
-            qtype = qq.get("type") or "选择题"
+            qtype = _normalize_question_type(qq.get("type"), "选择题")
             candidate_topic = None
             for p in pool:
                 if p in used_topics:
@@ -1882,7 +1883,7 @@ def _rewrite_duplicate_question_locally(
     重复题本地改写：不依赖本地兜底开关，保证严格模式下也能主动消重。
     """
     q = dict(question or {})
-    qtype = str(q.get("type") or "选择题")
+    qtype = _normalize_question_type(q.get("type"), "选择题")
     topic = re.sub(r'\s+', '', str(topic_seed or "")).strip() or f"专题{idx}"
     if qtype == "选择题":
         stem = f"关于{topic}的关键机制，下列说法最准确的是哪一项？"
@@ -3756,7 +3757,7 @@ async def run_exam_agent(
         stage_critic_timeout_count = 0
 
         def _stage_for_question(q: dict) -> str:
-            qtype = str((q or {}).get("type") or "")
+            qtype = _normalize_question_type((q or {}).get("type"), "选择题")
             if qtype == "选择题":
                 return "choice"
             if qtype in {"填空题", "判断题"}:

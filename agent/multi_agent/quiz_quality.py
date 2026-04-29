@@ -1,7 +1,7 @@
 import re
 from typing import Dict, List, Optional
 
-from agent.multi_agent.quiz_normalization import contains_term_style_violation
+from agent.multi_agent.quiz_normalization import contains_term_style_violation, normalize_question_type
 from utils.logger_handler import logger
 
 TYPE_LABEL_TO_KEY = {
@@ -30,7 +30,7 @@ def question_signature(text: str) -> str:
 
 def question_dedup_key(question: dict) -> str:
     q = question or {}
-    qtype = str(q.get("type") or "选择题")
+    qtype = normalize_question_type(q.get("type"), "选择题")
     stem_sig = question_signature(str(q.get("content") or q.get("question") or ""))
     if qtype in {"填空题", "判断题"}:
         ans_sig = question_signature(str(q.get("answer") or ""))
@@ -51,7 +51,7 @@ def target_counts(quantity_dist: dict, fallback_questions: Optional[List[dict]] 
     if fallback_questions:
         inferred = {"choice": 0, "fill": 0, "judge": 0, "essay": 0}
         for q in fallback_questions:
-            key = TYPE_LABEL_TO_KEY.get(str((q or {}).get("type") or ""))
+            key = TYPE_LABEL_TO_KEY.get(normalize_question_type((q or {}).get("type"), "选择题"))
             if key in inferred:
                 inferred[key] += 1
         if sum(inferred.values()) > 0:
@@ -143,7 +143,7 @@ def exam_quality_floor_flags(questions: List[dict], quantity_dist: dict, target_
     concept_seen: Dict[str, int] = {}
 
     for q in questions:
-        qtype = q.get("type") or "选择题"
+        qtype = normalize_question_type(q.get("type"), "选择题")
         key = TYPE_LABEL_TO_KEY.get(qtype)
         if key in counts:
             counts[key] += 1
