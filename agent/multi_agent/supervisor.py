@@ -122,6 +122,8 @@ SUPERVISOR_PROMPT = """你是【复习助手】的智能调度中心。
 7. "解释"、"什么是"、"概念"、"知识点" → rag
 8. 其他 → chitchat
 
+补充：像“每个课件都讲了什么/这份课件主要内容是什么/总结课件要点”属于内容理解，优先走 rag，不走 ops。
+
 ## 菜单选择理解（重要）：
 - 如果用户输入只是单个数字（1-9）或简单回复（如"第一个"、"第二个"）
 - 且历史对话中助手刚提供了带编号的选项菜单
@@ -488,6 +490,7 @@ def _build_ops_guard_reply(
     meta = {
         "ops_react": True,
         "ops_confirmation_required": True,
+        "danger_confirmation_required": True,
         "pending_tool": tool_name,
         "pending_args": pending_args,
         "required_confirmation_phrase": required_phrase,
@@ -559,6 +562,34 @@ def _ops_query_requires_tool(query: str) -> bool:
         or re.search(r"(删除|移除)\s*(课件|文件)", text)
         or re.search(r"(导出|下载|保存为|另存为)\s*(试卷|答案卷|答题卡|word|docx)", text, flags=re.IGNORECASE)
     )
+
+
+def _resolve_ops_deterministic_tool(query: str, session_id: str, limit: int) -> tuple[str, Dict[str, Any]]:
+    """识别无需 ReAct 的高确定性 ops 请求。"""
+    text = str(query or "").strip()
+    safe_limit = max(1, min(int(limit or 20), 200))
+    if re.search(r"(会话列表|查看会话|列出会话|显示会话|展示会话)", text):
+        return "list_sessions_tool", {}
+    if re.search(r"(查看|列出|显示|展示|最近\d{0,3}条)\s*(练习历史|练习记录|练习|错题|做题记录)", text):
+        return "get_practice_history", {"session_id": session_id, "limit": safe_limit}
+    if re.search(r"(立刻|马上|现在)?\s*(删除|清空|清除|清理).*(所有)?(学习记录|练习记录|错题)", text):
+        return "clear_practice_history_tool", {"session_id": session_id}
+    return "", {}
+
+
+def _get_recent_exam_or_quiz_export_content(session_id: str) -> str:
+    """从最近 exam/quiz 消息提取可导出的试卷文本。"""
+    for msg in reversed(_get_recent_session_messages(session_id, limit=20)):
+        if str(msg.get("role", "")).lower() not in {"ai", "assistant"}:
+            continue
+        kind = str(msg.get("kind") or "").strip().lower()
+        meta = msg.get("meta") if isinstance(msg.get("meta"), dict) else {}
+        route = str(meta.get("route") or "").strip().lower()
+        if kind in {"exam_paper", "quiz_set"} or route in {"exam", "quiz"}:
+            content = str(msg.get("content") or "").strip()
+            if content:
+                return content
+    return ""
 
 
 def _is_incomplete_response(text: str) -> bool:
@@ -780,8 +811,54 @@ def _extract_grounded_evidence(parsed: dict, context: str) -> list[dict]:
         if not source or not quote:
             continue
         if _is_grounded(quote):
-            grounded.append({"source": source, "quote": quote})
+            page = item.get("page")
+            card = {"source": source, "quote": quote}
+            if page not in (None, ""):
+                card["page"] = page
+            grounded.append(card)
     return grounded
+
+
+def _build_rag_structured_result(answer: str, evidence: list[dict], reason: str = "") -> dict:
+    """把 RAG 输出包装为前端可展示的证据卡协议。"""
+    evidence_cards = []
+    for item in evidence or []:
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("source", "")).strip()
+        quote = str(item.get("quote", "")).strip()
+        if not source and not quote:
+            continue
+        card = {
+            "source": source,
+            "quote": quote,
+            "grounded": True,
+        }
+        if item.get("page") not in (None, ""):
+            card["page"] = item.get("page")
+        evidence_cards.append(card)
+
+    evidence_status = "grounded" if evidence_cards else "none"
+    if reason == "evidence_partial" and not evidence_cards:
+        evidence_status = "partial"
+
+    payload = {"evidence_cards": evidence_cards}
+    meta = {
+        "evidence_status": evidence_status,
+        "evidence_count": len(evidence_cards),
+    }
+    if evidence_cards:
+        meta["evidence_source"] = f"课件证据 {len(evidence_cards)} 条"
+    return {
+        "kind": "chat",
+        "render_mode": "markdown",
+        "text": answer,
+        "payload": payload,
+        "meta": meta,
+        "answer": answer,
+        "evidence": evidence,
+        **({"reason": reason} if reason else {}),
+    }
 
 
 def _validate_supervisor_decision(
@@ -806,11 +883,16 @@ def _validate_supervisor_decision(
         raise ValueError("supervisor params must be a dict")
     # 统一参数语义：空字符串归一，避免后续 int('') 等异常
     if route == "quiz":
-        params = {
+        normalized_params = {
             "topic": str(params.get("topic", "") or "").strip(),
             "quiz_type": str(params.get("quiz_type", "") or "选择题").strip() or "选择题",
             "num": _safe_int(params.get("num", 5), default=5, minimum=1, maximum=20),
         }
+        # 保留确定性跟进参数，避免 answer_check 被标准化过程吞掉。
+        for key in ("action", "answer", "question_number", "deterministic_followup", "quiz_action"):
+            if key in params:
+                normalized_params[key] = params.get(key)
+        params = normalized_params
     elif route == "exam":
         raw_types = params.get("quiz_types", [])
         quiz_types = raw_types if isinstance(raw_types, list) else []
@@ -834,6 +916,12 @@ def _validate_supervisor_decision(
         str(decision.get('rewritten_query', '') or '')
     )
     reason = str(decision.get('reason', '') or '').strip()
+
+    # 纠偏：课件内容理解请求不应落在 ops；优先改走 rag。
+    if route == "ops" and _is_courseware_content_intent(original_query):
+        route = "rag"
+        params = {"topic": original_query}
+        reason = "纠偏：课件内容理解请求改走rag"
 
     # 语义漂移保护：低信息短句优先保持原语义，不让改写硬注入“出题/出卷”触发词。
     if route in {"quiz", "exam"} and not _is_menu_selection_reply(original_query):
@@ -1008,13 +1096,231 @@ def _has_recent_quiz_turn(session_id: str) -> bool:
     """判断最近一轮助手回复是否来自 quiz 路由。"""
     recent_messages = _get_recent_session_messages(session_id, limit=12)
     for msg in reversed(recent_messages):
-        if str(msg.get("role", "")).lower() != "ai":
+        if str(msg.get("role", "")).lower() not in {"ai", "assistant"}:
             continue
         kind = str(msg.get("kind") or "").strip().lower()
         meta = msg.get("meta") if isinstance(msg.get("meta"), dict) else {}
         route = str(meta.get("route") or "").strip().lower()
         return route == "quiz" or kind == "quiz_set"
     return False
+
+
+def _parse_cn_ordinal(text: str) -> Optional[int]:
+    """解析常见中文序号，供跟进问题定位题号/条目。"""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    digit_match = re.search(r"\d{1,2}", raw)
+    if digit_match:
+        return _safe_int(digit_match.group(0), default=0, minimum=0, maximum=99) or None
+    cn_map = {
+        "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+        "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+    }
+    if raw in cn_map:
+        return cn_map[raw]
+    if raw.startswith("十") and len(raw) == 2 and raw[1] in cn_map:
+        return 10 + cn_map[raw[1]]
+    if raw.endswith("十") and len(raw) == 2 and raw[0] in cn_map:
+        return cn_map[raw[0]] * 10
+    if len(raw) == 3 and raw[1] == "十" and raw[0] in cn_map and raw[2] in cn_map:
+        return cn_map[raw[0]] * 10 + cn_map[raw[2]]
+    return None
+
+
+def _parse_quiz_answer_attempt(text: str) -> Dict[str, Any]:
+    """识别用户是否在回答上一轮 quiz，而不是请求重新出题。"""
+    q = re.sub(r"\s+", "", str(text or "").strip())
+    if not q:
+        return {"is_answer_check": False}
+
+    answer = ""
+    question_number: Optional[int] = None
+    number_match = re.search(r"第(\d{1,2}|[一二两三四五六七八九十]{1,3})(?:题|个|道)", q)
+    if number_match:
+        question_number = _parse_cn_ordinal(number_match.group(1))
+
+    answer_patterns = [
+        r"(?:我选|选|答案是|答案为|选项是|选择|第(?:\d{1,2}|[一二两三四五六七八九十]{1,3})题选)([A-DＡ-Ｄ])",
+        r"^([A-DＡ-Ｄ])$",
+        r"^([A-DＡ-Ｄ])[。.!！]?$",
+    ]
+    for pattern in answer_patterns:
+        m = re.search(pattern, q, flags=re.IGNORECASE)
+        if m:
+            answer = m.group(1).upper()
+            answer = answer.translate(str.maketrans("ＡＢＣＤ", "ABCD"))
+            break
+
+    wants_check = bool(re.search(r"(判断对错|判分|批改|对不对|是否正确|解释原因|解析一下|请解释|为什么)", q))
+    explicit_answer = bool(answer)
+    return {
+        "is_answer_check": explicit_answer or wants_check,
+        "question_number": question_number,
+        "answer": answer,
+        "wants_check": wants_check,
+    }
+
+
+def _is_quiz_generation_followup(text: str) -> bool:
+    """识别明确继续出题请求，避免被 answer_check 分支拦截。"""
+    q = re.sub(r"\s+", "", str(text or "").strip())
+    if not q:
+        return False
+    return bool(
+        re.search(r"(再来|继续|重新|换个题型|同类型|出)\d{0,2}(道|个|题)?", q)
+        and any(token in q for token in ["题", "出题", "练习", "同类型", "换个题型"])
+    )
+
+
+def _get_recent_quiz_payload(session_id: str) -> Optional[Dict[str, Any]]:
+    """读取最近 quiz_set payload，用于确定性判分。"""
+    for msg in reversed(_get_recent_session_messages(session_id, limit=20)):
+        if str(msg.get("role", "")).lower() not in {"ai", "assistant"}:
+            continue
+        payload = msg.get("payload") if isinstance(msg.get("payload"), dict) else {}
+        questions = payload.get("questions") if isinstance(payload.get("questions"), list) else []
+        meta = msg.get("meta") if isinstance(msg.get("meta"), dict) else {}
+        kind = str(msg.get("kind") or "").strip().lower()
+        route = str(meta.get("route") or "").strip().lower()
+        if questions and (kind == "quiz_set" or route == "quiz"):
+            return payload
+    return None
+
+
+def _normalize_answer_letters(value: Any) -> str:
+    """归一化选择题答案字母，兼容“答案：A、C”等写法。"""
+    text = str(value or "").upper().translate(str.maketrans("ＡＢＣＤ", "ABCD"))
+    letters = re.findall(r"[A-D]", text)
+    return "".join(dict.fromkeys(letters))
+
+
+def _build_quiz_answer_check_result(session_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """基于最近 quiz payload 判分；缺上下文时只提示补充题目，不重新出题。"""
+    payload = _get_recent_quiz_payload(session_id)
+    questions = payload.get("questions") if isinstance(payload, dict) and isinstance(payload.get("questions"), list) else []
+    if not questions:
+        text = "未找到上一题，请贴出题目或选项后我再帮你判断对错；本次不会重新出题。"
+        return {
+            "kind": "chat",
+            "render_mode": "markdown",
+            "text": text,
+            "payload": {},
+            "meta": {"deterministic_followup": True, "quiz_action": "answer_check"},
+        }
+
+    qn = params.get("question_number")
+    question_number = _safe_int(qn, default=1, minimum=1, maximum=len(questions)) if qn else 1
+    question = questions[question_number - 1] if 0 < question_number <= len(questions) else questions[0]
+    user_answer = _normalize_answer_letters(params.get("answer"))
+    correct_answer = _normalize_answer_letters(question.get("answer") or question.get("correct_answer"))
+    stem = str(question.get("question") or question.get("content") or "").strip()
+    analysis = str(question.get("analysis") or question.get("explanation") or "暂无解析。").strip()
+
+    if not user_answer:
+        verdict = "无法判断：我还没识别到你的选项。"
+    elif correct_answer and user_answer == correct_answer:
+        verdict = "正确。"
+    elif correct_answer:
+        verdict = "错误。"
+    else:
+        verdict = "无法判断：上一题 payload 中没有标准答案。"
+
+    lines = [
+        f"我理解你在回答第 {question_number} 题。",
+        f"- 你的答案：{user_answer or '未识别'}",
+        f"- 正确答案：{correct_answer or '未提供'}",
+        f"- 判定：{verdict}",
+    ]
+    if stem:
+        lines.append(f"- 题目：{stem}")
+    lines.append(f"- 解析：{analysis}")
+    return {
+        "kind": "chat",
+        "render_mode": "markdown",
+        "text": "\n".join(lines),
+        "payload": {
+            "answer_check": {
+                "question_number": question_number,
+                "user_answer": user_answer,
+                "correct_answer": correct_answer,
+                "is_correct": bool(user_answer and correct_answer and user_answer == correct_answer),
+            }
+        },
+        "meta": {"deterministic_followup": True, "quiz_action": "answer_check"},
+    }
+
+
+def _is_context_reference_followup(text: str) -> bool:
+    """识别“第二个/这个/上面那个”等依赖上一轮内容的低信息指代。"""
+    q = re.sub(r"\s+", "", str(text or "").strip())
+    if not q:
+        return False
+    patterns = [
+        r"第(\d{1,2}|[一二两三四五六七八九十]{1,3})(个|点|条|题).*(什么意思|怎么理解|解释|继续讲)",
+        r"(这个|那个|上面那个|刚才那个|它)(呢|是什么意思|怎么理解|解释一下)?",
+        r"继续讲第(\d{1,2}|[一二两三四五六七八九十]{1,3})(个|点|条|题)",
+    ]
+    return any(re.search(pattern, q) for pattern in patterns)
+
+
+def _get_recent_assistant_route(session_id: str) -> Dict[str, Any]:
+    """取最近助手消息的 route/kind/content，供上下文指代沿用任务路由。"""
+    for msg in reversed(_get_recent_session_messages(session_id, limit=20)):
+        if str(msg.get("role", "")).lower() not in {"ai", "assistant"}:
+            continue
+        meta = msg.get("meta") if isinstance(msg.get("meta"), dict) else {}
+        return {
+            "route": str(meta.get("route") or "").strip().lower(),
+            "kind": str(msg.get("kind") or "").strip().lower(),
+            "content": str(msg.get("content") or "").strip(),
+        }
+    return {}
+
+
+def _extract_context_reference_text(user_input: str, recent_content: str) -> tuple[str, str]:
+    """从上一条回复中粗略定位用户指代的编号项。"""
+    q = str(user_input or "")
+    ordinal: Optional[int] = None
+    m = re.search(r"第(\d{1,2}|[一二两三四五六七八九十]{1,3})(个|点|条|题)", q)
+    if m:
+        ordinal = _parse_cn_ordinal(m.group(1))
+    label = f"第 {ordinal} 个" if ordinal else "刚才提到的内容"
+
+    content = str(recent_content or "").strip()
+    if not content:
+        return label, ""
+    if ordinal:
+        item_patterns = [
+            rf"^\s*(?:{ordinal}|{ordinal}[\.、\)]|Day\s*{ordinal}|第\s*{ordinal}\s*[天点条题])\s*[:：.\)、-]?\s*(.+)$",
+            rf"^\s*[-*]\s*(?:{ordinal}[\.、\)]|第\s*{ordinal}\s*[点条题])\s*(.+)$",
+        ]
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        for pattern in item_patterns:
+            for line in lines:
+                found = re.search(pattern, line, flags=re.IGNORECASE)
+                if found:
+                    return label, found.group(1).strip()[:300]
+        if 0 < ordinal <= len(lines):
+            return label, lines[ordinal - 1][:300]
+    return label, content[:300]
+
+
+def _build_context_reference_reply(session_id: str, user_input: str) -> Dict[str, Any]:
+    """为低信息指代提供确定性澄清，避免误判成闲聊。"""
+    recent = _get_recent_assistant_route(session_id)
+    label, snippet = _extract_context_reference_text(user_input, recent.get("content", ""))
+    if snippet:
+        text = f"我理解你说的{label}是：{snippet}\n\n你可以继续问“展开讲”或补充具体疑问，我会按这个上下文解释。"
+    else:
+        text = "我理解你在追问上一条回复中的内容，但当前会话里没有足够上下文。请贴出对应条目，我再继续解释。"
+    return {
+        "kind": "chat",
+        "render_mode": "markdown",
+        "text": text,
+        "payload": {},
+        "meta": {"deterministic_followup": True, "context_reference_resolved": True},
+    }
 
 
 def _build_recent_practice_snapshot(session_id: str, limit: int = 6) -> str:
@@ -1109,6 +1415,33 @@ def _is_ops_export_intent(query: str) -> bool:
     return has_export_verb and has_exam_artifact
 
 
+def _is_courseware_management_intent(query: str) -> bool:
+    """判断是否是课件管理类请求（增删查状态/文件层操作）。"""
+    text = str(query or "").strip()
+    if not text:
+        return False
+    return bool(
+        re.search(r"(上传|删除|移除|重试|清理)\s*(课件|文件)", text)
+        or re.search(r"(课件|文件).*(列表|清单|状态|向量|进度)", text)
+        or re.search(r"(查看|列出|展示|显示)\s*(课件文件|文件列表|课件列表)", text)
+    )
+
+
+def _is_courseware_content_intent(query: str) -> bool:
+    """判断是否是“询问课件讲了什么”的内容理解请求。"""
+    text = str(query or "").strip()
+    if not text:
+        return False
+    if _is_courseware_management_intent(text):
+        return False
+    if "课件" not in text and "讲义" not in text and "pdf" not in text.lower():
+        return False
+    return bool(
+        re.search(r"(讲了什么|讲的什么|讲了哪些|主要讲|内容是什么|内容概述|总结|概述|要点|大纲|覆盖了什么)", text)
+        or re.search(r"(每个|每一|逐个).*(课件|讲义).*(讲|内容|要点|概述)", text)
+    )
+
+
 def _get_route_fallback(error: str, original_query: str) -> str:
     """根据错误类型返回合适的 fallback 路由"""
     error_lower = error.lower()
@@ -1123,6 +1456,8 @@ def _get_route_fallback(error: str, original_query: str) -> str:
     # 先按 query 关键词兜底，避免模型暂时失败时误路由到 chitchat
     if is_ops_export_intent:
         return 'ops'
+    if _is_courseware_content_intent(query):
+        return 'rag'
     if any(kw in query for kw in ['出题', '做题', '练习', '刷题']):
         return 'quiz'
     if any(kw in query for kw in ['试卷', '考试', '出卷']):
@@ -1188,10 +1523,56 @@ async def supervisor_node(state: SupervisorState) -> SupervisorState:
             "input": state["input"],
         }
 
+    # 预检：课件“内容理解”问题优先走 RAG，避免误入 ops 触发慢工具链。
+    if _is_courseware_content_intent(state.get("input", "")):
+        logger.info("[Supervisor] 命中课件内容理解意图，优先路由 rag")
+        return {
+            "route": "rag",
+            "route_reason": "课件内容理解（预检强制rag）",
+            "route_params": {"topic": state.get("input", "")},
+            "input": state["input"],
+        }
+
     # 预检：按句子边界截断历史，保留语义完整性
     recent_history = _format_history_with_limit(state.get('chat_history', []))
     sid = state.get("session_id") or current_session_id.get() or "default"
     has_recent_quiz_context = _has_recent_quiz_turn(str(sid))
+
+    quiz_attempt = _parse_quiz_answer_attempt(state.get("input", ""))
+    if quiz_attempt.get("is_answer_check") and not _is_quiz_generation_followup(state.get("input", "")):
+        logger.info("[Supervisor] 命中 quiz 判分跟进，强制 route=quiz action=answer_check")
+        return {
+            "route": "quiz",
+            "route_reason": "确定性识别：上一题作答/判分跟进",
+            "route_params": {
+                "topic": "",
+                "quiz_type": "选择题",
+                "num": 1,
+                "action": "answer_check",
+                "answer": quiz_attempt.get("answer", ""),
+                "question_number": quiz_attempt.get("question_number"),
+                "deterministic_followup": True,
+                "quiz_action": "answer_check",
+            },
+            "input": state["input"],
+        }
+
+    if _is_context_reference_followup(state.get("input", "")):
+        recent_route = _get_recent_assistant_route(str(sid))
+        valid_follow_routes = {"rag", "quiz", "exam", "ops", "planner", "history"}
+        route = recent_route.get("route") if recent_route.get("route") in valid_follow_routes else "rag"
+        if recent_route.get("kind") == "quiz_set":
+            route = "quiz"
+        elif recent_route.get("kind") == "exam_paper":
+            route = "exam"
+        logger.info(f"[Supervisor] 命中上下文指代跟进，沿用 route={route}")
+        return {
+            "route": route,
+            "route_reason": "确定性识别：上下文指代跟进",
+            "route_params": {"action": "context_reference", "context_reference_resolved": True},
+            "input": state["input"],
+        }
+
     practice_snapshot = _build_recent_practice_snapshot(str(sid))
     if practice_snapshot:
         recent_history = f"{recent_history}\n\n【最近练习快照】\n{practice_snapshot}"
@@ -1247,7 +1628,11 @@ async def rag_subagent_node(state: SupervisorState) -> SupervisorState:
     sid = state.get('session_id') or current_session_id.get() or 'default'
     current_session_id.set(sid)
 
-    params = state.get('route_params', {})
+    params = state.get('route_params', {}) if isinstance(state.get('route_params', {}), dict) else {}
+    if params.get("action") == "context_reference":
+        structured = _build_context_reference_reply(str(sid), state.get("input", ""))
+        return {"subagent_result": structured, "final_answer": structured["text"]}
+
     topic = params.get('topic') or state['input']
 
     # 格式化近期对话历史，供 RAG 参考
@@ -1290,10 +1675,7 @@ async def rag_subagent_node(state: SupervisorState) -> SupervisorState:
         logger.info(f"[RAG SubAgent] 回答依据校验通过，evidence_count={len(grounded_evidence)}")
         logger.info(f"[Latency] rag_total_ms={int((time.time() - rag_start) * 1000)}")
         return {
-            "subagent_result": {
-                "answer": answer,
-                "evidence": grounded_evidence,
-            },
+            "subagent_result": _build_rag_structured_result(answer, grounded_evidence),
             "final_answer": answer,
         }
 
@@ -1303,11 +1685,7 @@ async def rag_subagent_node(state: SupervisorState) -> SupervisorState:
         logger.warning("[RAG SubAgent] 回答依据条目不足，按课件优先策略继续返回答案")
         logger.info(f"[Latency] rag_total_ms={int((time.time() - rag_start) * 1000)}")
         return {
-            "subagent_result": {
-                "answer": answer,
-                "evidence": grounded_evidence,
-                "reason": "evidence_partial",
-            },
+            "subagent_result": _build_rag_structured_result(answer, grounded_evidence, "evidence_partial"),
             "final_answer": answer,
         }
 
@@ -1319,11 +1697,7 @@ async def rag_subagent_node(state: SupervisorState) -> SupervisorState:
         "为避免误导，请换个更具体的问题，或补充相关课件后再试。"
     )
     return {
-        "subagent_result": {
-            "answer": fallback,
-            "evidence": grounded_evidence,
-            "reason": "no_grounded_evidence",
-        },
+        "subagent_result": _build_rag_structured_result(fallback, grounded_evidence, "no_grounded_evidence"),
         "final_answer": fallback,
     }
 
@@ -1335,15 +1709,23 @@ async def quiz_subagent_node(state: SupervisorState) -> SupervisorState:
     logger.info(f"[Quiz SubAgent] route_params={state.get('route_params', {})}")
     logger.info(f"[Quiz SubAgent] session_id={state.get('session_id', 'unknown')}")
 
+    sid = state.get('session_id') or current_session_id.get() or 'default'
+    current_session_id.set(sid)
+    params = state.get('route_params', {}) if isinstance(state.get('route_params', {}), dict) else {}
+    if params.get("action") == "context_reference":
+        structured = _build_context_reference_reply(str(sid), state.get("input", ""))
+        return {"subagent_result": structured, "final_answer": structured["text"]}
+    if params.get("action") == "answer_check":
+        logger.info("[Quiz SubAgent] 命中 answer_check，跳过出题链路")
+        structured = _build_quiz_answer_check_result(str(sid), params)
+        return {"subagent_result": structured, "final_answer": structured["text"]}
+
     from agent.multi_agent.quiz_agent import run_quiz_agent
     from api.routers.knowledge import get_sample_paper_context
     from utils.memory_service import memory_manager
 
-    sid = state.get('session_id') or current_session_id.get() or 'default'
-    current_session_id.set(sid)
     sample_ctx = get_sample_paper_context(sid)
 
-    params = state.get('route_params', {})
     topic = params.get('topic', '')
     quiz_type = params.get('quiz_type') or '选择题'
     num = _safe_int(params.get('num', 3), default=3, minimum=1, maximum=20)
@@ -1424,9 +1806,14 @@ async def exam_subagent_node(state: SupervisorState) -> SupervisorState:
 
     sid = state.get('session_id') or current_session_id.get() or 'default'
     current_session_id.set(sid)
+
+    params = state.get('route_params', {}) if isinstance(state.get('route_params', {}), dict) else {}
+    if params.get("action") == "context_reference":
+        structured = _build_context_reference_reply(str(sid), state.get("input", ""))
+        return {"subagent_result": structured, "final_answer": structured["text"]}
+
     sample_ctx = get_sample_paper_context(sid)
 
-    params = state.get('route_params', {})
     topics = params.get('topics', [])
     quiz_types = params.get('quiz_types')
     if not quiz_types or not isinstance(quiz_types, list):
@@ -1546,6 +1933,92 @@ async def ops_subagent_node(state: SupervisorState) -> SupervisorState:
     max_steps = 2
     params = state.get("route_params", {}) if isinstance(state.get("route_params", {}), dict) else {}
     limit = _safe_int(params.get("limit", 20), default=20, minimum=1, maximum=200)
+
+    if params.get("action") == "context_reference":
+        structured = _build_context_reference_reply(str(sid), user_input)
+        return {"subagent_result": structured, "final_answer": structured["text"]}
+
+    if params.get("target") == "exam_export" and params.get("action") == "export":
+        exam_paper = _get_recent_exam_or_quiz_export_content(str(sid))
+        if not exam_paper:
+            text = "无法导出 Word：当前会话未找到可导出的试卷内容。请先生成一套试卷/小测卷，再说“导出刚才的试卷 Word”。"
+            structured = {
+                "kind": "chat",
+                "render_mode": "markdown",
+                "text": text,
+                "payload": {"ops_trace": []},
+                "meta": {"ops_react": True, "ops_deterministic": True},
+            }
+            return {"subagent_result": structured, "final_answer": text}
+        tool_obj = tool_map.get("export_exam_docx_tool")
+        if tool_obj is None:
+            text = "导出试卷 Word 失败：export_exam_docx_tool 未注册。"
+            return {"subagent_result": text, "final_answer": text}
+        try:
+            result = await tool_obj.ainvoke({"exam_paper": exam_paper, "course_name": "复习助手小测卷", "include_answers": True})
+            result_text = _safe_json_dumps(result) if isinstance(result, (dict, list)) else str(result)
+            trace.append({"step": 1, "tool": "export_exam_docx_tool", "args": {"course_name": "复习助手小测卷", "include_answers": True}, "observation": result_text[:1200]})
+            structured = {
+                "kind": "chat",
+                "render_mode": "markdown",
+                "text": result_text,
+                "payload": {"ops_trace": trace},
+                "meta": {"ops_react": True, "ops_steps": 1, "ops_deterministic": True},
+            }
+            return {"subagent_result": structured, "final_answer": result_text}
+        except Exception as e:
+            text = f"导出试卷 Word 失败：{e}"
+            structured = {
+                "kind": "chat",
+                "render_mode": "markdown",
+                "text": text,
+                "payload": {"ops_trace": trace},
+                "meta": {"ops_react": True, "ops_steps": len(trace), "ops_deterministic": True},
+            }
+            return {"subagent_result": structured, "final_answer": text}
+
+    direct_tool, direct_args = _resolve_ops_deterministic_tool(user_input, str(sid), limit)
+    if direct_tool:
+        logger.info(f"[Ops SubAgent] 命中确定性工具分支 tool={direct_tool}")
+        tool_obj = tool_map.get(direct_tool)
+        if tool_obj is None:
+            text = f"管理工具未注册：{direct_tool}"
+            return {"subagent_result": text, "final_answer": text}
+        if direct_tool in OPS_DANGEROUS_TOOLS:
+            required_phrase, arg_error = _ops_required_confirmation_phrase(direct_tool, direct_args)
+            reason = arg_error or f"检测到高风险操作 `{direct_tool}`，需要二次确认后执行。"
+            trace.append({"step": 1, "tool": direct_tool, "args": direct_args, "guard_blocked": True, "required_confirmation_phrase": required_phrase})
+            structured = _build_ops_guard_reply(
+                trace=trace,
+                tool_name=direct_tool,
+                pending_args=direct_args,
+                required_phrase=required_phrase,
+                reason=reason,
+            )
+            structured["meta"]["ops_deterministic"] = True
+            return {"subagent_result": structured, "final_answer": structured["text"]}
+        try:
+            result = await tool_obj.ainvoke(direct_args)
+            result_text = _safe_json_dumps(result) if isinstance(result, (dict, list)) else str(result)
+            trace.append({"step": 1, "tool": direct_tool, "args": direct_args, "observation": result_text[:1200]})
+            structured = {
+                "kind": "chat",
+                "render_mode": "markdown",
+                "text": result_text,
+                "payload": {"ops_trace": trace},
+                "meta": {"ops_react": True, "ops_steps": 1, "ops_deterministic": True},
+            }
+            return {"subagent_result": structured, "final_answer": result_text}
+        except Exception as e:
+            text = f"管理操作执行失败：`{direct_tool}`\n原因：{e}"
+            structured = {
+                "kind": "chat",
+                "render_mode": "markdown",
+                "text": text,
+                "payload": {"ops_trace": trace},
+                "meta": {"ops_react": True, "ops_steps": len(trace), "ops_deterministic": True},
+            }
+            return {"subagent_result": structured, "final_answer": text}
 
     # 对明确的历史管理动作走确定性工具调用，避免 LLM 口头宣告“已完成”。
     deterministic_action = parse_history_action(user_input)
@@ -1771,11 +2244,23 @@ async def ops_subagent_node(state: SupervisorState) -> SupervisorState:
         if last.get("observation"):
             final_text = f"已执行管理操作：`{last.get('tool', 'unknown')}`\n\n{last.get('observation')}"
         else:
-            final_text = (
-                f"管理操作尝试失败：`{last.get('tool', 'unknown')}`\n"
-                f"原因：{last.get('error', '未知错误')}\n"
-                "请补充更明确的对象（例如第几条/具体会话名）后再试。"
-            )
+            last_tool = str(last.get("tool", "unknown") or "unknown")
+            error_text = str(last.get("error", "未知错误") or "未知错误")
+            error_lower = error_text.lower()
+            is_timeout = ("timeout" in error_lower) or ("timed out" in error_lower) or ("超时" in error_text)
+            if last_tool == "search_courseware" and is_timeout:
+                final_text = (
+                    "课件内容检索超时（本次已中止），并非“对象不明确”。\n"
+                    f"失败工具：`{last_tool}`\n"
+                    f"错误：{error_text}\n"
+                    "建议改用更聚焦提问，例如：`总结 C0-Overview 的核心知识点`。"
+                )
+            else:
+                final_text = (
+                    f"管理操作尝试失败：`{last_tool}`\n"
+                    f"原因：{error_text}\n"
+                    "请补充更明确的对象（例如第几条/具体会话名）后再试。"
+                )
     else:
         final_text = "未能解析出可执行的管理操作。请明确说明是查看、删除还是清空哪类记录。"
 
@@ -2061,15 +2546,22 @@ def _normalize_planner_payload(
     }
 
 
-def _render_planner_markdown(plan: Dict[str, Any]) -> str:
+def _planner_requires_wrong_basis(user_input: str) -> bool:
+    """判断计划是否必须显式声明基于错题/薄弱点。"""
+    text = str(user_input or "")
+    return any(token in text for token in ["最近错题", "错题", "薄弱点", "练习记录", "做题记录"])
+
+
+def _render_planner_markdown(plan: Dict[str, Any], *, basis_text: str = "") -> str:
     """将结构化计划渲染为用户可读 Markdown。"""
     lines = [
         f"## {plan.get('title', '复习计划')}",
         f"- 目标：{plan.get('goal', '')}",
-        f"- 周期：{plan.get('cycle_days', 7)} 天",
-        "",
-        "### 每日安排",
+        f"- 周期：{plan.get('cycle_days', 7)}天",
     ]
+    if basis_text:
+        lines.append(f"- 依据：{basis_text}")
+    lines.extend(["", "### 每日安排"])
     for row in plan.get("daily_plan", []):
         day = int(row.get("day", 0) or 0)
         focus = str(row.get("focus", "") or "")
@@ -2102,6 +2594,11 @@ async def planner_subagent_node(state: SupervisorState) -> SupervisorState:
     logger.info("[Planner SubAgent] 生成复习计划...")
 
     sid = state.get("session_id") or current_session_id.get() or "default"
+    params = state.get("route_params", {}) if isinstance(state.get("route_params", {}), dict) else {}
+    if params.get("action") == "context_reference":
+        structured = _build_context_reference_reply(str(sid), state.get("input", ""))
+        return {"subagent_result": structured, "final_answer": structured["text"]}
+
     constraints = _extract_planner_constraints(state.get("input", ""))
     snapshot = _build_planner_practice_snapshot(sid)
     snapshot_text = _render_planner_snapshot(snapshot)
@@ -2143,7 +2640,18 @@ async def planner_subagent_node(state: SupervisorState) -> SupervisorState:
         else:
             plan["next_action"] = default_plan.get("next_action", "先完成第 1 天第 1 个任务。")
 
-    plan_text = _render_planner_markdown(plan)
+    if constraints.get("cycle_days") == 3 and "3天" not in str(plan.get("title", "")):
+        plan["title"] = f"3天复习计划：{str(plan.get('title') or '薄弱点突破')}"
+    if "复习" not in str(plan.get("goal", "")):
+        plan["goal"] = f"复习并巩固：{str(plan.get('goal') or '薄弱知识点')}"
+    basis_text = ""
+    if _planner_requires_wrong_basis(state.get("input", "")):
+        weak_points = snapshot.get("weak_points", []) if isinstance(snapshot.get("weak_points", []), list) else []
+        basis_text = "最近错题/薄弱点"
+        if weak_points:
+            basis_text = f"最近错题/薄弱点（优先：{'、'.join(str(kp) for kp in weak_points[:3])}）"
+
+    plan_text = _render_planner_markdown(plan, basis_text=basis_text)
     structured = {
         "kind": "chat",
         "render_mode": "markdown",
@@ -2402,7 +2910,11 @@ async def history_subagent_node(state: SupervisorState) -> SupervisorState:
     sid = state.get('session_id') or current_session_id.get() or 'default'
     current_session_id.set(sid)
 
-    params = state.get('route_params', {})
+    params = state.get('route_params', {}) if isinstance(state.get('route_params', {}), dict) else {}
+    if params.get("action") == "context_reference":
+        structured = _build_context_reference_reply(str(sid), state.get("input", ""))
+        return {"subagent_result": structured, "final_answer": structured["text"]}
+
     limit = params.get('limit', 20)
 
     # 先执行可确定的管理动作（查/删/清空），避免再走 LLM 推断。
