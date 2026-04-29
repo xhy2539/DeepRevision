@@ -7,6 +7,12 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import ExamCanvas, { isExamContent } from "@/components/ExamCanvas";
 import ToastContainer, { showToast } from "@/components/ui/toast";
+import AgentRouteBadge from "@/components/AgentRouteBadge";
+import AgentTracePanel from "@/components/AgentTracePanel";
+import LearningLoopPanel from "@/components/LearningLoopPanel";
+import EvidenceCards from "@/components/EvidenceCards";
+import SafetyGuardCard from "@/components/SafetyGuardCard";
+import CompetitionHero from "@/components/CompetitionHero";
 
 // Types
 type MessageKind = "chat" | "quiz_set" | "exam_paper";
@@ -44,6 +50,7 @@ interface StreamSectionToolCall {
 interface StreamSectionCitation {
   index?: number;
   source?: string;
+  page?: string | number;
   quote?: string;
 }
 
@@ -72,6 +79,15 @@ interface AssistantPayload {
   exam_data?: unknown;
   messageId?: string;
   stream_sections?: StreamSections;
+  evidence_cards?: EvidenceCard[];
+}
+
+interface EvidenceCard {
+  source?: string;
+  page?: string | number;
+  quote?: string;
+  confidence?: number;
+  grounded?: boolean;
 }
 
 interface QuizExamData {
@@ -141,6 +157,27 @@ interface PracticeStatsData {
   retry_rate: number;
   weak_points: string[];
   knowledge_point_stats: Record<string, KnowledgePointStat>;
+  mastery_rows_total?: number;
+  priority_review_points?: MasteryPoint[];
+}
+
+interface MasteryPoint {
+  knowledge_point: string;
+  mastery_score: number;
+  stored_mastery_score?: number;
+  attempt_count: number;
+  correct_count: number;
+  recent_wrong_streak: number;
+  recent_correct_streak?: number;
+  review_urgency?: number;
+  days_since_last_seen?: number;
+}
+
+interface LastPracticeSummary {
+  score: number;
+  total: number;
+  wrongPoints: string[];
+  saved: number;
 }
 
 interface Message {
@@ -314,6 +351,7 @@ function normalizeUserAssistantProfile(value: unknown): UserAssistantProfile {
 
 const SESSION_ID_REGEX = /^[\u4e00-\u9fa5a-zA-Z0-9_-]{1,64}$/;
 const isValidSessionId = (sid: string) => SESSION_ID_REGEX.test((sid || "").trim());
+const AUTO_SCROLL_BOTTOM_GAP_PX = 140;
 
 interface KnowledgeFile {
   filename: string;
@@ -390,7 +428,7 @@ function StreamSectionsPanel({ sections }: { sections: StreamSections }) {
   return (
     <div className="mt-3 space-y-2">
       {sections.progress.length > 0 && (
-        <details className="rounded-lg border border-sky-200 bg-sky-50/40 px-3 py-2" open>
+        <details className="rounded-lg border border-sky-200 bg-sky-50/40 px-3 py-2">
           <summary className="cursor-pointer text-xs font-semibold text-sky-700">{`流程进度 (${sections.progress.length})`}</summary>
           <div className="mt-2 space-y-1 text-xs text-sky-900">
             {sections.progress.map((item, idx) => (
@@ -400,7 +438,7 @@ function StreamSectionsPanel({ sections }: { sections: StreamSections }) {
         </details>
       )}
       {mergedToolCalls.length > 0 && (
-        <details className="rounded-lg border border-violet-200 bg-violet-50/40 px-3 py-2" open>
+        <details className="rounded-lg border border-violet-200 bg-violet-50/40 px-3 py-2">
           <summary className="cursor-pointer text-xs font-semibold text-violet-700">{`工具调用 (${mergedToolCalls.length})`}</summary>
           <div className="mt-2 space-y-2 text-xs text-violet-900">
             {mergedToolCalls.map((call, idx) => (
@@ -417,7 +455,7 @@ function StreamSectionsPanel({ sections }: { sections: StreamSections }) {
         </details>
       )}
       {sections.reasoning.trim() && (
-        <details className="rounded-lg border border-teal-200 bg-teal-50/40 px-3 py-2" open>
+        <details className="rounded-lg border border-teal-200 bg-teal-50/40 px-3 py-2">
           <summary className="cursor-pointer text-xs font-semibold text-teal-700">推理摘要</summary>
           <div className="mt-2 text-xs leading-relaxed text-teal-900 whitespace-pre-wrap">{sections.reasoning}</div>
         </details>
@@ -2102,8 +2140,13 @@ export default function ChatPage() {
   const [practiceFeedbackByMessage, setPracticeFeedbackByMessage] = useState<
     Record<string, { type: "success" | "warning" | "error"; text: string }>
   >({});
+  const [learningPracticeStats, setLearningPracticeStats] = useState<PracticeStatsData | null>(null);
+  const [masterySnapshot, setMasterySnapshot] = useState<MasteryPoint[]>([]);
+  const [lastPracticeSummary, setLastPracticeSummary] = useState<LastPracticeSummary | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messageScrollRef = useRef<HTMLDivElement>(null);
+  const shouldAutoScrollRef = useRef(true);
   const streamAbortRef = useRef<AbortController | null>(null);
 
   // 主动停止按钮：中止当前流式请求（前后端 cancel 链路联动）。
@@ -2171,6 +2214,33 @@ export default function ChatPage() {
     await loadUserProfile(currentUsername);
   }, [currentUsername, loadUserProfile]);
 
+  const loadLearningLoopData = useCallback(async (sessionId: string) => {
+    // 侧栏看板只读取现有统计接口，避免引入新的后端契约。
+    if (!sessionId) return;
+    try {
+      const [statsRes, masteryRes] = await Promise.all([
+        fetch(`/api/chat/practice/stats?session_id=${encodeURIComponent(sessionId)}`),
+        fetch(`/api/chat/mastery?session_id=${encodeURIComponent(sessionId)}&priority_limit=10`),
+      ]);
+      const statsData = await statsRes.json();
+      const masteryData = await masteryRes.json();
+      setLearningPracticeStats(statsData?.code === 200 ? (statsData.data as PracticeStatsData) : null);
+      setMasterySnapshot(
+        masteryData?.code === 200 && Array.isArray(masteryData?.data?.mastery)
+          ? (masteryData.data.mastery as MasteryPoint[])
+          : []
+      );
+    } catch {
+      setLearningPracticeStats(null);
+      setMasterySnapshot([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!currentSession) return;
+    void loadLearningLoopData(currentSession);
+  }, [currentSession, loadLearningLoopData]);
+
   // 缺省知识点提取：优先后端返回，其次题干首行降级。
   const inferKnowledgePoint = (question: ExamPracticeQuestion): string => {
     if (question.knowledge_point && question.knowledge_point.trim()) {
@@ -2219,6 +2289,16 @@ export default function ChatPage() {
         if (submitData?.code !== 200) {
           throw new Error(submitData?.message || "练习记录提交失败");
         }
+        const wrongPoints = Array.from(
+          new Set(wrongAnswers.map((q) => inferKnowledgePoint(q)).filter(Boolean))
+        );
+        setLastPracticeSummary({
+          score,
+          total,
+          wrongPoints,
+          saved: Number(submitData?.saved || payloadRecords.length || 0),
+        });
+        await loadLearningLoopData(currentSession);
 
         if (wrongAnswers.length > 0) {
           const similarRes = await fetch("/api/chat/practice/similar", {
@@ -2352,10 +2432,23 @@ export default function ChatPage() {
       .catch(err => console.error("加载消息失败:", err));
   };
 
-  // 滚动到底部
+  const updateAutoScrollFlag = useCallback(() => {
+    // 只在“接近底部”时保持自动跟随，避免用户上滑阅读时被强制拉回。
+    const el = messageScrollRef.current;
+    if (!el) return;
+    const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    shouldAutoScrollRef.current = distanceToBottom <= AUTO_SCROLL_BOTTOM_GAP_PX;
+  }, []);
+
+  const handleMessageScroll = useCallback(() => {
+    updateAutoScrollFlag();
+  }, [updateAutoScrollFlag]);
+
+  // 新消息到达时，仅在用户靠近底部时自动滚动。
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, thoughts]);
+    if (!shouldAutoScrollRef.current) return;
+    messagesEndRef.current?.scrollIntoView({ behavior: isLoading ? "auto" : "smooth", block: "end" });
+  }, [messages, thoughts, isLoading]);
 
   useEffect(() => {
     return () => {
@@ -2382,6 +2475,7 @@ export default function ChatPage() {
       timestamp: Date.now()
     };
 
+    shouldAutoScrollRef.current = true;
     setMessages(prev => [...prev, userMessage]);
     setInput("");
     setIsLoading(true);
@@ -3406,13 +3500,35 @@ ${sampleHint}
         </div>
       </header>
 
+      <CompetitionHero
+        sessionName={currentSessionName}
+        totalAttempts={learningPracticeStats?.total_attempts || 0}
+        weakCount={learningPracticeStats?.weak_points?.length || 0}
+        masteryCount={masterySnapshot.length || learningPracticeStats?.mastery_rows_total || 0}
+        backendReady={isBackendConnected}
+      />
+
       {/* ============== 主内容区 ============== */}
       <main className="chat-main flex-1 w-full relative overflow-hidden flex">
         {/* 聊天区域 */}
         <div className="flex-1 flex flex-col overflow-hidden relative z-10">
           {/* 消息列表 */}
-          <div className="flex-1 overflow-y-auto p-4 md:p-8 lg:p-10">
+          <div
+            ref={messageScrollRef}
+            onScroll={handleMessageScroll}
+            className="flex-1 overflow-y-auto p-4 md:p-8 lg:p-10"
+          >
             <div className="max-w-5xl mx-auto conversation-lane">
+              <div className="mb-4 xl:hidden">
+                <LearningLoopPanel
+                  stats={learningPracticeStats}
+                  masteryCount={masterySnapshot.length}
+                  lastPractice={lastPracticeSummary}
+                  disabled={isLoading}
+                  onSendPrompt={(prompt) => void sendMessage(prompt)}
+                />
+              </div>
+
               {messages.length === 0 && (
                 <div className="w-full flex items-start gap-4 animate-slideUp">
                   <div className="w-6 h-6 rounded bg-teal-100 text-teal-700 flex items-center justify-center flex-shrink-0 mt-1 border border-teal-200">
@@ -3479,6 +3595,12 @@ ${sampleHint}
                         </>
                       )}
                     </div>
+
+                    {message.role === "assistant" && message.meta && (
+                      <div className="mb-2 flex justify-start">
+                        <AgentRouteBadge meta={message.meta as Record<string, unknown>} />
+                      </div>
+                    )}
 
                     {message.role === "assistant" && thoughts.length > 0 && (
                       <ThoughtChain thoughts={thoughts} />
@@ -3614,6 +3736,19 @@ ${sampleHint}
                         )}
                       </div>
                     )}
+                    {message.role === "assistant" && message.meta && (
+                      <AgentTracePanel meta={message.meta as Record<string, unknown>} />
+                    )}
+                    {message.role === "assistant" && (
+                      <EvidenceCards
+                        cards={(message.payload as AssistantPayload | undefined)?.evidence_cards}
+                        status={String((message.meta as Record<string, unknown> | undefined)?.evidence_status || "")}
+                        route={String((message.meta as Record<string, unknown> | undefined)?.route || "")}
+                      />
+                    )}
+                    {message.role === "assistant" && (
+                      <SafetyGuardCard meta={message.meta as Record<string, unknown> | undefined} />
+                    )}
                   </div>
                 </div>
               ))}
@@ -3652,24 +3787,34 @@ ${sampleHint}
                     }
                   }}
                   disabled={!isLoading && !input.trim()}
-                  className="mb-2 mr-2 p-3 rounded-xl transition-all duration-300 disabled:opacity-40 disabled:cursor-not-allowed"
+                  className={`mb-2 mr-2 transition-all duration-200 disabled:opacity-40 disabled:cursor-not-allowed ${
+                    isLoading
+                      ? "p-0 h-10 w-10 rounded-full"
+                      : "p-3 rounded-xl"
+                  }`}
                   style={{
                     background: isLoading
-                      ? 'linear-gradient(135deg, #7f1d1d 0%, #b91c1c 100%)'
+                      ? '#1f2937'
                       : input.trim()
                         ? 'linear-gradient(135deg, #2d3436 0%, #636e72 100%)'
                         : 'rgba(200,200,200,0.3)',
                     boxShadow: isLoading
-                      ? '0 2px 12px rgba(185,28,28,0.25)'
+                      ? 'none'
                       : input.trim()
                         ? '0 2px 12px rgba(45,52,54,0.3)'
-                      : 'none'
+                      : 'none',
+                    border: isLoading ? '1px solid rgba(148,163,184,0.34)' : 'none'
                   }}
                 >
                   {isLoading ? (
-                    <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24" aria-label="停止生成">
-                      <rect x="6" y="6" width="12" height="12" rx="2" />
-                    </svg>
+                    <span className="relative flex h-full w-full items-center justify-center">
+                      <span className="absolute inset-[5px] rounded-full border border-slate-300/20" />
+                      <span
+                        className="h-3 w-3 rounded-[3px] bg-slate-100"
+                        aria-label="停止生成"
+                        style={{ boxShadow: "inset 0 0 0 1px rgba(71,85,105,0.32)" }}
+                      />
+                    </span>
                   ) : (
                     <svg className="w-4 h-4" fill="none" stroke="white" viewBox="0 0 24 24" style={{ opacity: input.trim() ? 1 : 0.5 }}>
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
@@ -3704,7 +3849,10 @@ ${sampleHint}
                   {isLoading && (
                     <>
                       <span className="opacity-50">·</span>
-                      <span>点击红色按钮停止</span>
+                      <span className="inline-flex items-center gap-1 text-slate-500">
+                        <span className="h-1.5 w-1.5 rounded-full bg-slate-500/70" />
+                        点击停止按钮中止生成
+                      </span>
                     </>
                   )}
                 </div>
@@ -3712,6 +3860,24 @@ ${sampleHint}
             </div>
           </div>
         </div>
+
+        <aside className="hidden w-[22rem] shrink-0 border-l border-teal-100 bg-white/70 p-4 xl:block">
+          <div className="sticky top-4 space-y-4">
+            <LearningLoopPanel
+              stats={learningPracticeStats}
+              masteryCount={masterySnapshot.length}
+              lastPractice={lastPracticeSummary}
+              disabled={isLoading}
+              onSendPrompt={(prompt) => void sendMessage(prompt)}
+            />
+            <div className="rounded-2xl border border-slate-100 bg-white/90 p-4 text-xs text-slate-600 shadow-sm">
+              <div className="font-semibold text-slate-800">演示提示</div>
+              <div className="mt-2 leading-relaxed">
+                先让系统基于课件回答，再出题并提交错题。右侧会同步显示 mastery 和优先复习点，随后可一键生成 3 天复习计划。
+              </div>
+            </div>
+          </div>
+        </aside>
       </main>
 
       {/* ============== 模态框 ============== */}
