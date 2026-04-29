@@ -12,7 +12,6 @@ import AgentTracePanel from "@/components/AgentTracePanel";
 import LearningLoopPanel from "@/components/LearningLoopPanel";
 import EvidenceCards from "@/components/EvidenceCards";
 import SafetyGuardCard from "@/components/SafetyGuardCard";
-import CompetitionHero from "@/components/CompetitionHero";
 
 // Types
 type MessageKind = "chat" | "quiz_set" | "exam_paper";
@@ -3499,14 +3498,6 @@ ${sampleHint}
           </button>
         </div>
       </header>
-
-      <CompetitionHero
-        sessionName={currentSessionName}
-        totalAttempts={learningPracticeStats?.total_attempts || 0}
-        weakCount={learningPracticeStats?.weak_points?.length || 0}
-        masteryCount={masterySnapshot.length || learningPracticeStats?.mastery_rows_total || 0}
-        backendReady={isBackendConnected}
-      />
 
       {/* ============== 主内容区 ============== */}
       <main className="chat-main flex-1 w-full relative overflow-hidden flex">
