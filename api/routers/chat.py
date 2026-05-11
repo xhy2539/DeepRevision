@@ -4,6 +4,7 @@ import re
 import time
 import hashlib
 import shlex
+import ast
 from contextlib import suppress
 from functools import lru_cache
 from fastapi import APIRouter, Body, Request, HTTPException
@@ -23,6 +24,7 @@ from utils.memory_service import memory_manager
 from utils.session_context import current_session_id
 from utils.rag_metrics import rag_get_metrics_snapshot, rag_inc
 from utils.config_handler import chroma_conf
+from utils.tool_context import format_tool_contexts_for_prompt, should_use_tool_context
 from utils.user_profile_service import (
     normalize_username,
     get_user_profile as get_user_profile_data,
@@ -45,7 +47,7 @@ _REGISTERED_TOOL_MAP: Dict[str, Any] = {
 RUNTIME_METRICS: Dict[str, Any] = {
     "total_requests": 0,
     "failed_requests": 0,
-    "routes": {"rag": 0, "quiz": 0, "exam": 0, "ops": 0, "planner": 0, "history": 0, "chitchat": 0},
+    "routes": {"rag": 0, "quiz": 0, "exam": 0, "ops": 0, "planner": 0, "history": 0, "learning_loop": 0, "chitchat": 0},
     "quiz_timeout_count": 0,
     "fallback_quality_guard_count": 0,
     "tool_call_count_rag": 0,
@@ -363,6 +365,45 @@ def _validate_session_id(session_id: str) -> str:
     if not _VALID_SESSION_ID.match(session_id):
         raise HTTPException(status_code=400, detail="非法 session_id")
     return session_id
+
+
+_INTERNAL_USER_PROMPT_PREFIXES = (
+    "你是资深课程命题教师，请基于已上传课件生成一套“综合测试卷”。",
+)
+
+
+def _should_hide_user_history_message(msg: Dict[str, Any]) -> bool:
+    """识别按钮触发的内部控制消息，避免污染历史列表和上下文。"""
+    if str(msg.get("role") or "") != "user":
+        return False
+    meta = msg.get("meta") if isinstance(msg.get("meta"), dict) else {}
+    if bool(meta.get("hidden") or meta.get("hide_user_message")):
+        return True
+    content = str(msg.get("content") or "").strip()
+    return any(content.startswith(prefix) for prefix in _INTERNAL_USER_PROMPT_PREFIXES)
+
+
+def _build_assistant_artifact_tool_context(query: str, message: Dict[str, Any], answer: str) -> Optional[Dict[str, Any]]:
+    """把生成的试卷/题卡转成可跨轮引用的工具上下文。"""
+    kind = str((message or {}).get("kind") or "").strip()
+    route = str(((message or {}).get("meta") or {}).get("route") or "").strip()
+    if kind == "exam_paper" or route == "exam":
+        tool_name = "generated_exam_paper"
+        summary = "生成的综合试卷"
+    elif kind == "quiz_set" or route == "quiz":
+        tool_name = "generated_quiz_set"
+        summary = "生成的练习题"
+    else:
+        return None
+    content = str(answer or "").strip()
+    if not content:
+        return None
+    return {
+        "tool_name": tool_name,
+        "args": {"route": route or kind, "query": str(query or "").strip()[:300]},
+        "summary": summary,
+        "content": content[:5000],
+    }
 
 
 def _tool_accepts_argument(tool_obj: Any, arg_name: str) -> bool:
@@ -738,26 +779,60 @@ def _extract_citations_from_context(context: str, limit: int = 6) -> List[Dict[s
         snippet = snippet[:120]
         metadata_text = str(match.group(3) or "").strip()
         source = f"参考资料{idx}"
-        try:
-            parsed_meta = json.loads(metadata_text.replace("'", '"'))
-            if isinstance(parsed_meta, dict):
-                source = str(parsed_meta.get("source_filename") or parsed_meta.get("source") or source)
-        except Exception:
-            pass
+        page = None
+        parsed_meta = _parse_context_metadata(metadata_text)
+        if parsed_meta:
+            source = str(parsed_meta.get("source_filename") or parsed_meta.get("source") or source)
+            page = parsed_meta.get("page")
         key = f"{source}|{snippet}"
         if key in seen:
             continue
         seen.add(key)
-        out.append(
-            {
-                "index": idx,
-                "source": source,
-                "quote": snippet,
-            }
-        )
+        item = {
+            "index": idx,
+            "source": source,
+            "quote": snippet,
+        }
+        if page not in (None, ""):
+            item["page"] = page
+        out.append(item)
         if len(out) >= limit:
             break
     return out
+
+
+def _parse_context_metadata(metadata_text: str) -> Dict[str, Any]:
+    """兼容 Python dict 与 JSON 两种上下文 metadata 表达。"""
+    raw = str(metadata_text or "").strip()
+    if not raw:
+        return {}
+    for parser in (ast.literal_eval, json.loads):
+        try:
+            parsed = parser(raw)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def _build_evidence_cards_from_citations(citations: List[Dict[str, Any]], limit: int = 3) -> List[Dict[str, Any]]:
+    """把检索引用转成前端证据卡，供 RAG 成功回答展示来源。"""
+    cards: List[Dict[str, Any]] = []
+    for citation in citations or []:
+        if not isinstance(citation, dict):
+            continue
+        source = str(citation.get("source") or "").strip()
+        quote = str(citation.get("quote") or "").strip()
+        if not source and not quote:
+            continue
+        card: Dict[str, Any] = {"source": source, "quote": quote, "grounded": True}
+        if citation.get("page") not in (None, ""):
+            card["page"] = citation.get("page")
+        cards.append(card)
+        if len(cards) >= limit:
+            break
+    return cards
 
 
 def _merge_persona_into_context(memory_context: str, persona_text: str) -> str:
@@ -790,6 +865,8 @@ async def chat_stream_endpoint(request: Request):
     persona_text = build_persona_instructions(user_profile)
     assistant_name = str(user_profile.get("assistant_name") or "DeepRevision")
     query = body.get("query", "")
+    client_action = str(body.get("client_action", "") or "").strip()
+    hide_user_message = bool(body.get("hide_user_message") or body.get("hideUserMessage"))
     exam_stage_plan = bool(body.get("exam_stage_plan", True))
     exam_rerun_stage = body.get("exam_rerun_stage")
     exam_partial_questions = body.get("exam_partial_questions") if isinstance(body.get("exam_partial_questions"), list) else []
@@ -809,6 +886,8 @@ async def chat_stream_endpoint(request: Request):
     recent_records = memory_manager.store[session_id]["recent"]
     chat_history = []
     for msg in recent_records:
+        if _should_hide_user_history_message(msg):
+            continue
         if msg["role"] == "user":
             chat_history.append(HumanMessage(content=msg["content"]))
         else:
@@ -818,7 +897,17 @@ async def chat_stream_endpoint(request: Request):
                 continue
             chat_history.append(AIMessage(content=msg["content"]))
 
+    tool_context_text = ""
+    if should_use_tool_context(query):
+        try:
+            recent_tool_contexts = memory_manager.get_recent_tool_contexts(session_id, limit=6)
+            tool_context_text = format_tool_contexts_for_prompt(recent_tool_contexts, query=query)
+        except Exception as e:
+            logger.warning(f"[ToolContext] 读取近期工具上下文失败 sid={session_id}: {e}")
+
     graph_context = _merge_persona_into_context(memory_manager.get_memory_context(session_id), persona_text)
+    if tool_context_text:
+        graph_context = f"{graph_context}\n\n{tool_context_text}".strip() if graph_context else tool_context_text
 
     def _attach_user_profile_meta(message_obj: Dict[str, Any]) -> Dict[str, Any]:
         """把用户级人格标识注入消息 meta，便于前端展示助手名称。"""
@@ -847,7 +936,9 @@ async def chat_stream_endpoint(request: Request):
             "input": query,
             "chat_history": chat_history,
             "memory_context": graph_context,
+            "tool_context": tool_context_text,
             "session_id": session_id,
+            "client_action": client_action,
             "exam_stage_plan": exam_stage_plan,
             "exam_rerun_stage": exam_rerun_stage,
             "exam_partial_questions": exam_partial_questions,
@@ -989,7 +1080,14 @@ async def chat_stream_endpoint(request: Request):
                             "input": query,
                             "chat_history": chat_history,
                             "memory_context": graph_context,
+                            "tool_context": tool_context_text,
                             "session_id": session_id,
+                            "exam_stage_plan": exam_stage_plan,
+                            "exam_rerun_stage": exam_rerun_stage,
+                            "exam_partial_questions": exam_partial_questions,
+                            "exam_fast_mode": exam_fast_mode,
+                            "quiz_force_llm_critic": quiz_force_llm_critic,
+                            "client_action": client_action,
                             "route": "",
                             "route_reason": "",
                             "route_params": {},
@@ -1367,17 +1465,33 @@ async def chat_stream_endpoint(request: Request):
                             message = build_assistant_message(route, answer, session_id, route_params, structured_result=None)
                             message = _attach_user_profile_meta(message)
                             payload = message.get("payload") if isinstance(message.get("payload"), dict) else {}
+                            evidence_cards: List[Dict[str, Any]] = []
+                            if route == "rag":
+                                evidence_cards = _build_evidence_cards_from_citations(rag_citations)
+                                if evidence_cards:
+                                    payload = {**payload, "evidence_cards": evidence_cards}
                             if bool(stream_v2_cfg.get("emit_sections", True)):
                                 payload = {**payload, "stream_sections": stream_sections}
                             message["payload"] = payload
                             meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
                             if route == "rag":
+                                evidence_status = (
+                                    "grounded"
+                                    if rag_grounded_evidence
+                                    else "partial"
+                                    if answer and evidence_cards
+                                    else "none"
+                                )
                                 meta = {
                                     **meta,
                                     "grounding_mode": "stream_v2_citation_match",
                                     "grounded_evidence_count": len(rag_grounded_evidence),
                                     "grounded_reason": rag_grounding_reason or ("pass" if rag_grounded_evidence else "partial"),
+                                    "evidence_status": evidence_status,
+                                    "evidence_count": len(evidence_cards),
                                 }
+                                if evidence_cards:
+                                    meta["evidence_source"] = f"课件引用 {len(evidence_cards)} 条"
                             message["meta"] = {**meta, "stream_version": "v2", "route_reason": route_reason}
                             _record_stream_event("complete")
                             yield _format_sse(
@@ -1711,14 +1825,15 @@ async def chat_stream_endpoint(request: Request):
             # 兼容旧前端：保留 [DONE] 终止标记
             yield "data: [DONE]\n\n"
 
-        # 保存对话历史（成功/失败都要记录用户输入，避免历史断层）
+        # 保存对话历史（隐藏控制消息只驱动本轮执行，不进入用户可见历史）
         now = int(time.time() * 1000)
-        await memory_manager.add_message(
-            session_id,
-            "user",
-            query,
-            timestamp=now,
-        )
+        if not hide_user_message:
+            await memory_manager.add_message(
+                session_id,
+                "user",
+                query,
+                timestamp=now,
+            )
 
         if client_disconnected:
             if sent_content.strip():
@@ -1762,6 +1877,17 @@ async def chat_stream_endpoint(request: Request):
                 meta=ai_meta,
                 timestamp=now + 1,
             )
+            artifact_context = _build_assistant_artifact_tool_context(query, message or {}, answer)
+            if artifact_context:
+                try:
+                    memory_manager.append_tool_contexts(
+                        session_id,
+                        [artifact_context],
+                        turn_query=query,
+                        source="assistant_artifact",
+                    )
+                except Exception as e:
+                    logger.warning(f"[ToolContext] 保存生成产物上下文失败 sid={session_id}: {e}")
         elif error_text:
             await memory_manager.add_message(
                 session_id,
@@ -1789,6 +1915,80 @@ async def chat_stream_endpoint(request: Request):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+def _update_learning_loop_after_practice(
+    session_id: str,
+    records: List[Dict[str, Any]],
+    *,
+    saved: int,
+) -> Dict[str, Any]:
+    """练习提交后推进学习闭环状态，供下一轮复盘使用。"""
+    try:
+        loop_state = memory_manager.get_agent_state(session_id, "learning_loop")
+    except Exception as e:
+        logger.warning(f"[LearningLoop] 读取闭环状态失败 sid={session_id}: {e}")
+        return {}
+    if not loop_state or loop_state.get("status") != "active":
+        return {}
+
+    safe_records = [row for row in records or [] if isinstance(row, dict)]
+    total = len(safe_records)
+    correct = sum(1 for row in safe_records if bool(row.get("is_correct")))
+    wrong = max(0, total - correct)
+    wrong_points = []
+    wrong_reasons = []
+    for row in safe_records:
+        if bool(row.get("is_correct")):
+            continue
+        kp = str(row.get("knowledge_point") or "未标注").strip() or "未标注"
+        reason = str(row.get("wrong_reason") or "").strip()
+        if kp not in wrong_points:
+            wrong_points.append(kp)
+        if reason and reason not in wrong_reasons:
+            wrong_reasons.append(reason)
+
+    current_phase = str(loop_state.get("phase") or "").strip()
+    day_match = re.match(r"day(\d+)_quiz_issued", current_phase)
+    if day_match:
+        phase = f"day{day_match.group(1)}_answered"
+        phase_label = f"Day{day_match.group(1)}"
+    elif current_phase == "remediation_quiz_issued":
+        phase = "remediation_answered"
+        phase_label = "补救练习"
+    else:
+        phase = "answered"
+        phase_label = "本轮"
+    summary = {
+        "total": total,
+        "correct": correct,
+        "wrong_count": wrong,
+        "score": correct,
+        "accuracy": round((correct / total) * 100.0, 1) if total > 0 else 0.0,
+        "saved": int(saved or 0),
+        "wrong_points": wrong_points,
+        "wrong_reasons": wrong_reasons[:5],
+        "submitted_at": int(time.time() * 1000),
+    }
+    next_action = (
+        f"复盘错题：优先回看「{'、'.join(wrong_points[:3])}」，然后继续学习闭环生成补救练习。"
+        if wrong_points
+        else f"{phase_label}全对：继续学习闭环，进入复盘并决定是否推进下一步。"
+    )
+    updated = {
+        **loop_state,
+        "phase": phase,
+        "last_practice_summary": summary,
+        "next_action": next_action,
+        "updated_at": int(time.time() * 1000),
+    }
+    try:
+        memory_manager.set_agent_state(session_id, "learning_loop", updated)
+        logger.info(f"[LearningLoop] practice submit 推进状态 sid={session_id}, phase={phase}, wrong={wrong}")
+        return updated
+    except Exception as e:
+        logger.warning(f"[LearningLoop] 写入闭环状态失败 sid={session_id}: {e}")
+        return {}
 
 
 @router.post("/practice/submit")
@@ -1833,6 +2033,7 @@ async def submit_practice_records(req: PracticeSubmitRequest = Body(...)):
         if tasks:
             await asyncio.gather(*tasks)
 
+        saved_records: List[Dict[str, Any]] = []
         for idx, record in enumerate(req.records):
             qid = record.question_id or f"{session_id}_{record.question_number or idx + 1}_{int(time.time() * 1000)}"
             kp_key = f"{str(record.knowledge_point or '')}|||{str(record.question_content or '')[:160]}"
@@ -1862,10 +2063,23 @@ async def submit_practice_records(req: PracticeSubmitRequest = Body(...)):
                 except Exception as e:
                     logger.warning(f"[Practice] 题库写入失败 qid={qid}: {e}")
                 saved += 1
+                saved_records.append(
+                    {
+                        "question_id": qid,
+                        "question_number": record.question_number,
+                        "question_content": record.question_content,
+                        "knowledge_point": normalized_kp,
+                        "user_answer": record.user_answer,
+                        "correct_answer": record.correct_answer,
+                        "is_correct": record.is_correct,
+                        "wrong_reason": record.wrong_reason,
+                    }
+                )
             except Exception as e:
                 logger.error(f"[Practice] 记录写入失败 qid={qid}: {e}")
                 continue
 
+        learning_loop_state = _update_learning_loop_after_practice(session_id, saved_records, saved=saved)
         stats = memory_manager.get_knowledge_point_stats(session_id)
         weak_points = [kp for kp, data in stats.items() if data.get("weak")]
         mastery_rows_total = memory_manager.get_mastery_rows_count(session_id)
@@ -1880,6 +2094,9 @@ async def submit_practice_records(req: PracticeSubmitRequest = Body(...)):
             "stats": stats,
             "mastery_rows_total": mastery_rows_total,
             "priority_review_points": priority_review_points,
+            "learning_loop_state_updated": bool(learning_loop_state),
+            "learning_loop_phase": learning_loop_state.get("phase") if learning_loop_state else None,
+            "learning_loop_next_action": learning_loop_state.get("next_action") if learning_loop_state else None,
         }
     except HTTPException:
         raise
@@ -1987,6 +2204,20 @@ async def get_mastery_snapshot(session_id: str, limit: int = 200, priority_limit
             "mastery_rows_total": mastery_rows_total,
             "mastery": snapshot,
             "priority_review_points": priority_points,
+        },
+    }
+
+
+@router.get("/learning-loop/state")
+async def get_learning_loop_state(session_id: str):
+    """获取学习闭环状态，供前端侧栏展示当前阶段和下一步。"""
+    _validate_session_id(session_id)
+    state = memory_manager.get_agent_state(session_id, "learning_loop")
+    return {
+        "code": 200,
+        "data": {
+            "session_id": session_id,
+            "state": state if isinstance(state, dict) else {},
         },
     }
 
@@ -2248,6 +2479,8 @@ async def get_messages(session_id: str):
     messages = memory_manager.get_messages(session_id)
     normalized = []
     for msg in messages:
+        if _should_hide_user_history_message(msg):
+            continue
         normalized.append({
             "id": f"{msg.get('timestamp', 0)}",
             "role": msg.get("role"),

@@ -104,6 +104,13 @@ def _create_tables(conn: sqlite3.Connection):
             question_text     TEXT,
             created_at        INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS agent_states (
+            session_id TEXT    NOT NULL,
+            agent_name TEXT    NOT NULL,
+            state_json TEXT    NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (session_id, agent_name)
+        );
     """)
     # 创建索引，加速按 session_id 查询
     conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_sid ON messages(session_id);")
@@ -115,6 +122,7 @@ def _create_tables(conn: sqlite3.Connection):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_quiz_round_sid ON quiz_round_questions(session_id);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_quiz_round_sid_created ON quiz_round_questions(session_id, created_at DESC);")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_quiz_round_sid_round ON quiz_round_questions(session_id, round_id);")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_states_sid ON agent_states(session_id);")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS question_bank (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -499,7 +507,60 @@ def _delete_session_sync(db: str, session_id: str):
         conn.execute("DELETE FROM practice_records WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM knowledge_mastery WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM quiz_round_questions WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM agent_states WHERE session_id = ?", (session_id,))
         conn.commit()
+    finally:
+        conn.close()
+
+
+def _get_agent_state_sync(db: str, session_id: str, agent_name: str) -> Dict[str, Any]:
+    """读取指定 agent 的持久状态。"""
+    conn = sqlite3.connect(db)
+    try:
+        _create_tables(conn)
+        row = conn.execute(
+            "SELECT state_json FROM agent_states WHERE session_id = ? AND agent_name = ?",
+            (session_id, agent_name),
+        ).fetchone()
+        if not row:
+            return {}
+        parsed = _loads_json_or_default(row[0], {})
+        return parsed if isinstance(parsed, dict) else {}
+    finally:
+        conn.close()
+
+
+def _set_agent_state_sync(db: str, session_id: str, agent_name: str, state: Dict[str, Any]) -> None:
+    """写入指定 agent 的持久状态。"""
+    conn = sqlite3.connect(db)
+    try:
+        _create_tables(conn)
+        conn.execute("INSERT OR IGNORE INTO sessions (session_id, name) VALUES (?, ?)", (session_id, session_id))
+        conn.execute(
+            """
+            INSERT INTO agent_states (session_id, agent_name, state_json, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(session_id, agent_name)
+            DO UPDATE SET state_json = excluded.state_json, updated_at = excluded.updated_at
+            """,
+            (session_id, agent_name, json.dumps(state or {}, ensure_ascii=False), int(time.time() * 1000)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _clear_agent_state_sync(db: str, session_id: str, agent_name: str) -> bool:
+    """清除指定 agent 的持久状态。"""
+    conn = sqlite3.connect(db)
+    try:
+        _create_tables(conn)
+        cur = conn.execute(
+            "DELETE FROM agent_states WHERE session_id = ? AND agent_name = ?",
+            (session_id, agent_name),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0) > 0
     finally:
         conn.close()
 
@@ -726,7 +787,12 @@ class SessionMemoryManager:
         self._init_session(session_id, name, parent_id)
         self.store[session_id]["name"] = name
         self.store[session_id]["parent_id"] = parent_id
-        asyncio.create_task(self._persist(session_id))
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _save_session_sync(self.db, session_id, self.store[session_id])
+        else:
+            loop.create_task(self._persist(session_id))
 
     async def add_message(
         self,
@@ -939,6 +1005,91 @@ class SessionMemoryManager:
         _ensure_session_loaded(self.store, self.db, session_id)
         return list(self.store.get(session_id, {}).get("recent", []))
 
+    def get_agent_state(self, session_id: str, agent_name: str) -> Dict[str, Any]:
+        """读取某个 Agent 在会话内的持久状态。"""
+        sid = str(session_id or "").strip() or "default"
+        name = str(agent_name or "").strip() or "default_agent"
+        return _get_agent_state_sync(self.db, sid, name)
+
+    def set_agent_state(self, session_id: str, agent_name: str, state: Dict[str, Any]) -> Dict[str, Any]:
+        """保存某个 Agent 在会话内的持久状态。"""
+        sid = str(session_id or "").strip() or "default"
+        name = str(agent_name or "").strip() or "default_agent"
+        safe_state = state if isinstance(state, dict) else {}
+        _set_agent_state_sync(self.db, sid, name, safe_state)
+        return safe_state
+
+    def clear_agent_state(self, session_id: str, agent_name: str) -> bool:
+        """清除某个 Agent 在会话内的持久状态。"""
+        sid = str(session_id or "").strip() or "default"
+        name = str(agent_name or "").strip() or "default_agent"
+        return _clear_agent_state_sync(self.db, sid, name)
+
+    def append_tool_contexts(
+        self,
+        session_id: str,
+        observations: List[Dict[str, Any]],
+        *,
+        turn_query: str = "",
+        source: str = "react_orchestrator",
+        max_items: int = 20,
+        max_content_chars: int = 5000,
+    ) -> int:
+        """追加近期工具上下文，供后续轮次按需引用。"""
+        sid = str(session_id or "").strip() or "default"
+        state = self.get_agent_state(sid, "tool_context")
+        items = state.get("items") if isinstance(state.get("items"), list) else []
+        now = int(time.time() * 1000)
+        saved = 0
+        for obs in observations or []:
+            if not isinstance(obs, dict):
+                continue
+            tool_name = str(obs.get("tool_name") or "").strip()
+            content = str(obs.get("content") or "").strip()
+            if not tool_name or not content:
+                continue
+            args = obs.get("args") if isinstance(obs.get("args"), dict) else {}
+            clipped_content = content[:max_content_chars]
+            summary = str(obs.get("summary") or "").strip() or clipped_content[:160]
+            digest = hashlib.sha1(f"{sid}:{tool_name}:{now}:{clipped_content[:200]}".encode("utf-8")).hexdigest()[:16]
+            items.append(
+                {
+                    "id": f"tc_{digest}",
+                    "session_id": sid,
+                    "tool_name": tool_name,
+                    "args": json.loads(json.dumps(args, ensure_ascii=False, default=str)),
+                    "summary": summary[:300],
+                    "content": clipped_content,
+                    "turn_query": str(turn_query or "").strip()[:500],
+                    "source": str(source or "react_orchestrator"),
+                    "created_at": now + saved,
+                }
+            )
+            saved += 1
+        if saved:
+            keep = max(1, int(max_items or 20))
+            self.set_agent_state(sid, "tool_context", {"items": items[-keep:], "updated_at": now})
+        return saved
+
+    def get_recent_tool_contexts(
+        self,
+        session_id: str,
+        *,
+        limit: int = 6,
+        tool_names: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """读取近期工具上下文，按创建顺序返回最近 limit 条。"""
+        sid = str(session_id or "").strip() or "default"
+        state = self.get_agent_state(sid, "tool_context")
+        items = state.get("items") if isinstance(state.get("items"), list) else []
+        allowed = {str(name).strip() for name in (tool_names or []) if str(name).strip()}
+        filtered = [
+            item for item in items
+            if isinstance(item, dict) and (not allowed or str(item.get("tool_name") or "").strip() in allowed)
+        ]
+        safe_limit = max(1, min(int(limit or 6), 20))
+        return filtered[-safe_limit:]
+
     def delete_message(self, session_id: str, timestamp: int) -> bool:
         """
         删除指定 timestamp 的消息。
@@ -1031,11 +1182,12 @@ class SessionMemoryManager:
         if session_id not in self.store:
             return False
         del self.store[session_id]
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            loop.run_in_executor(None, partial(_delete_session_sync, self.db, session_id))
-        else:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
             _delete_session_sync(self.db, session_id)
+        else:
+            loop.run_in_executor(None, partial(_delete_session_sync, self.db, session_id))
         return True
 
     def add_practice_record(self, session_id: str, question_id: str, question_content: str,

@@ -24,10 +24,19 @@ type PracticeSummary = {
   saved: number;
 } | null;
 
+type LearningLoopState = {
+  phase?: string;
+  status?: string;
+  current_day?: number;
+  next_action?: string;
+  review_decision?: string;
+};
+
 type LearningLoopPanelProps = {
   stats: PracticeStats | null;
   masteryCount: number;
   lastPractice: PracticeSummary;
+  loopState?: LearningLoopState | null;
   disabled?: boolean;
   onSendPrompt: (prompt: string) => void;
 };
@@ -40,10 +49,30 @@ function fmtScore(value?: number): string {
   return Number.isFinite(value) ? Number(value).toFixed(2) : "0.00";
 }
 
+function formatPhaseLabel(phase: string): string {
+  const match = phase.match(/^day(\d+)_(quiz_issued|answered|reviewed)$/);
+  if (match) {
+    const [, day, status] = match;
+    if (status === "quiz_issued") return `Day${day} 练习中`;
+    if (status === "answered") return `Day${day} 待复盘`;
+    return `Day${day} 已复盘`;
+  }
+  const phaseLabelMap: Record<string, string> = {
+    planned: "已规划",
+    cycle_completed: "周期完成",
+    remediation_quiz_issued: "补救练习中",
+    remediation_answered: "补救待复盘",
+    remediation_reviewed: "补救已复盘",
+    answered: "待复盘",
+  };
+  return phase ? (phaseLabelMap[phase] || phase) : "未启动";
+}
+
 export default function LearningLoopPanel({
   stats,
   masteryCount,
   lastPractice,
+  loopState,
   disabled,
   onSendPrompt,
 }: LearningLoopPanelProps) {
@@ -53,6 +82,17 @@ export default function LearningLoopPanel({
   const weakPoints = (stats?.weak_points || []).slice(0, 5);
   const firstWeakPoint =
     priority[0]?.knowledge_point || weakPoints[0] || lastPractice?.wrongPoints?.[0] || "";
+  const phase = String(loopState?.phase || "").trim();
+  const phaseLabel = formatPhaseLabel(phase);
+  const nextAction = String(loopState?.next_action || "").trim();
+  const continueLabel =
+    phase === "cycle_completed"
+      ? "开启新周期"
+      : /^day\d+_reviewed$/.test(phase) || phase === "remediation_reviewed"
+      ? (loopState?.review_decision === "remedial_practice" ? "生成补救题" : "生成下一题")
+      : /^day\d+_answered$/.test(phase) || phase === "remediation_answered"
+      ? "进入复盘"
+      : "继续闭环";
 
   return (
     <section className="rounded-[1.35rem] border border-slate-200/70 bg-white/85 p-4 shadow-[0_18px_45px_rgba(15,23,42,0.06)] backdrop-blur">
@@ -63,6 +103,18 @@ export default function LearningLoopPanel({
         </div>
         <div className="rounded-full bg-slate-900 px-3 py-1 text-[11px] font-semibold text-white">
           {masteryCount || stats?.mastery_rows_total || 0} 考点
+        </div>
+      </div>
+
+      <div className="mt-3 rounded-2xl border border-teal-100 bg-teal-50/70 px-3 py-2">
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-[11px] font-semibold text-teal-700">当前阶段</span>
+          <span className="rounded-full bg-white px-2 py-0.5 text-[11px] font-semibold text-teal-800">
+            {phaseLabel}
+          </span>
+        </div>
+        <div className="mt-1.5 line-clamp-2 text-[11px] leading-5 text-teal-900">
+          {nextAction || (phase ? "按当前闭环阶段继续推进。" : "点击开始自主复习生成 Day1 任务。")}
         </div>
       </div>
 
@@ -129,7 +181,26 @@ export default function LearningLoopPanel({
         )}
       </div>
 
-      <div className="mt-4 grid grid-cols-2 gap-2">
+      <div className="mt-4 space-y-2">
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            type="button"
+            disabled={disabled}
+            onClick={() => onSendPrompt("请进入学习闭环：根据我的练习画像和课件，安排今天的复习任务，并给我 Day1 练习建议。")}
+            className="rounded-full bg-teal-600 px-3 py-2 text-center text-xs font-semibold text-white transition hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            开始自主复习
+          </button>
+          <button
+            type="button"
+            disabled={disabled}
+            onClick={() => onSendPrompt("继续学习闭环，进入下一步。")}
+            className="rounded-full bg-emerald-100 px-3 py-2 text-center text-xs font-semibold text-emerald-900 transition hover:bg-emerald-200 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {continueLabel}
+          </button>
+        </div>
+        <div className="grid grid-cols-2 gap-2">
         <button
           type="button"
           disabled={disabled}
@@ -146,6 +217,7 @@ export default function LearningLoopPanel({
         >
           再练一题
         </button>
+        </div>
       </div>
     </section>
   );

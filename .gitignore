@@ -17,6 +17,7 @@ venv/
 .coverage
 coverage/
 htmlcov/
+test-results/
 
 # Node.js / React前端
 node_modules/
@@ -39,6 +40,9 @@ logs/
 data/
 tmp/
 output/
+.playwright-cli/
+react/.playwright-cli/
+%SystemDrive%/
 server.log
 log.md
 # 测试/调试临时文本

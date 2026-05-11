@@ -180,15 +180,16 @@ class VectorStoreService():
             self._save_file_vector_map(mapping)
 
         async def get_file_document(read_path: str):
-            if read_path.endswith(".txt"):
+            ext = os.path.splitext(read_path)[1].lower()
+            if ext == ".txt":
                 return txt_loader(read_path)
-            elif read_path.endswith(".pdf"):
+            elif ext == ".pdf":
                 return pdf_loader(read_path)
-            elif read_path.endswith(".docx") or read_path.endswith(".doc"):
+            elif ext in {".docx", ".doc"}:
                 return word_loader(read_path)
-            elif read_path.endswith(".pptx") or read_path.endswith(".ppt"):
+            elif ext in {".pptx", ".ppt"}:
                 return ppt_loader(read_path)
-            elif read_path.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")):
+            elif ext in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}:
                 return image_loader(read_path)
             return []
 

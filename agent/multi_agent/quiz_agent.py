@@ -19,7 +19,7 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 from model.factory import chat_model, light_chat_model, backup_chat_model, backup_light_chat_model
-from agent.tools.agent_tools import get_rag_service
+from agent.tools.agent_tools import fetch_exam_paper_reference, search_exam_format, get_rag_service
 from utils.config_handler import chroma_conf
 from utils.session_context import current_session_id
 from utils.logger_handler import logger
@@ -1946,6 +1946,41 @@ def _normalize_choice_answer(answer: str, options: List[str]) -> str:
     return "A"
 
 
+def _extract_choice_answer_from_explanation(text: str) -> str:
+    """从解析末尾的明确结论中提取选择题答案字母。"""
+    normalized = str(text or "").upper().translate(str.maketrans("ＡＢＣＤ", "ABCD"))
+    if not normalized.strip():
+        return ""
+
+    patterns = [
+        r"(?:最终|最后|综上|因此|故|所以|修正|确认)[^。；;\n]{0,40}(?:答案|应选|选择|选项)[为是：:\s]*([ABCD])\b",
+        r"(?:正确答案|标准答案|答案|应选|选择|选项)[为是：:\s]*([ABCD])\b",
+        r"\b([ABCD])\s*(?:为|是)?(?:正确答案|标准答案|正确选项)",
+    ]
+    matches: List[str] = []
+    for pattern in patterns:
+        matches.extend(m.group(1).upper() for m in re.finditer(pattern, normalized))
+    return matches[-1] if matches else ""
+
+
+def _reconcile_choice_answers_with_explanations(questions: List[dict]) -> tuple[List[dict], List[dict]]:
+    """交付前修正选择题 answer 与解析最终答案不一致的问题。"""
+    reconciled: List[dict] = []
+    fixes: List[dict] = []
+    for index, question in enumerate(questions or [], start=1):
+        q = dict(question or {})
+        qtype = _normalize_question_type(q.get("type"), "选择题")
+        options = q.get("options") or []
+        if qtype == "选择题" and isinstance(options, list) and len(options) >= 4:
+            declared = _normalize_choice_answer(str(q.get("answer") or ""), options)
+            inferred = _extract_choice_answer_from_explanation(q.get("explanation") or q.get("analysis") or "")
+            if inferred in {"A", "B", "C", "D"} and declared != inferred:
+                q["answer"] = inferred
+                fixes.append({"number": q.get("number") or q.get("id") or index, "from": declared, "to": inferred})
+        reconciled.append(q)
+    return reconciled, fixes
+
+
 def _ensure_choice_structure(question: dict) -> dict:
     q = dict(question)
     stem = _shorten_stem_for_exam(str(q.get("content") or "").strip(), max_len=90)
@@ -3266,6 +3301,7 @@ async def run_quiz_agent(
         rag_context=rag_context,
         target_num=max(1, int(num)),
     )
+    parsed_questions, answer_consistency_fixes = _reconcile_choice_answers_with_explanations(parsed_questions)
 
     floor_flags = _quiz_quality_floor_flags(parsed_questions, quiz_type, num)
     if quiz_type == "选择题" and not bool(floor_flags.get("options_ok")):
@@ -3287,6 +3323,7 @@ async def run_quiz_agent(
                 rag_context=rag_context,
                 target_num=max(1, int(num)),
             )
+            parsed_questions, answer_consistency_fixes = _reconcile_choice_answers_with_explanations(parsed_questions)
             floor_flags = _quiz_quality_floor_flags(parsed_questions, quiz_type, num)
             result = {**result, "delivery_mode": "partial_revised", "degrade_reason": "missing_choice_options_repaired"}
         if not bool(floor_flags.get("options_ok")):
@@ -3346,6 +3383,7 @@ async def run_quiz_agent(
             "quiz_end_to_end_ms": end_to_end_ms,
             "tool_gate_reason": gate_reason,
             "term_style_ok": term_style_ok,
+            "choice_answer_consistency_fixes": answer_consistency_fixes,
         },
     }
 
@@ -3681,35 +3719,40 @@ async def run_exam_agent(
 
     logger.info(f"[Exam Agent] 校验后参数: quiz_types={quiz_types}, total_questions={total_questions}, quantity_dist={quantity_dist}")
 
-    # 如果没有样卷，联网搜索试卷“格式参考”（用于样式，不替代课件知识证据）
+    # 如果没有样卷，先找真实试卷风格参考；找不到再降级到题型格式参考。
     online_format_context = ""
     if not sample_paper_context or sample_paper_context.strip() == "":
-        logger.info("[Exam Agent] 无样卷，联网搜索试卷格式和考点参考...")
-        search_result = ""
-        try:
-            # 优先尝试 DuckDuckGo
-            from langchain_community.tools import DuckDuckGoSearchRun
-            search = DuckDuckGoSearchRun()
-            search_query = f"{topics[0] if topics else '大学课程'} 期末考试试卷 题型分布 结构"
-            search_result = search.run(search_query)
-        except Exception as e:
-            logger.warning(f"[Exam Agent] DuckDuckGo 失败，尝试 Tavily: {e}")
-            try:
-                # 备用：Tavily
-                from langchain_community.tools import TavilySearchResults
-                search = TavilySearchResults(max_results=3)
-                docs = search.run(f"{topics[0] if topics else '大学课程'} 期末考试试卷 题型")
-                if docs:
-                    search_result = "\n".join([d.get("content", "")[:500] for d in docs if d.get("content")])
-            except Exception as e2:
-                logger.warning(f"[Exam Agent] Tavily 也失败: {e2}")
+        logger.info("[Exam Agent] 无样卷，联网搜索真实试卷参考...")
+        session_course = str(current_session_id.get() or "").strip()
+        topic_hint = str(topics[0] if topics else "").strip()
+        reference_course = session_course if session_course and session_course != "default" else (topic_hint or "大学课程")
 
-        if search_result and len(search_result) > 50:
-            online_format_context = f"\n\n【联网搜索的试卷格式参考】（无本地样卷时使用）：\n{search_result[:1500]}..."
-            logger.info("[Exam Agent] 联网搜索获取格式参考成功")
+        try:
+            online_format_context = await fetch_exam_paper_reference(
+                reference_course,
+                topic_hint=topic_hint,
+                limit=5,
+            )
+        except Exception as e:
+            logger.warning(f"[Exam Agent] 真实试卷搜索失败: {e}")
+            online_format_context = ""
+
+        if online_format_context:
+            logger.info("[Exam Agent] 联网搜索获取真实试卷参考成功")
             tool_call_web = 1
         else:
-            online_format_context = "\n\n【提示】无样卷参考，请使用通用期末试卷格式：选择题、填空题、判断题、简答题四种题型均衡分布。"
+            logger.info("[Exam Agent] 未找到真实试卷参考，降级搜索题型格式参考")
+            try:
+                format_result = str(await search_exam_format.ainvoke({"course_name": reference_course}) or "")
+                if format_result and "未获取到" not in format_result and "无法获取" not in format_result:
+                    online_format_context = f"【联网题型格式参考】\n{format_result[:2000]}"
+                    logger.info("[Exam Agent] 联网搜索获取题型格式参考成功")
+                    tool_call_web = 1
+            except Exception as e:
+                logger.warning(f"[Exam Agent] 题型格式搜索失败: {e}")
+
+            if not online_format_context:
+                online_format_context = "【提示】无样卷和可用联网试卷参考，请使用通用期末试卷格式：选择题、填空题、判断题、简答题四种题型均衡分布。"
     else:
         logger.info("[Exam Agent] 使用本地样卷格式")
 
@@ -3766,7 +3809,7 @@ async def run_exam_agent(
     evidence_source = "courseware_plus_web" if tool_call_web > 0 else "courseware_only"
 
     # 合并样卷格式和联网搜索结果
-    final_sample_context = (sample_paper_context or "") + online_format_context
+    final_sample_context = (sample_paper_context or "") + ("\n\n" + online_format_context if online_format_context else "")
 
     initial_state: ExamPaperState = {
         "topics": topics,

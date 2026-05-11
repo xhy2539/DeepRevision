@@ -198,6 +198,11 @@ def build_assistant_message(
 ) -> Dict[str, Any]:
     """构造统一的助手消息协议。"""
     route_params = route_params or {}
+    orchestrator = route_params.get("orchestrator") if isinstance(route_params.get("orchestrator"), dict) else {}
+    react_trace = orchestrator.get("trace") if isinstance(orchestrator.get("trace"), list) else []
+    react_status = str(orchestrator.get("react_status") or "").strip()
+    task_plan = orchestrator.get("task_plan") if isinstance(orchestrator.get("task_plan"), dict) else {}
+    plan_execution = orchestrator.get("plan_execution") if isinstance(orchestrator.get("plan_execution"), list) else []
 
     if structured_result:
         content = structured_result.get("text", answer) or answer
@@ -210,6 +215,12 @@ def build_assistant_message(
                 else "markdown"
             )
         payload = structured_result.get("payload") or {}
+        if react_trace and isinstance(payload, dict):
+            payload = {**payload, "agent_trace": payload.get("agent_trace") or react_trace}
+        if isinstance(payload, dict) and task_plan:
+            payload = {**payload, "task_plan": payload.get("task_plan") or task_plan}
+        if isinstance(payload, dict) and plan_execution:
+            payload = {**payload, "plan_execution": payload.get("plan_execution") or plan_execution}
         if kind == "quiz_set":
             if not isinstance(payload, dict):
                 payload = {}
@@ -233,6 +244,14 @@ def build_assistant_message(
             "generated_at": int(time.time()),
             "structured": True,
         }
+        if react_trace:
+            merged_meta.update(
+                {
+                    "agent_mode": "react",
+                    "react_status": react_status or "pass",
+                    "agent_trace": extra_meta.get("agent_trace") or react_trace,
+                }
+            )
         merged_meta.update(extra_meta)
         return {
             "kind": kind,
@@ -262,15 +281,29 @@ def build_assistant_message(
         render_mode = "exam_canvas"
         payload = _build_exam_payload(answer)
 
+    if task_plan:
+        payload = {**payload, "task_plan": task_plan}
+    if plan_execution:
+        payload = {**payload, "plan_execution": plan_execution}
+
     return {
         "kind": kind,
         "render_mode": render_mode,
         "content": answer,
-        "payload": payload,
+        "payload": {**payload, "agent_trace": react_trace} if react_trace else payload,
         "meta": {
             "route": route,
             "session_id": session_id,
             "generated_at": int(time.time()),
+            **(
+                {
+                    "agent_mode": "react",
+                    "react_status": react_status or "pass",
+                    "agent_trace": react_trace,
+                }
+                if react_trace
+                else {}
+            ),
         },
     }
 

@@ -2,7 +2,10 @@ import json
 import re
 import os
 import asyncio
-from typing import Optional
+import ast
+import hashlib
+from typing import Optional, List, Tuple, Any
+from urllib.parse import urlparse
 
 from langchain_core.tools import tool
 from rag.rag_service import RagSummarizeService
@@ -18,6 +21,57 @@ WEB_SEARCH_ENABLED = agent_conf.get('web_search', {}).get('enabled', True)
 # 因此 check-then-set 在单 event loop 内是原子的，无需加锁（fix #7）
 _rag_cache: dict[str, RagSummarizeService] = {}
 _VALID_SESSION_ID = re.compile(r'^[\u4e00-\u9fa5a-zA-Z0-9_\-]{1,64}$')
+_UNSAFE_SEARCH_TERMS = {
+    "成人视频",
+    "成人内容",
+    "色情",
+    "黄色",
+    "裸聊",
+    "4p",
+    "操死",
+    "鲍鱼粉嫩",
+}
+_LOW_VALUE_SEARCH_DOMAINS = {
+    "douyin.com",
+    "iesdouyin.com",
+    "tiktok.com",
+    "pinterest.com",
+    "kuaishou.com",
+}
+_EXAM_FORMAT_TERMS = (
+    "期末",
+    "考试",
+    "试卷",
+    "题型",
+    "卷面",
+    "选择题",
+    "判断题",
+    "填空题",
+    "简答题",
+    "final exam",
+)
+_EXAM_PAPER_TERMS = (
+    "期末考试",
+    "试卷",
+    "试题",
+    "真题",
+    "答案",
+    "a卷",
+    "b卷",
+    "闭卷",
+    "开卷",
+    "课程考试",
+    "final exam",
+    "exam paper",
+)
+_EXAM_FILE_HINTS = (".pdf", ".doc", ".docx", ".ppt", ".pptx")
+_COURSE_ALIASES = {
+    "操作系统": ("操作系统", "operating system", "operating systems"),
+    "数据结构": ("数据结构", "data structure", "data structures"),
+    "计算机网络": ("计算机网络", "computer network", "computer networking"),
+    "数据库": ("数据库", "database", "database systems"),
+    "软件工程": ("软件工程", "software engineering"),
+}
 
 
 def _normalize_session_id(session_id: Optional[str]) -> str:
@@ -26,6 +80,225 @@ def _normalize_session_id(session_id: Optional[str]) -> str:
     if not _VALID_SESSION_ID.match(sid):
         raise ValueError("session_id 格式非法，只允许字母、数字、中文、下划线和连字符（最长64位）")
     return sid
+
+
+def _clean_search_text(value: Any, limit: int = 260) -> str:
+    """清洗搜索标题/摘要，避免前端展示大段噪声。"""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) > limit:
+        return text[:limit].rstrip() + "..."
+    return text
+
+
+def _source_domain(url: str) -> str:
+    """从 URL 提取展示用域名。"""
+    parsed = urlparse(str(url or ""))
+    domain = (parsed.netloc or parsed.path).split("/")[0].lower()
+    return domain[4:] if domain.startswith("www.") else domain
+
+
+def _normalize_search_docs(raw_docs: Any) -> List[dict]:
+    """兼容不同搜索后端的返回结构，统一为 title/link/snippet。"""
+    if isinstance(raw_docs, str):
+        try:
+            raw_docs = json.loads(raw_docs)
+        except Exception:
+            return [{"title": "搜索摘要", "link": "", "snippet": raw_docs}]
+    if isinstance(raw_docs, dict):
+        raw_docs = raw_docs.get("results") or raw_docs.get("documents") or [raw_docs]
+    if not isinstance(raw_docs, list):
+        return []
+
+    docs: List[dict] = []
+    for item in raw_docs:
+        if not isinstance(item, dict):
+            continue
+        link = str(item.get("link") or item.get("url") or item.get("href") or "").strip()
+        title = _clean_search_text(
+            item.get("title") or item.get("name") or item.get("heading") or link or "未命名结果",
+            limit=120,
+        )
+        snippet = _clean_search_text(
+            item.get("snippet") or item.get("body") or item.get("content") or item.get("description") or "",
+            limit=320,
+        )
+        if not (title or snippet or link):
+            continue
+        docs.append({"title": title, "link": link, "snippet": snippet, "domain": _source_domain(link)})
+    return docs
+
+
+def _is_low_value_search_doc(doc: dict) -> bool:
+    """过滤成人、短视频、纯娱乐站点等不适合学习场景的结果。"""
+    text = f"{doc.get('title', '')} {doc.get('snippet', '')}".lower()
+    domain = str(doc.get("domain") or _source_domain(str(doc.get("link") or ""))).lower()
+    if any(term.lower() in text for term in _UNSAFE_SEARCH_TERMS):
+        return True
+    return any(domain == bad or domain.endswith("." + bad) for bad in _LOW_VALUE_SEARCH_DOMAINS)
+
+
+def _dedupe_search_docs(docs: List[dict], limit: int = 5) -> List[dict]:
+    """按链接和标题去重，并限制返回数量。"""
+    result: List[dict] = []
+    seen = set()
+    for doc in _normalize_search_docs(docs):
+        if _is_low_value_search_doc(doc):
+            continue
+        key = str(doc.get("link") or doc.get("title") or "").lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(doc)
+        if len(result) >= max(1, min(int(limit or 5), 10)):
+            break
+    return result
+
+
+def _format_search_results(query: str, docs: Any, limit: int = 5) -> str:
+    """把结构化搜索结果格式化为可追溯 Markdown。"""
+    normalized = _dedupe_search_docs(_normalize_search_docs(docs), limit=limit)
+    if not normalized:
+        return f"未获取到与“{query}”相关的可信联网搜索结果。"
+
+    lines = [
+        f"**检索词**：{_clean_search_text(query, limit=160)}",
+        "**说明**：联网结果仅作辅助参考，课程结论仍应优先以已上传课件为准。",
+        "",
+    ]
+    for index, doc in enumerate(normalized, 1):
+        title = doc.get("title") or "未命名结果"
+        link = doc.get("link") or ""
+        domain = doc.get("domain") or _source_domain(link) or "未知来源"
+        snippet = doc.get("snippet") or "该结果未返回摘要。"
+        title_part = f"[{title}]({link})" if link else title
+        lines.extend(
+            [
+                f"{index}. {title_part}",
+                f"   - 来源：{domain}",
+                f"   - 摘要：{snippet}",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _course_terms(course_name: str) -> Tuple[str, ...]:
+    """生成课程名及常见英文别名，用于过滤题型搜索噪声。"""
+    course = str(course_name or "").strip()
+    return _COURSE_ALIASES.get(course, (course,)) if course else tuple()
+
+
+def _filter_exam_format_docs(course_name: str, docs: Any, limit: int = 5) -> List[dict]:
+    """保留同时命中课程名和考试题型语义的搜索结果。"""
+    terms = tuple(term.lower() for term in _course_terms(course_name) if term)
+    candidates = []
+    for doc in _dedupe_search_docs(_normalize_search_docs(docs), limit=20):
+        text = f"{doc.get('title', '')} {doc.get('snippet', '')}".lower()
+        course_hit = any(term in text for term in terms) if terms else True
+        exam_score = sum(1 for term in _EXAM_FORMAT_TERMS if term.lower() in text)
+        if not course_hit or exam_score <= 0:
+            continue
+        candidates.append((exam_score, doc))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return [doc for _, doc in candidates[: max(1, min(int(limit or 5), 10))]]
+
+
+def _filter_exam_paper_docs(course_name: str, docs: Any, limit: int = 5) -> List[dict]:
+    """筛出更像真实试卷/真题文件的联网结果，并降低普通总结页权重。"""
+    terms = tuple(term.lower() for term in _course_terms(course_name) if term)
+    candidates = []
+    for doc in _dedupe_search_docs(_normalize_search_docs(docs), limit=30):
+        title = str(doc.get("title") or "")
+        link = str(doc.get("link") or "")
+        snippet = str(doc.get("snippet") or "")
+        domain = str(doc.get("domain") or _source_domain(link)).lower()
+        text = f"{title} {snippet} {link}".lower()
+        title_link_text = f"{title} {link}".lower()
+        course_hit = any(term in text for term in terms) if terms else True
+        paper_score = sum(1 for term in _EXAM_PAPER_TERMS if term.lower() in text)
+        strong_paper_score = sum(1 for term in _EXAM_PAPER_TERMS if term.lower() in title_link_text)
+        file_score = 2 if any(hint in link.lower() or hint in title.lower() for hint in _EXAM_FILE_HINTS) else 0
+        edu_score = 1 if domain.endswith("edu.cn") or ".edu." in domain or "edu.cn" in link.lower() else 0
+        if not course_hit or paper_score <= 0 or (strong_paper_score <= 0 and file_score <= 0):
+            continue
+        candidates.append((paper_score + file_score + edu_score, file_score, edu_score, doc))
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    return [doc for *_score, doc in candidates[: max(1, min(int(limit or 5), 10))]]
+
+
+def _format_exam_paper_reference(course_name: str, query: str, docs: Any, limit: int = 5) -> str:
+    """把真实试卷搜索结果整理为出卷风格参考，明确禁止复制原题。"""
+    filtered = _filter_exam_paper_docs(course_name, docs, limit=limit)
+    if not filtered:
+        return ""
+
+    lines = [
+        "【联网真实试卷参考】",
+        f"课程：{_clean_search_text(course_name or '大学课程', limit=80)}",
+        f"检索词：{_clean_search_text(query, limit=160)}",
+        "用途：仅参考题型结构、难度分布、题干表达风格和是否包含答案。",
+        "约束：禁止照抄或改写真实试卷原题；题目事实依据仍以课件/RAG内容为准。",
+        "",
+    ]
+    for index, doc in enumerate(filtered, 1):
+        title = doc.get("title") or "未命名试卷参考"
+        link = doc.get("link") or ""
+        domain = doc.get("domain") or _source_domain(link) or "未知来源"
+        snippet = doc.get("snippet") or "该结果未返回摘要。"
+        title_part = f"[{title}]({link})" if link else title
+        lines.extend(
+            [
+                f"{index}. {title_part}",
+                f"   - 来源：{domain}",
+                f"   - 可参考点：{snippet}",
+            ]
+        )
+    return "\n".join(lines)
+
+
+async def fetch_exam_paper_reference(course_name: str, topic_hint: str = "", limit: int = 5) -> str:
+    """联网查找真实试卷/真题参考；找不到时返回空串，由调用方降级。"""
+    if not WEB_SEARCH_ENABLED:
+        return ""
+
+    course = str(course_name or topic_hint or "大学课程").strip() or "大学课程"
+    aliases = [term for term in _course_terms(course) if term]
+    primary = aliases[0] if aliases else course
+    queries = [
+        f"{primary} 期末考试 试卷 filetype:pdf",
+        f"{primary} 期末考试 真题 答案",
+        f"{primary} 期末考试 试题 doc",
+        f"site:edu.cn {primary} 期末考试 试卷",
+    ]
+    if len(aliases) > 1:
+        queries.append(f"{aliases[1]} final exam paper pdf")
+
+    all_docs: List[dict] = []
+    best_query = queries[0]
+    for query in queries[:5]:
+        try:
+            docs = await asyncio.to_thread(_run_duckduckgo_results, query, 6)
+            all_docs.extend(_normalize_search_docs(docs))
+            if _filter_exam_paper_docs(course, all_docs, limit=limit):
+                best_query = query
+                break
+        except Exception as e:
+            logger.warning(f"[真实试卷搜索] query={query} 失败: {e}")
+            continue
+
+    filtered = _filter_exam_paper_docs(course, all_docs, limit=limit)
+    if not filtered:
+        logger.info(f"[真实试卷搜索] {course} -> 未找到高相关真实试卷参考")
+        return ""
+    logger.info(f"[真实试卷搜索] {course} -> 获取 {len(filtered)} 条真实试卷参考")
+    return _format_exam_paper_reference(course, best_query, filtered, limit=limit)
+
+
+def _run_duckduckgo_results(query: str, num_results: int = 6) -> List[dict]:
+    """调用 DuckDuckGo 结构化结果接口，保留标题和链接。"""
+    from langchain_community.tools import DuckDuckGoSearchResults
+
+    search = DuckDuckGoSearchResults(num_results=num_results, output_format="list")
+    return _normalize_search_docs(search.run(query))
 
 
 def clear_rag_cache(session_id: str):
@@ -51,13 +324,71 @@ async def get_rag_service() -> RagSummarizeService:
     return await _get_rag()
 
 
+def _extract_courseware_hits(context: str, limit: int = 8) -> List[Tuple[str, str]]:
+    """从 retrieve_context 文本中提取“来源文件 + 片段”用于快速展示。"""
+    text = str(context or "")
+    if not text:
+        return []
+    hits: List[Tuple[str, str]] = []
+    seen = set()
+    pattern = r"\[参考资料\d+\]:参考资料:(.*?)\|参考元数据:(\{.*?\})(?:\n|$)"
+    for match in re.finditer(pattern, text, flags=re.DOTALL):
+        raw_snippet = re.sub(r"\s+", " ", str(match.group(1) or "")).strip()
+        snippet = raw_snippet[:140]
+        meta_text = str(match.group(2) or "").strip()
+        source = "未知来源"
+        try:
+            meta: Any = ast.literal_eval(meta_text)
+            if isinstance(meta, dict):
+                source = str(meta.get("source_filename") or meta.get("source") or source).strip() or source
+        except Exception:
+            pass
+        key = f"{source}|{snippet}"
+        if key in seen or not snippet:
+            continue
+        seen.add(key)
+        hits.append((source, snippet))
+        if len(hits) >= max(1, min(int(limit or 8), 20)):
+            break
+    return hits
+
+
 # ==================== 工具定义 ====================
 
 @tool(description='从课件知识库中检索知识点和参考资料。传入的query应该是一个具体考点名词。')
 @timer_and_token_logger
 async def search_courseware(query: str) -> str:
+    """快速课件检索：限时检索 + 片段提炼，避免走慢总结链路。"""
+    q = str(query or "").strip()
+    if not q:
+        return "请输入要检索的课件关键词。"
+
     rag = await _get_rag()
-    return await rag.rag_summarize(query)
+    try:
+        # 只走检索链路，不走总结链路，避免 60s 级别超时。
+        context = await asyncio.wait_for(rag.retrieve_context(q, mode="rag_chat"), timeout=14.0)
+    except asyncio.TimeoutError:
+        return (
+            "课件检索超时（已中止本次查询）。\n"
+            "建议缩小范围后重试，例如：`总结 C0-Overview 的核心知识点`。"
+        )
+    except Exception as e:
+        logger.warning(f"[search_courseware] 检索失败 query={q[:80]} err={e}")
+        return f"课件检索失败：{str(e)}"
+
+    hits = _extract_courseware_hits(context, limit=8)
+    if not hits:
+        return (
+            f"未检索到与“{q}”相关的课件片段。\n"
+            "建议改用更具体的关键词（章节名/概念名/文件名）。"
+        )
+
+    lines = [f"【课件检索结果】关键词：{q}"]
+    for idx, (source, snippet) in enumerate(hits, 1):
+        lines.append(f"{idx}. {source}：{snippet}")
+    lines.append("")
+    lines.append("如需我继续，可直接说：`按每个文件各总结3条要点`。")
+    return "\n".join(lines)
 
 
 @tool(description='联网搜索信息。当需要验证答案、查找默认试卷风格、查询考试规范时使用。')
@@ -65,33 +396,33 @@ async def search_courseware(query: str) -> str:
 async def web_search(query: str) -> str:
     """
     联网搜索工具（用于辅助验证，不能替代课件资料）
-    优先使用 DuckDuckGo，失败则尝试 Tavily
+    优先返回带 URL 的结构化结果，失败则尝试 Tavily
     """
     if not WEB_SEARCH_ENABLED:
         return "联网搜索功能已关闭，请在配置文件中启用"
 
-    # 尝试 DuckDuckGo
+    q = str(query or "").strip()
+    if not q:
+        return "请输入要联网搜索的关键词。"
+
     try:
-        from langchain_community.tools import DuckDuckGoSearchRun
-        search = DuckDuckGoSearchRun()
-        result = search.run(query)
-        if result and len(result) > 10:
-            if len(result) > 2000:
-                result = result[:2000] + "..."
-            logger.info(f"[联网搜索] {query} -> {len(result)} 字符")
-            return result
+        docs = await asyncio.to_thread(_run_duckduckgo_results, q, 6)
+        trusted_docs = _dedupe_search_docs(_normalize_search_docs(docs), limit=5)
+        if trusted_docs:
+            logger.info(f"[联网搜索] {q} -> {len(trusted_docs)} 条可信结构化结果")
+            return _format_search_results(q, trusted_docs, limit=5)
+        if docs:
+            logger.info(f"[联网搜索] {q} -> DuckDuckGo 结果均被过滤，尝试备用搜索")
     except Exception as e:
         logger.warning(f"[联网搜索] DuckDuckGo 失败: {e}")
 
-    # 备用：尝试 Tavily
     try:
         from langchain_community.tools import TavilySearchResults
-        search = TavilySearchResults(max_results=3)
-        docs = search.run(query)
+        search = TavilySearchResults(max_results=5)
+        docs = await asyncio.to_thread(search.run, q)
         if docs:
-            result = "\n".join([d.get("content", "")[:500] for d in docs if d.get("content")])
-            logger.info(f"[联网搜索] Tavily 备用成功 -> {len(result)} 字符")
-            return result
+            logger.info(f"[联网搜索] Tavily 备用成功 -> {len(_normalize_search_docs(docs))} 条结果")
+            return _format_search_results(q, docs, limit=5)
     except Exception as e:
         logger.warning(f"[联网搜索] Tavily 也失败: {e}")
 
@@ -105,15 +436,24 @@ async def search_exam_format(course_name: str) -> str:
     if not WEB_SEARCH_ENABLED:
         return "联网搜索功能已关闭，无法获取在线试卷格式。请上传样卷或使用默认格式。"
 
+    course = str(course_name or "大学课程").strip()
+    query = f"{course} 期末考试 试卷 题型 结构 选择题 判断题 填空题 简答题"
     try:
-        from langchain_community.tools import DuckDuckGoSearchRun
-        search = DuckDuckGoSearchRun()
-        query = f"{course_name} 期末考试试卷 格式 题型 结构"
-        result = search.run(query)
-        if len(result) > 1500:
-            result = result[:1500] + "..."
-        logger.info(f"[试卷格式搜索] {course_name} -> 获取格式参考")
-        return f"【{course_name}试卷格式参考】\n{result}"
+        docs = await asyncio.to_thread(_run_duckduckgo_results, query, 8)
+        filtered = _filter_exam_format_docs(course, docs, limit=5)
+        if not filtered:
+            logger.info(f"[试卷格式搜索] {course} -> 无高相关结构化结果")
+            return (
+                f"【{course}试卷格式参考】\n"
+                "未获取到同时匹配课程名和考试题型的高相关联网结果。"
+                "建议上传样卷，或使用系统默认的选择题/判断题/填空题/简答题结构。"
+            )
+        logger.info(f"[试卷格式搜索] {course} -> 获取 {len(filtered)} 条高相关格式参考")
+        return (
+            f"【{course}试卷格式参考】\n"
+            "以下结果仅用于参考试卷结构，不替代已上传课件中的知识依据。\n\n"
+            + _format_search_results(query, filtered, limit=5)
+        )
     except Exception as e:
         logger.warning(f"[试卷格式搜索] 失败: {e}")
         return "无法获取格式参考，将使用默认格式"
@@ -356,7 +696,7 @@ async def list_knowledge_files_tool(session_id: Optional[str] = None) -> str:
     if not files:
         return f"会话 {sid} 暂无课件文件"
 
-    lines = [f"【课件文件列表】session={sid}"]
+    lines = [f"【课件文件列表】session={sid}, count={len(files)}"]
     for i, file_info in enumerate(files, 1):
         name = file_info.get("filename", "")
         status = file_info.get("status", "unknown")
@@ -442,6 +782,60 @@ async def delete_knowledge_file_tool(filename: str, session_id: Optional[str] = 
     except Exception as e:
         detail = getattr(e, "detail", None)
         return f"删除课件失败: {detail or str(e)}"
+
+
+@tool(description='删除与指定保留课件内容完全相同的重复课件。传入 keep_filename，仅删除同 MD5 的其他文件。')
+@timer_and_token_logger
+async def delete_duplicate_knowledge_files_tool(keep_filename: str, session_id: Optional[str] = None) -> str:
+    """按 MD5 删除重复课件，仅保留 keep_filename。"""
+    sid = _normalize_session_id(session_id)
+    keep = os.path.basename((keep_filename or "").strip())
+    if not keep:
+        return "keep_filename 不能为空"
+
+    from utils.config_handler import chroma_conf
+    from utils.path_tool import get_abs_path
+    from api.routers.knowledge import delete_file
+
+    data_root = get_abs_path(chroma_conf["data_path"])
+    session_data_dir = os.path.join(data_root, sid)
+    keep_path = os.path.join(session_data_dir, keep)
+    if not os.path.isfile(keep_path):
+        return f"保留文件不存在: {keep}"
+
+    allowed = {".txt", ".pdf", ".docx", ".doc", ".ppt", ".pptx", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+    with open(keep_path, "rb") as f:
+        keep_md5 = hashlib.md5(f.read()).hexdigest()
+
+    duplicates: List[str] = []
+    for fname in os.listdir(session_data_dir):
+        if fname == keep or fname.startswith("."):
+            continue
+        if os.path.splitext(fname)[1].lower() not in allowed:
+            continue
+        fpath = os.path.join(session_data_dir, fname)
+        if not os.path.isfile(fpath):
+            continue
+        try:
+            with open(fpath, "rb") as f:
+                file_md5 = hashlib.md5(f.read()).hexdigest()
+        except Exception:
+            continue
+        if file_md5 == keep_md5:
+            duplicates.append(fname)
+
+    if not duplicates:
+        return f"未发现与 {keep} 内容完全相同的重复课件。"
+
+    lines = [f"【重复课件删除】session={sid}", f"保留: {keep}"]
+    for fname in sorted(duplicates):
+        result = await delete_file(filename=fname, session_id=sid)
+        if isinstance(result, dict):
+            lines.append(f"删除: {fname} -> {result.get('message', '完成')}")
+        else:
+            lines.append(f"删除: {fname} -> 完成")
+    lines.append(f"共删除 {len(duplicates)} 个重复文件。")
+    return "\n".join(lines)
 
 
 @tool(description='查看当前会话是否已上传样卷，并返回样卷格式与内容预览。')
@@ -636,6 +1030,82 @@ async def get_system_diagnostics_tool(session_id: Optional[str] = None) -> str:
     return "\n".join(lines)
 
 
+@tool(description='总结指定课件文件的全部内容。传入 filename（课件文件名）和可选的 focus（关注点，如"重点知识"）。会读取该文件所有 chunk 并做 map-reduce 总结，适合"帮我总结这份课件"类请求。')
+@timer_and_token_logger
+async def summarize_document(filename: str, focus: str = "核心知识点和重点内容") -> str:
+    """获取文件全部 chunk 并 map-reduce 总结。"""
+    from model.factory import light_chat_model
+    from langchain_core.messages import HumanMessage
+
+    fname = (filename or "").strip()
+    if not fname:
+        return "请传入课件文件名（filename）。"
+
+    rag = await _get_rag()
+    vs = rag.vector_store_service.vector_store
+
+    # 获取该文件所有 chunk
+    try:
+        result = vs.get(where={"source_filename": fname}, include=["documents", "metadatas"])
+    except Exception as e:
+        return f"读取课件向量失败：{e}"
+
+    docs = result.get("documents") or []
+    metas = result.get("metadatas") or []
+    if not docs:
+        return f"未找到课件“{fname}”的向量数据，请确认文件名是否正确且已完成向量化。"
+
+    # 按 page_number 排序
+    paired = sorted(
+        zip(docs, metas),
+        key=lambda x: int((x[1] or {}).get("page_number") or 0)
+    )
+    chunks = [d for d, _ in paired]
+
+    # map 阶段：每批 ~3000 字
+    BATCH = 3000
+    batches, cur, cur_len = [], [], 0
+    for c in chunks:
+        if cur_len + len(c) > BATCH and cur:
+            batches.append("\n".join(cur))
+            cur, cur_len = [], 0
+        cur.append(c)
+        cur_len += len(c)
+    if cur:
+        batches.append("\n".join(cur))
+
+    map_prompt = "请提炼以下课件片段的核心知识点（{focus}），用简洁的要点列表输出，不超过300字：\n\n{text}"
+    summaries = []
+    for batch in batches:
+        try:
+            resp = await asyncio.wait_for(
+                light_chat_model.ainvoke([HumanMessage(content=map_prompt.format(focus=focus, text=batch))]),
+                timeout=20.0
+            )
+            summaries.append(resp.content.strip())
+        except Exception as e:
+            logger.warning(f"[summarize_document] map batch 失败: {e}")
+
+    if not summaries:
+        return "总结失败，请稍后重试。"
+
+    # reduce 阶段
+    combined = "\n\n".join(summaries)
+    reduce_prompt = (
+        f"以下是课件“{fname}”各部分的要点摘要，请整合成一份完整的课件总结（关注：{focus}），"
+        f"结构清晰，分章节或主题列出，不超过800字：\n\n{combined}"
+    )
+    try:
+        final = await asyncio.wait_for(
+            light_chat_model.ainvoke([HumanMessage(content=reduce_prompt)]),
+            timeout=30.0
+        )
+        return f"【课件总结】{fname}\n\n{final.content.strip()}"
+    except Exception as e:
+        # reduce 超时时直接返回 map 结果
+        return f"【课件总结（分段）】{fname}\n\n" + "\n\n---\n\n".join(summaries)
+
+
 @tool(description='分析学生错题原因。需要传入题目、学生的答案和正确答案。返回错因分类和详细分析。')
 @timer_and_token_logger
 async def analyze_wrong_reason(question: str, user_answer: str, correct_answer: str) -> str:
@@ -681,6 +1151,7 @@ def _build_tools():
     """根据配置动态生成工具列表"""
     tool_list = [
         search_courseware,
+        summarize_document,
         generate_quiz,
         generate_exam_paper,
         get_practice_history,
@@ -697,6 +1168,7 @@ def _build_tools():
         list_knowledge_files_tool,
         list_failed_uploads_tool,
         delete_knowledge_file_tool,
+        delete_duplicate_knowledge_files_tool,
         get_sample_paper_tool,
         export_exam_docx_tool,
         export_answer_sheet_tool,

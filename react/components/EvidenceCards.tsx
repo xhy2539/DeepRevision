@@ -17,6 +17,7 @@ export default function EvidenceCards({ cards, status, route }: EvidenceCardsPro
   if (safeCards.length === 0 && route !== "rag") return null;
 
   if (safeCards.length === 0) {
+    if (status && status !== "none") return null;
     return (
       <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-left text-xs text-amber-800">
         未找到可靠课件证据。建议上传或补充相关课件后再追问。

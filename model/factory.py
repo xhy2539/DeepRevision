@@ -134,7 +134,8 @@ class BackupLightChatModelFactory(BaseModelFactory):
 
 class EmbeddingsFactory(BaseModelFactory):
     def generate(self) -> Optional[Embeddings | BaseChatModel]:
-        return DashScopeEmbeddings(model=rag_conf['embedding_model_name'])
+        api_key = os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("QWEN_API_KEY")
+        return DashScopeEmbeddings(model=rag_conf['embedding_model_name'], dashscope_api_key=api_key)
 
 
 class VisionModelFactory(BaseModelFactory):
@@ -142,7 +143,7 @@ class VisionModelFactory(BaseModelFactory):
         vision_model_name = rag_conf.get('vision_model_name', 'qwen-vl-max')
         # 千问模型使用 DashScope API (直接用 OpenAI 兼容接口)
         if 'qwen' in vision_model_name.lower():
-            api_key = os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("MINIMAX_API_KEY")
+            api_key = os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("QWEN_API_KEY")
             return ChatOpenAI(
                 model=vision_model_name,
                 api_key=api_key,

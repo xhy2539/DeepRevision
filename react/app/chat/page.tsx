@@ -79,6 +79,8 @@ interface AssistantPayload {
   messageId?: string;
   stream_sections?: StreamSections;
   evidence_cards?: EvidenceCard[];
+  task_plan?: unknown;
+  plan_execution?: unknown;
 }
 
 interface EvidenceCard {
@@ -160,6 +162,14 @@ interface PracticeStatsData {
   priority_review_points?: MasteryPoint[];
 }
 
+interface LearningLoopStateData {
+  phase?: string;
+  status?: string;
+  current_day?: number;
+  next_action?: string;
+  review_decision?: string;
+}
+
 interface MasteryPoint {
   knowledge_point: string;
   mastery_score: number;
@@ -181,13 +191,21 @@ interface LastPracticeSummary {
 
 interface Message {
   id: string;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "ai";
   content: string;
   timestamp: number;
   kind?: MessageKind;
   render_mode?: "markdown" | "interactive_cards" | "exam_canvas";
   payload?: AssistantPayload;
   meta?: Record<string, unknown>;
+}
+
+function isAssistantRole(role?: string): boolean {
+  return role === "assistant" || role === "ai";
+}
+
+interface SendMessageOptions {
+  hideUserMessage?: boolean;
 }
 
 interface ExamStageTraceItem {
@@ -690,6 +708,8 @@ function QuizCard({
   const [submitted, setSubmitted] = useState(false);
   const [score, setScore] = useState(0);
   const hasInvalidChoiceQuestion = questions.some((q) => isChoiceQuestionType(q.type) && (!q.options || q.options.length < 4));
+  const answeredCount = questions.filter((_, idx) => String(selectedAnswers[idx] || "").trim()).length;
+  const allAnswered = questions.length > 0 && answeredCount === questions.length;
 
   const normalizeAnswer = (a: string) => a.trim().replace(/\s+/g, " ").toUpperCase();
 
@@ -702,6 +722,8 @@ function QuizCard({
   };
 
   const submitPractice = () => {
+    if (!allAnswered) return;
+
     let correctCount = 0;
     const wrongAnswers: ExamPracticeQuestion[] = [];
     const records: PracticeRecordItem[] = [];
@@ -754,14 +776,21 @@ function QuizCard({
       {/* 工具栏 */}
       <div className="flex items-center justify-end gap-2">
         {practiceMode ? (
-          <div className="mr-auto flex gap-2">
+          <div className="mr-auto flex flex-wrap items-center gap-2">
             <button
               onClick={submitPractice}
-              disabled={submitted}
+              disabled={submitted || !allAnswered}
               className="rounded-full bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-slate-700 disabled:bg-slate-300"
             >
               提交答案
             </button>
+            {!submitted && (
+              <span className={`rounded-full px-3 py-1.5 text-xs font-medium ${
+                allAnswered ? "bg-teal-50 text-teal-700" : "bg-amber-50 text-amber-700"
+              }`}>
+                已答 {answeredCount}/{questions.length}
+              </span>
+            )}
             {submitted && (
               <span className="rounded-full bg-slate-100 px-3 py-1.5 text-xs font-medium text-slate-700">
                 {score}/{questions.length}
@@ -983,6 +1012,7 @@ function MarkdownContent({
   content,
   kind,
   payload,
+  messageId,
   onRequestAnswers,
   similarQuestions,
   onPracticeComplete,
@@ -990,6 +1020,7 @@ function MarkdownContent({
   content: string;
   kind?: MessageKind;
   payload?: AssistantPayload;
+  messageId?: string;
   onRequestAnswers?: () => void;
   similarQuestions?: Record<number, SimilarQuestion[]>;
   // Handles both ExamCanvas (5 args) and QuizCard (6 args with messageId)
@@ -997,6 +1028,8 @@ function MarkdownContent({
   onPracticeComplete?: (...args: any[]) => void;
 }) {
   const parsedQuiz = parseQuizContent(content);
+  // 结构化渲染由后端 kind 控制；普通 chat 不再因搜索摘要里的 A./B. 误升级为题卡。
+  const shouldAutoDetectStructured = !kind;
 
   if (kind === "exam_paper") {
     return (
@@ -1016,12 +1049,12 @@ function MarkdownContent({
       ? payload.questions
       : parsedQuiz.questions;
     if (questions.length > 0) {
-      return <QuizCard questions={questions} defaultShowAnswers={false} messageId={payload?.messageId} onPracticeComplete={(msgId, sc, tot, rec, wrong) => onPracticeComplete?.(msgId, sc, tot, rec, wrong, {})} />;
+      return <QuizCard questions={questions} defaultShowAnswers={false} messageId={payload?.messageId || messageId} onPracticeComplete={(_msgId, sc, tot, rec, wrong, answers) => onPracticeComplete?.(sc, tot, rec, wrong, answers || {})} />;
     }
   }
 
   // 检测是否为试卷格式，使用 Canvas 渲染
-  if (isExamContent(content)) {
+  if (shouldAutoDetectStructured && isExamContent(content)) {
     // 直接使用 ExamCanvas 渲染，它内部会处理解析失败的情况
     // 解析失败时会渲染原始内容作为后备
     return (
@@ -1035,7 +1068,7 @@ function MarkdownContent({
     );
   }
 
-  if (kind === "chat" && !parsedQuiz.isQuiz) {
+  if (kind === "chat" || !parsedQuiz.isQuiz) {
     return (
       <div className="prose-custom chat-prose">
       <ReactMarkdown
@@ -1078,11 +1111,11 @@ function MarkdownContent({
   }
 
   // 尝试用简单方式解析题目
-  if (parsedQuiz.isQuiz && parsedQuiz.questions.length > 0) {
+  if (shouldAutoDetectStructured && parsedQuiz.isQuiz && parsedQuiz.questions.length > 0) {
     const questions = payload?.questions && payload.questions.length > 0
       ? payload.questions
       : parsedQuiz.questions;
-    return <QuizCard questions={questions} defaultShowAnswers={false} messageId={payload?.messageId} onPracticeComplete={(msgId, sc, tot, rec, wrong) => onPracticeComplete?.(msgId, sc, tot, rec, wrong, {})} />;
+    return <QuizCard questions={questions} defaultShowAnswers={false} messageId={payload?.messageId || messageId} onPracticeComplete={(_msgId, sc, tot, rec, wrong, answers) => onPracticeComplete?.(sc, tot, rec, wrong, answers || {})} />;
   }
 
   return (
@@ -2165,18 +2198,36 @@ export default function ChatPage() {
   >({});
   const [learningPracticeStats, setLearningPracticeStats] = useState<PracticeStatsData | null>(null);
   const [masterySnapshot, setMasterySnapshot] = useState<MasteryPoint[]>([]);
+  const [learningLoopState, setLearningLoopState] = useState<LearningLoopStateData | null>(null);
   const [lastPracticeSummary, setLastPracticeSummary] = useState<LastPracticeSummary | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messageScrollRef = useRef<HTMLDivElement>(null);
   const shouldAutoScrollRef = useRef(true);
   const streamAbortRef = useRef<AbortController | null>(null);
+  const streamingAssistantMessageIdRef = useRef<string | null>(null);
 
   // 主动停止按钮：中止当前流式请求（前后端 cancel 链路联动）。
   const stopStreaming = useCallback(() => {
+    const activeMessageId = streamingAssistantMessageIdRef.current;
     if (streamAbortRef.current) {
       streamAbortRef.current.abort();
     }
+    if (activeMessageId) {
+      setMessages(prev => prev.map(m =>
+        m.id === activeMessageId
+          ? (() => {
+              const currentContent = String(m.content || "").trim();
+              const cancelledContent =
+                !currentContent || currentContent === "正在生成内容，请稍候..."
+                  ? "已停止生成。"
+                  : currentContent;
+              return { ...m, content: cancelledContent, meta: { ...(m.meta || {}), cancelled: true } };
+            })()
+          : m
+      ));
+    }
+    setIsLoading(false);
   }, []);
 
   const resolveClientUsername = useCallback((): string => {
@@ -2238,24 +2289,32 @@ export default function ChatPage() {
   }, [currentUsername, loadUserProfile]);
 
   const loadLearningLoopData = useCallback(async (sessionId: string) => {
-    // 侧栏看板只读取现有统计接口，避免引入新的后端契约。
+    // 侧栏看板汇总统计、mastery 和闭环阶段，避免用户只能在 trace 里找状态。
     if (!sessionId) return;
     try {
-      const [statsRes, masteryRes] = await Promise.all([
+      const [statsRes, masteryRes, stateRes] = await Promise.all([
         fetch(`/api/chat/practice/stats?session_id=${encodeURIComponent(sessionId)}`),
         fetch(`/api/chat/mastery?session_id=${encodeURIComponent(sessionId)}&priority_limit=10`),
+        fetch(`/api/chat/learning-loop/state?session_id=${encodeURIComponent(sessionId)}`),
       ]);
       const statsData = await statsRes.json();
       const masteryData = await masteryRes.json();
+      const stateData = await stateRes.json();
       setLearningPracticeStats(statsData?.code === 200 ? (statsData.data as PracticeStatsData) : null);
       setMasterySnapshot(
         masteryData?.code === 200 && Array.isArray(masteryData?.data?.mastery)
           ? (masteryData.data.mastery as MasteryPoint[])
           : []
       );
+      setLearningLoopState(
+        stateData?.code === 200 && stateData?.data?.state
+          ? (stateData.data.state as LearningLoopStateData)
+          : null
+      );
     } catch {
       setLearningPracticeStats(null);
       setMasterySnapshot([]);
+      setLearningLoopState(null);
     }
   }, []);
 
@@ -2315,6 +2374,10 @@ export default function ChatPage() {
         const wrongPoints = Array.from(
           new Set(wrongAnswers.map((q) => inferKnowledgePoint(q)).filter(Boolean))
         );
+        const shouldAutoReviewLoop =
+          submitData?.learning_loop_state_updated === true &&
+          /^(day\d+|remediation)_answered$/.test(String(submitData?.learning_loop_phase || ""));
+        const loopHint = shouldAutoReviewLoop ? " 正在自动进入闭环复盘。" : "";
         setLastPracticeSummary({
           score,
           total,
@@ -2352,7 +2415,7 @@ export default function ChatPage() {
               ...prev,
               [messageId]: {
                 type: "success",
-                text: `练习已保存，已生成 ${similarCount} 道复练推荐题。`,
+                text: `练习已保存，已生成 ${similarCount} 道复练推荐题。${loopHint}`,
               },
             }));
           }
@@ -2361,11 +2424,15 @@ export default function ChatPage() {
             ...prev,
             [messageId]: {
               type: "success",
-              text: "本次练习全对，记录已保存。",
+              text: `本次练习全对，记录已保存。${loopHint}`,
             },
           }));
         }
-        showToast("练习记录已保存，已更新相似题推荐", "success");
+        showToast(shouldAutoReviewLoop ? "练习记录已保存，正在自动复盘" : "练习记录已保存，已更新相似题推荐", "success");
+        if (shouldAutoReviewLoop) {
+          await sendMessage("继续学习闭环，复盘本次作答。", undefined, { hideUserMessage: true });
+          await loadLearningLoopData(currentSession);
+        }
       }
       console.log("[Practice] 完成练习:", { score, total, totalCount: records.length, wrongCount: wrongAnswers.length });
     } catch (error) {
@@ -2482,7 +2549,11 @@ export default function ChatPage() {
   }, []);
 
   // 发送消息
-  const sendMessage = async (overrideText?: string, extraBody?: Record<string, unknown>) => {
+  const sendMessage = async (
+    overrideText?: string,
+    extraBody?: Record<string, unknown>,
+    options: SendMessageOptions = {}
+  ) => {
     // 入口保护：空输入/非法会话/重复发送均直接返回。
     const outgoingText = (overrideText ?? input).trim();
     if (!outgoingText || !currentSession || isLoading) return;
@@ -2499,8 +2570,10 @@ export default function ChatPage() {
     };
 
     shouldAutoScrollRef.current = true;
-    setMessages(prev => [...prev, userMessage]);
-    setInput("");
+    if (!options.hideUserMessage) {
+      setMessages(prev => [...prev, userMessage]);
+      setInput("");
+    }
     setIsLoading(true);
     setThoughts([]);
     setStreamDiagnostics({
@@ -2513,6 +2586,7 @@ export default function ChatPage() {
 
     const startTime = Date.now();
     const assistantMessageId = (Date.now() + 1).toString();
+    streamingAssistantMessageIdRef.current = assistantMessageId;
 
     setMessages(prev => [...prev, {
       id: assistantMessageId,
@@ -2669,6 +2743,7 @@ export default function ChatPage() {
         exam_fast_mode: resolvedExamFastMode, // 快速/完整模式开关
         quiz_force_llm_critic: resolvedQuizForceCritic, // quiz 与模式联动：完整=强制 LLM Critic
         ...extra,
+        hide_user_message: Boolean(options.hideUserMessage), // 隐藏按钮类内部 prompt，避免刷新后进入历史。
       };
       const response = await fetch("/api/chat/stream", {
         method: "POST",
@@ -3016,16 +3091,20 @@ export default function ChatPage() {
         shouldDrainRenderQueue = false;
         forceFlushRenderQueue(false);
         const visibleContent = renderedContent.trim();
+        const cancelledContent =
+          !visibleContent || visibleContent === "正在生成内容，请稍候..."
+            ? "已停止生成。"
+            : visibleContent;
         setMessages(prev => prev.map(m =>
           m.id === assistantMessageId
             ? {
                 ...m,
-                content: visibleContent || "已停止生成。",
+                content: cancelledContent,
                 meta: { ...(m.meta || {}), cancelled: true },
               }
             : m
         ));
-        fullContent = visibleContent;
+        fullContent = cancelledContent;
       } else {
         streamTerminationReason = "error";
         shouldDrainRenderQueue = false;
@@ -3057,6 +3136,12 @@ export default function ChatPage() {
       });
       if (streamAbortRef.current === abortController) {
         streamAbortRef.current = null;
+      }
+      if (streamingAssistantMessageIdRef.current === assistantMessageId) {
+        streamingAssistantMessageIdRef.current = null;
+      }
+      if (currentSession) {
+        await loadLearningLoopData(currentSession);
       }
       setIsLoading(false);
     }
@@ -3504,7 +3589,11 @@ ${sampleHint}
                   }
                 } catch (e) {}
                 const prompt = buildComprehensiveExamPrompt(sampleInfo);
-                await sendMessage(prompt, { exam_stage_plan: true, exam_fast_mode: examFastMode });
+                await sendMessage(
+                  prompt,
+                  { client_action: "generate_exam", exam_stage_plan: true, exam_fast_mode: examFastMode },
+                  { hideUserMessage: true }
+                );
               }}
               className="px-4 py-1.5 text-xs font-medium text-teal-700 bg-teal-50 hover:bg-teal-100 border border-teal-200 rounded-md transition-all flex items-center gap-1"
             >
@@ -3539,8 +3628,9 @@ ${sampleHint}
                   stats={learningPracticeStats}
                   masteryCount={masterySnapshot.length}
                   lastPractice={lastPracticeSummary}
+                  loopState={learningLoopState}
                   disabled={isLoading}
-                  onSendPrompt={(prompt) => void sendMessage(prompt)}
+                  onSendPrompt={(prompt) => void sendMessage(prompt, undefined, { hideUserMessage: true })}
                 />
               </div>
 
@@ -3611,13 +3701,13 @@ ${sampleHint}
                       )}
                     </div>
 
-                    {message.role === "assistant" && message.meta && (
+                    {isAssistantRole(message.role) && message.meta && (
                       <div className="mb-2 flex justify-start">
                         <AgentRouteBadge meta={message.meta as Record<string, unknown>} />
                       </div>
                     )}
 
-                    {message.role === "assistant" && thoughts.length > 0 && (
+                    {isAssistantRole(message.role) && thoughts.length > 0 && (
                       <ThoughtChain thoughts={thoughts} />
                     )}
 
@@ -3625,7 +3715,7 @@ ${sampleHint}
                       message.role === "user"
                         ? "rounded-tr-md"
                         : "rounded-tl-md border"
-                    } ${message.role === "assistant" && (message.kind ?? "chat") === "chat" ? "chat-message" : ""}`} style={{
+                    } ${isAssistantRole(message.role) && (message.kind ?? "chat") === "chat" ? "chat-message" : ""}`} style={{
                       background: message.role === "user"
                         ? '#f1f5f9'
                         : ((message.kind ?? "chat") === "chat"
@@ -3640,9 +3730,10 @@ ${sampleHint}
                         : '0 2px 6px rgba(15,23,42,0.06)'
                     }}>
                       <MarkdownContent
-                        content={message.content || (message.role === "assistant" && isLoading ? "正在思考中..." : "")}
+                        content={message.content || (isAssistantRole(message.role) && isLoading ? "正在思考中..." : "")}
                         kind={message.kind}
                         payload={message.payload}
+                        messageId={message.id}
                         similarQuestions={similarQuestionsByMessage[message.id]}
                         onPracticeComplete={(score, total, records, wrongAnswers, userAnswers) =>
                           handlePracticeCompleteForMessage(message.id, score, total, records, wrongAnswers, userAnswers)
@@ -3651,13 +3742,13 @@ ${sampleHint}
                           void sendMessage("请给出上面试卷的答案和解析");
                         }}
                       />
-                      {message.role === "assistant" && (message.kind ?? "chat") === "chat" && (
+                      {isAssistantRole(message.role) && (message.kind ?? "chat") === "chat" && (
                         <StreamSectionsPanel
                           sections={normalizeStreamSections((message.payload as AssistantPayload | undefined)?.stream_sections)}
                         />
                       )}
                     </div>
-                    {message.role === "assistant" && (
+                    {isAssistantRole(message.role) && (
                       <div className="mt-2 flex items-center gap-2">
                         {message.kind !== "exam_paper" && message.meta && (
                           <span className={`text-xs px-2 py-1 rounded border ${
@@ -3751,18 +3842,26 @@ ${sampleHint}
                         )}
                       </div>
                     )}
-                    {message.role === "assistant" && message.meta && (
-                      <AgentTracePanel meta={message.meta as Record<string, unknown>} />
+                    {isAssistantRole(message.role) && message.meta && (
+                      <AgentTracePanel
+                        meta={message.meta as Record<string, unknown>}
+                        payload={message.payload as Record<string, unknown> | undefined}
+                      />
                     )}
-                    {message.role === "assistant" && (
+                    {isAssistantRole(message.role) && (
                       <EvidenceCards
                         cards={(message.payload as AssistantPayload | undefined)?.evidence_cards}
                         status={String((message.meta as Record<string, unknown> | undefined)?.evidence_status || "")}
                         route={String((message.meta as Record<string, unknown> | undefined)?.route || "")}
                       />
                     )}
-                    {message.role === "assistant" && (
-                      <SafetyGuardCard meta={message.meta as Record<string, unknown> | undefined} />
+                    {isAssistantRole(message.role) && (
+                      <SafetyGuardCard
+                        meta={message.meta as Record<string, unknown> | undefined}
+                        disabled={isLoading}
+                        onConfirm={(phrase) => void sendMessage(phrase, undefined, { hideUserMessage: true })}
+                        onCancel={() => showToast("已取消危险操作，本次未执行。", "info")}
+                      />
                     )}
                   </div>
                 </div>
@@ -3882,8 +3981,9 @@ ${sampleHint}
               stats={learningPracticeStats}
               masteryCount={masterySnapshot.length}
               lastPractice={lastPracticeSummary}
+              loopState={learningLoopState}
               disabled={isLoading}
-              onSendPrompt={(prompt) => void sendMessage(prompt)}
+              onSendPrompt={(prompt) => void sendMessage(prompt, undefined, { hideUserMessage: true })}
             />
           </div>
         </aside>

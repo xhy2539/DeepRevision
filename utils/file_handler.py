@@ -359,7 +359,7 @@ def _summarize_image(image_bytes: bytes, context: str = "") -> str:
         return str(content or "").strip() or "无有效信息"
     except Exception as e:
         logger.error(f"图片解析失败: {e}")
-        return "[图片内容提取失败]"
+        return "无有效信息"
 
 
 # ================= OCR 支持（可选）====================

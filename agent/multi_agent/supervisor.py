@@ -5,16 +5,18 @@ Supervisor Agent 分析用户意图，路由到对应 SubAgent：
   - rag_agent    : 知识问答、概念解释、复习某知识点
   - quiz_agent   : 出单道或少量题目（调用 Reflexion 出题工作流）
   - exam_agent   : 生成完整试卷（调用 Reflexion 出卷工作流）
-  - ops_agent    : 管理操作（会话/历史 CRUD，ReAct 工具决策）
-  - planner_agent: 制定复习计划、推荐学习顺序
-  - history_agent: 查看练习历史、答题记录、错题分析
-  - chitchat     : 闲聊、感谢、无关话题
+- ops_agent    : 管理操作（会话/历史 CRUD，ReAct 工具决策）
+- planner_agent: 制定复习计划、推荐学习顺序
+- history_agent: 查看练习历史、答题记录、错题分析
+- learning_loop: 自主学习闭环（画像→课件→计划→练习建议→复盘）
+- chitchat     : 闲聊、感谢、无关话题
 
 工作流：supervisor → (路由判断) → SubAgent → END
 """
 import json
 import time
 import re
+import ast
 from typing import TypedDict, List, Dict, Any, Optional
 
 from langgraph.graph import StateGraph, END
@@ -25,9 +27,16 @@ from langchain_core.messages import HumanMessage
 from model.factory import chat_model, backup_chat_model, light_chat_model, backup_light_chat_model
 from agent.tools.agent_tools import get_rag_service, tools as registered_tools
 from agent.tools.history_action_parser import parse_history_action
+from agent.multi_agent.tool_orchestrator import (
+    build_tool_plan,
+    execute_tool_plan,
+    is_explicit_web_search_intent,
+    run_react_orchestrator,
+)
 from utils.logger_handler import logger
 from utils.session_context import current_session_id
 from utils.rag_metrics import rag_inc
+from utils.memory_service import memory_manager
 
 
 # ==================== 状态定义 ====================
@@ -36,14 +45,16 @@ class SupervisorState(TypedDict):
     input: str              # 当前用户输入
     chat_history: List      # 历史消息（LangChain BaseMessage 列表）
     memory_context: str     # 长期图谱记忆（注入 system prompt）
+    tool_context: str       # 近期工具结果/生成产物（按需注入）
     session_id: str         # 当前科目会话
+    client_action: str      # 前端显式动作，如 generate_exam
     exam_stage_plan: bool   # 是否启用分段出卷
     exam_rerun_stage: str   # 失败后仅重跑某一段
     exam_partial_questions: list  # 已成功段题目（重跑失败段时回传）
     exam_fast_mode: bool   # True=快速路径(格式检查), False=完整路径(LLM Critique)
     quiz_force_llm_critic: bool  # True=quiz强制走LLM Critic，不走本地快速质检短路
     # Supervisor 决策
-    route: str              # "rag" | "quiz" | "exam" | "ops" | "planner" | "history" | "chitchat"
+    route: str              # "rag" | "quiz" | "exam" | "ops" | "planner" | "history" | "learning_loop" | "chitchat"
     route_reason: str       # 路由原因（用于日志）
     route_params: dict      # 从用户输入中提取的参数
     supervisor_precomputed: bool  # 外层已完成路由判定时跳过重复 supervisor 调用
@@ -110,6 +121,7 @@ SUPERVISOR_PROMPT = """你是【复习助手】的智能调度中心。
 - ops：用户要执行管理/工具操作（会话与历史 CRUD、课件文件管理、诊断统计、样卷/相似题查询、试卷导出等）→ 用"ops"
 - planner：用户说"复习计划"、"学习计划"、"怎么复习" → 用"planner"
 - history：用户说"历史"、"错题"、"练习记录" → 用"history"
+- learning_loop：用户明确要求“学习闭环/自主复习/开始复习循环/今天该复习什么并给题/根据错题安排并出题” → 用"learning_loop"
 - chitchat：问候（你好/hi/hello）、感谢、闲聊、无关话题、无法分类 → 用"chitchat"
 
 ## 关键词触发规则（优先级从高到低）：
@@ -117,10 +129,11 @@ SUPERVISOR_PROMPT = """你是【复习助手】的智能调度中心。
 2. "试卷"、"考试" → exam
 3. "出题"、"做题"、"练习题" → quiz
 4. "创建会话"、"重命名会话"、"删除会话"、"清空历史记录"、"删除第N条错题/消息/记录"、"会话列表"、"系统诊断"、"删除课件"、"查看样卷" → ops
-5. "复习计划"、"学习计划" → planner
-6. "历史"、"错题" → history
-7. "解释"、"什么是"、"概念"、"知识点" → rag
-8. 其他 → chitchat
+5. "学习闭环"、"自主复习"、"开始复习循环"、"今天该复习什么"且包含"题/练习"、"根据错题安排并出题" → learning_loop
+6. "复习计划"、"学习计划" → planner
+7. "历史"、"错题" → history
+8. "解释"、"什么是"、"概念"、"知识点" → rag
+9. 其他 → chitchat
 
 补充：像“每个课件都讲了什么/这份课件主要内容是什么/总结课件要点”属于内容理解，优先走 rag，不走 ops。
 
@@ -361,6 +374,7 @@ OPS_DANGEROUS_TOOLS = {
     "clear_chat_history_tool",
     "delete_session_tool",
     "delete_knowledge_file_tool",
+    "delete_duplicate_knowledge_files_tool",
 }
 
 
@@ -451,6 +465,11 @@ def _ops_required_confirmation_phrase(tool_name: str, args: Dict[str, Any]) -> t
         if not filename:
             return "", "删除课件需要显式提供 filename。"
         return f"确认删除课件:{filename}", ""
+    if tool_name == "delete_duplicate_knowledge_files_tool":
+        keep_filename = str(args.get("keep_filename", "") or "").strip()
+        if not keep_filename:
+            return "", "删除重复课件需要显式提供 keep_filename。"
+        return f"确认删除重复课件:{keep_filename}", ""
     return "", ""
 
 
@@ -477,9 +496,7 @@ def _build_ops_guard_reply(
     reason: str,
 ) -> Dict[str, Any]:
     """构造 ops 安全闸回执（结构化 payload/meta）。"""
-    required = bool(required_phrase)
-    confirm_hint = f"\n请发送：`{required_phrase}`" if required else ""
-    text = f"{reason}{confirm_hint}"
+    text = f"{reason}\n请在安全确认卡中选择是否继续。"
     payload = {
         "ops_trace": trace,
         "ops_confirmation_required": True,
@@ -558,18 +575,120 @@ def _ops_query_requires_tool(query: str) -> bool:
         or re.search(r"(会话列表|查看会话|列出会话)", text)
         or re.search(r"(创建|新建|重命名)\s*会话", text)
         or re.search(r"删除第\s*\d+\s*条", text)
-        or re.search(r"(查看|获取|查询|分析|统计|搜索)\s*(系统诊断|token|课件|课件文件|样卷|薄弱点|相似题)", text)
+        or re.search(r"(查看|获取|查询|分析|统计|搜索)\s*(系统诊断|token|课件|课件文件|知识库|样卷|薄弱点|相似题)", text)
+        or _is_courseware_management_intent(text)
         or re.search(r"(删除|移除)\s*(课件|文件)", text)
         or re.search(r"(导出|下载|保存为|另存为)\s*(试卷|答案卷|答题卡|word|docx)", text, flags=re.IGNORECASE)
     )
+
+
+def _extract_courseware_filename(text: str) -> str:
+    """从文本中提取一个常见课件文件名。"""
+    match = re.search(
+        r"([\w\u4e00-\u9fa5 .+\-&()（）]+?\.(?:pdf|docx?|pptx?|txt|png|jpe?g|webp|gif|bmp))",
+        str(text or ""),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    return str(match.group(1) or "").strip(" ，,。；;：:")
+
+
+def _infer_duplicate_keep_filename(query: str, session_id: str) -> str:
+    """
+    推断重复课件清理时应保留的文件。
+    优先使用当前/近期对话里的“保留 xxx.pdf”，否则从唯一重复组里选非副本命名。
+    """
+    text = str(query or "")
+    explicit = re.search(r"保留\s*([^\s，,。；;]+?\.(?:pdf|docx?|pptx?|txt|png|jpe?g|webp|gif|bmp))", text, flags=re.IGNORECASE)
+    if explicit:
+        return str(explicit.group(1)).strip()
+    explicit_filename = _extract_courseware_filename(text)
+    if explicit_filename:
+        return explicit_filename
+
+    for msg in reversed(_get_recent_session_messages(session_id, limit=8)):
+        content = str(msg.get("content") or "")
+        match = re.search(r"保留\s*([^\s，,。；;]+?\.(?:pdf|docx?|pptx?|txt|png|jpe?g|webp|gif|bmp))", content, flags=re.IGNORECASE)
+        if match:
+            return str(match.group(1)).strip()
+
+    try:
+        import os
+        import hashlib
+        from utils.config_handler import chroma_conf
+        from utils.path_tool import get_abs_path
+
+        session_dir = os.path.join(get_abs_path(chroma_conf["data_path"]), session_id)
+        if not os.path.isdir(session_dir):
+            return ""
+        allowed = {".txt", ".pdf", ".docx", ".doc", ".ppt", ".pptx", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+        groups: Dict[str, List[str]] = {}
+        for fname in os.listdir(session_dir):
+            if fname.startswith(".") or os.path.splitext(fname)[1].lower() not in allowed:
+                continue
+            fpath = os.path.join(session_dir, fname)
+            if not os.path.isfile(fpath):
+                continue
+            with open(fpath, "rb") as f:
+                md5 = hashlib.md5(f.read()).hexdigest()
+            groups.setdefault(md5, []).append(fname)
+        duplicate_groups = [sorted(names) for names in groups.values() if len(names) > 1]
+        if len(duplicate_groups) != 1:
+            return ""
+        names = duplicate_groups[0]
+
+        def score(name: str) -> tuple[int, int, str]:
+            lower = name.lower()
+            duplicate_markers = ("-dup", "-quad", "-trip", "copy", "副本", "重复")
+            marker_penalty = 1 if any(marker in lower for marker in duplicate_markers) else 0
+            return (marker_penalty, len(name), name)
+
+        return sorted(names, key=score)[0]
+    except Exception:
+        return ""
+
+
+def _is_duplicate_delete_intent(query: str) -> bool:
+    """判断是否是删除重复课件/其余重复文件的请求。"""
+    text = str(query or "").strip()
+    if not text:
+        return False
+    return bool(
+        re.search(r"(删除|移除|清理).*(其余|剩余|重复).*(课件|文件|资料)", text)
+        or re.search(r"(删除|移除|清理).*(课件|文件|资料).*(重复|副本)", text)
+        or re.fullmatch(r"确认删除重复课件:.+", text)
+    )
+
+
+def _is_knowledge_delete_confirmation(query: str) -> bool:
+    """判断是否是课件删除确认短语，避免被课件列表预检误拦截。"""
+    text = str(query or "").strip().replace("：", ":")
+    return bool(re.fullmatch(r"确认删除(?:重复)?课件:.+", text))
 
 
 def _resolve_ops_deterministic_tool(query: str, session_id: str, limit: int) -> tuple[str, Dict[str, Any]]:
     """识别无需 ReAct 的高确定性 ops 请求。"""
     text = str(query or "").strip()
     safe_limit = max(1, min(int(limit or 20), 200))
+    if is_explicit_web_search_intent(text):
+        plan = build_tool_plan(text, session_id=session_id, route_hint="ops")
+        calls = plan.get("tool_calls") if isinstance(plan.get("tool_calls"), list) else []
+        if calls:
+            first_call = calls[0] if isinstance(calls[0], dict) else {}
+            return str(first_call.get("tool_name") or ""), first_call.get("args") if isinstance(first_call.get("args"), dict) else {}
     if re.search(r"(会话列表|查看会话|列出会话|显示会话|展示会话)", text):
         return "list_sessions_tool", {}
+    if _is_duplicate_delete_intent(text):
+        keep_filename = _infer_duplicate_keep_filename(text, session_id)
+        if keep_filename:
+            return "delete_duplicate_knowledge_files_tool", {"keep_filename": keep_filename, "session_id": session_id}
+    if re.fullmatch(r"确认删除课件:.+", text.replace("：", ":")):
+        filename = text.replace("：", ":").split(":", 1)[1].strip()
+        if filename:
+            return "delete_knowledge_file_tool", {"filename": filename, "session_id": session_id}
+    if _is_courseware_management_intent(text):
+        return "list_knowledge_files_tool", {"session_id": session_id}
     if re.search(r"(查看|列出|显示|展示|最近\d{0,3}条)\s*(练习历史|练习记录|练习|错题|做题记录)", text):
         return "get_practice_history", {"session_id": session_id, "limit": safe_limit}
     if re.search(r"(立刻|马上|现在)?\s*(删除|清空|清除|清理).*(所有)?(学习记录|练习记录|错题)", text):
@@ -871,7 +990,7 @@ def _validate_supervisor_decision(
     if not isinstance(decision, dict) or not decision:
         raise ValueError("empty supervisor decision")
 
-    valid_routes = {'rag', 'quiz', 'exam', 'ops', 'planner', 'history', 'chitchat'}
+    valid_routes = {'rag', 'quiz', 'exam', 'ops', 'planner', 'history', 'learning_loop', 'chitchat'}
     route = str(decision.get('route', '')).strip().lower()
     if route not in valid_routes:
         raise ValueError(f"invalid supervisor route: {route or 'empty'}")
@@ -1404,15 +1523,26 @@ def _is_ops_export_intent(query: str) -> bool:
     if not text:
         return False
 
-    has_export_verb = bool(
-        re.search(
-            r"(导出|下载|导出来|保存为|另存为|生成)\s*(word|docx|试卷|答案卷|答题卡)?",
-            text,
-            flags=re.IGNORECASE,
-        )
-    )
+    # 普通“生成试卷”应走 exam；只有明确文件产物/下载语义才走 ops。
+    has_export_verb = bool(re.search(r"(导出|下载|导出来|保存为|另存为)", text, flags=re.IGNORECASE))
+    has_generated_file = bool(re.search(r"生成\s*(word|docx|答案卷|答题卡|答案纸)", text, flags=re.IGNORECASE))
     has_exam_artifact = bool(re.search(r"(试卷|答案卷|答题卡|答案纸|word|docx)", text, flags=re.IGNORECASE))
-    return has_export_verb and has_exam_artifact
+    return (has_export_verb or has_generated_file) and has_exam_artifact
+
+
+def _is_exam_generation_intent(query: str) -> bool:
+    """识别短句试卷生成请求；复杂自然语言留给 LLM Router 判断。"""
+    text = str(query or "").strip()
+    if not text or _is_ops_export_intent(text):
+        return False
+    compact = re.sub(r"\s+", "", text)
+    if len(compact) > 80:
+        return False
+    has_exam_artifact = bool(re.search(r"(试卷|测试卷|考试|出卷|命题)", compact))
+    has_generation_signal = bool(
+        re.search(r"(生成|出|命题|组卷|编写|设计|来一套|给我一套|做一套)", compact)
+    )
+    return has_exam_artifact and has_generation_signal
 
 
 def _is_courseware_management_intent(query: str) -> bool:
@@ -1422,7 +1552,11 @@ def _is_courseware_management_intent(query: str) -> bool:
         return False
     return bool(
         re.search(r"(上传|删除|移除|重试|清理)\s*(课件|文件)", text)
-        or re.search(r"(课件|文件).*(列表|清单|状态|向量|进度)", text)
+        or re.search(r"(课件|文件).*(列表|清单|状态|向量|进度|数量|个数|多少|几个)", text)
+        or re.search(r"(知识库|已上传).*(课件|文件|资料).*(数量|个数|多少|几个|列表|清单|状态)", text)
+        or re.search(r"(知识库|已上传).*(数量|个数|多少|几个)", text)
+        or re.search(r"已上传.*\d+\s*个", text)
+        or re.search(r"(有多少|多少个|几个).*(课件|文件|资料)", text)
         or re.search(r"(查看|列出|展示|显示)\s*(课件文件|文件列表|课件列表)", text)
     )
 
@@ -1442,6 +1576,42 @@ def _is_courseware_content_intent(query: str) -> bool:
     )
 
 
+def _is_learning_loop_intent(query: str) -> bool:
+    """识别强自主学习闭环请求，避免被普通 planner/quiz 分流。"""
+    text = str(query or "").strip()
+    if not text:
+        return False
+    compact = re.sub(r"\s+", "", text)
+    explicit_loop = bool(re.search(r"(学习闭环|自主复习|复习循环|进入学习闭环|开始自主复习|开始复习循环)", compact))
+    plan_and_quiz = bool(
+        re.search(r"(错题|薄弱点|练习画像|mastery|掌握情况).*(安排|计划|复习).*(出题|给.*题|练习)", compact, flags=re.IGNORECASE)
+        or re.search(r"(今天|现在).*(该|应该).*(复习).*(题|练习)", compact)
+    )
+    return explicit_loop or plan_and_quiz
+
+
+def _is_learning_loop_continue_intent(query: str) -> bool:
+    """识别继续推进已有学习闭环的请求。"""
+    text = re.sub(r"\s+", "", str(query or "").strip())
+    if not text:
+        return False
+    return bool(
+        re.search(r"(继续|下一步|推进|执行).*(学习闭环|自主复习|复习循环|Day1|今日闭环|今天任务|练习)", text, flags=re.IGNORECASE)
+        or re.search(r"(开始|执行|生成|出).*(Day1|今日).*(练习|题)", text, flags=re.IGNORECASE)
+    )
+
+
+def _is_learning_loop_review_intent(query: str) -> bool:
+    """识别学习闭环内的作答复盘请求。"""
+    text = re.sub(r"\s+", "", str(query or "").strip())
+    if not text:
+        return False
+    return bool(
+        re.search(r"(学习闭环|自主复习|复习循环).*(复盘|分析|错因|本次作答|刚才作答|提交结果)", text)
+        or re.search(r"(复盘|分析).*(本次|刚才|这次).*(作答|练习|错题)", text)
+    )
+
+
 def _get_route_fallback(error: str, original_query: str) -> str:
     """根据错误类型返回合适的 fallback 路由"""
     error_lower = error.lower()
@@ -1456,6 +1626,8 @@ def _get_route_fallback(error: str, original_query: str) -> str:
     # 先按 query 关键词兜底，避免模型暂时失败时误路由到 chitchat
     if is_ops_export_intent:
         return 'ops'
+    if _is_learning_loop_intent(query) or _is_learning_loop_continue_intent(query) or _is_learning_loop_review_intent(query):
+        return 'learning_loop'
     if _is_courseware_content_intent(query):
         return 'rag'
     if any(kw in query for kw in ['出题', '做题', '练习', '刷题']):
@@ -1491,7 +1663,7 @@ async def supervisor_node(state: SupervisorState) -> SupervisorState:
     # 允许外层先做一次路由判定，然后在 workflow 内复用，避免 quiz/exam 回退路径重复调用 LLM 路由。
     if bool(state.get("supervisor_precomputed", False)):
         precomputed_route = str(state.get("route", "") or "").strip()
-        valid_routes = {"rag", "quiz", "exam", "ops", "planner", "history", "chitchat"}
+        valid_routes = {"rag", "quiz", "exam", "ops", "planner", "history", "learning_loop", "chitchat"}
         if precomputed_route in valid_routes:
             precomputed_reason = str(state.get("route_reason", "") or "预路由命中")
             precomputed_params = state.get("route_params", {}) if isinstance(state.get("route_params"), dict) else {}
@@ -1513,6 +1685,30 @@ async def supervisor_node(state: SupervisorState) -> SupervisorState:
         logger.info(f"[Supervisor] 检测到打招呼，直接路由 chitchat")
         return {"route": "chitchat", "route_reason": "打招呼问候", "route_params": {}, "input": state['input']}
 
+    # 前端按钮传入的显式动作优先于自然语言 Router，避免按钮 prompt 被关键词误分流。
+    if str(state.get("client_action", "") or "").strip() == "generate_exam":
+        logger.info("[Supervisor] 命中前端显式生成试卷动作，强制路由 exam")
+        return {
+            "route": "exam",
+            "route_reason": "前端显式动作 generate_exam（强制exam）",
+            "route_params": {"topics": [], "quiz_types": ["选择题", "判断题", "填空题", "简答题"], "total_questions": 23},
+            "input": state["input"],
+        }
+
+    # 预检：强自主学习闭环必须优先于普通 planner/quiz/history。
+    if (
+        _is_learning_loop_intent(state.get("input", ""))
+        or _is_learning_loop_continue_intent(state.get("input", ""))
+        or _is_learning_loop_review_intent(state.get("input", ""))
+    ):
+        logger.info("[Supervisor] 命中学习闭环意图，优先路由 learning_loop")
+        return {
+            "route": "learning_loop",
+            "route_reason": "学习闭环意图（预检强制learning_loop）",
+            "route_params": {"mode": "learning_loop"},
+            "input": state["input"],
+        }
+
     # 预检：导出试卷/答案卷属于管理操作，优先进入 ops，避免被 exam 关键词误吸走。
     if _is_ops_export_intent(state.get("input", "")):
         logger.info("[Supervisor] 命中导出试卷意图，优先路由 ops")
@@ -1520,6 +1716,46 @@ async def supervisor_node(state: SupervisorState) -> SupervisorState:
             "route": "ops",
             "route_reason": "导出试卷意图（预检强制ops）",
             "route_params": {"target": "exam_export", "action": "export", "limit": 20},
+            "input": state["input"],
+        }
+
+    # 预检：确认短语必须进入 ops 执行链路，不能被课件列表查询抢走。
+    if _is_knowledge_delete_confirmation(state.get("input", "")):
+        logger.info("[Supervisor] 命中课件删除确认短语，优先路由 ops")
+        return {
+            "route": "ops",
+            "route_reason": "课件删除确认短语（预检强制ops）",
+            "route_params": {},
+            "input": state["input"],
+        }
+
+    # 预检：用户明确要求联网/网络搜索时必须走工具，不让普通模型口头拒绝。
+    if is_explicit_web_search_intent(state.get("input", "")):
+        logger.info("[Supervisor] 命中显式联网搜索意图，优先路由 ops")
+        return {
+            "route": "ops",
+            "route_reason": "显式联网搜索意图（预检强制ops）",
+            "route_params": {"target": "web_search", "action": "search", "limit": 20},
+            "input": state["input"],
+        }
+
+    # 预检：生成试卷必须优先于“已上传课件”这类课件元信息关键词。
+    if _is_exam_generation_intent(state.get("input", "")):
+        logger.info("[Supervisor] 命中试卷生成意图，优先路由 exam")
+        return {
+            "route": "exam",
+            "route_reason": "试卷生成意图（预检强制exam）",
+            "route_params": {"topics": [], "quiz_types": ["选择题", "判断题", "填空题", "简答题"], "total_questions": 23},
+            "input": state["input"],
+        }
+
+    # 预检：课件数量/列表/状态是资源元信息，必须走工具查询，避免 RAG 片段估数。
+    if _is_courseware_management_intent(state.get("input", "")):
+        logger.info("[Supervisor] 命中课件管理查询，优先路由 ops")
+        return {
+            "route": "ops",
+            "route_reason": "课件管理查询（预检强制ops）",
+            "route_params": {"target": "knowledge", "action": "list", "limit": 200},
             "input": state["input"],
         }
 
@@ -1559,7 +1795,7 @@ async def supervisor_node(state: SupervisorState) -> SupervisorState:
 
     if _is_context_reference_followup(state.get("input", "")):
         recent_route = _get_recent_assistant_route(str(sid))
-        valid_follow_routes = {"rag", "quiz", "exam", "ops", "planner", "history"}
+        valid_follow_routes = {"rag", "quiz", "exam", "ops", "planner", "history", "learning_loop"}
         route = recent_route.get("route") if recent_route.get("route") in valid_follow_routes else "rag"
         if recent_route.get("kind") == "quiz_set":
             route = "quiz"
@@ -1617,6 +1853,158 @@ async def supervisor_node(state: SupervisorState) -> SupervisorState:
     return {"route": route, "route_reason": reason, "route_params": params, "input": rewritten_query}
 
 
+async def tool_orchestrator_node(state: SupervisorState) -> SupervisorState:
+    """在专家 Agent 前统一规划并执行安全工具调用。"""
+    route = str(state.get("route") or "rag")
+    client_action = str(state.get("client_action") or "").strip()
+    if client_action == "generate_exam" or route == "chitchat":
+        return state
+
+    recent_history = _format_history_with_limit(state.get("chat_history", []), max_chars=800)
+    tool_context = str(state.get("tool_context") or "").strip()
+    if tool_context:
+        recent_history = f"{recent_history}\n\n{tool_context}".strip()
+
+    react_result = await run_react_orchestrator(
+        query=str(state.get("input") or ""),
+        session_id=str(state.get("session_id") or current_session_id.get() or "default"),
+        route_hint=route,
+        recent_history=recent_history,
+    )
+    observations = react_result.get("observations") if isinstance(react_result.get("observations"), list) else []
+    if observations:
+        try:
+            memory_manager.append_tool_contexts(
+                str(state.get("session_id") or current_session_id.get() or "default"),
+                observations,
+                turn_query=str(state.get("input") or ""),
+                source="react_orchestrator",
+            )
+        except Exception as e:
+            logger.warning(f"[ToolContext] 保存 ReAct observation 失败: {e}")
+    params = state.get("route_params", {}) if isinstance(state.get("route_params", {}), dict) else {}
+    delegate = react_result.get("delegate") if isinstance(react_result.get("delegate"), dict) else {}
+    delegate_params = delegate.get("route_params") if isinstance(delegate.get("route_params"), dict) else {}
+    next_route = str(react_result.get("next_agent") or route)
+    return {
+        **state,
+        "route": next_route,
+        "route_params": {
+            **params,
+            **delegate_params,
+            "orchestrator": {
+                "tool_plan": react_result.get("tool_plan", {}),
+                "task_plan": react_result.get("task_plan", {}),
+                "plan_execution": react_result.get("plan_execution", []),
+                "observations": observations,
+                "trace": react_result.get("trace", []),
+                "guard_blocked": bool(react_result.get("guard_blocked", False)),
+                "react_status": str(react_result.get("react_status") or ""),
+                "final_answer": str(react_result.get("final_answer") or ""),
+                "route_before_orchestrator": route,
+                "route_after_orchestrator": next_route,
+                "route_changed_by_orchestrator": next_route != route,
+            },
+        },
+    }
+
+
+def _get_orchestrator_observations(state: SupervisorState) -> List[Dict[str, Any]]:
+    """读取 ReAct observation，供专家 Agent 复用已完成的取证结果。"""
+    params = state.get("route_params", {}) if isinstance(state.get("route_params", {}), dict) else {}
+    orchestrator = params.get("orchestrator") if isinstance(params.get("orchestrator"), dict) else {}
+    observations = orchestrator.get("observations") if isinstance(orchestrator.get("observations"), list) else []
+    return [item for item in observations if isinstance(item, dict)]
+
+
+def _format_orchestrator_observations(
+    state: SupervisorState,
+    tool_names: set[str] | None = None,
+    *,
+    title: str = "ReAct工具观察",
+) -> str:
+    """把指定工具的 observation 拼成可注入 prompt 的上下文文本。"""
+    allowed = set(tool_names or [])
+    lines: List[str] = []
+    for item in _get_orchestrator_observations(state):
+        tool_name = str(item.get("tool_name") or "").strip()
+        if allowed and tool_name not in allowed:
+            continue
+        content = str(item.get("content") or "").strip()
+        if not content:
+            continue
+        lines.append(f"【{tool_name}】\n{content}")
+    if not lines:
+        return ""
+    return f"【{title}】\n" + "\n\n".join(lines)
+
+
+def _get_orchestrator_observation_content(state: SupervisorState, tool_name: str) -> str:
+    """读取指定工具的第一条 observation 原文。"""
+    for item in _get_orchestrator_observations(state):
+        if str(item.get("tool_name") or "").strip() == tool_name:
+            return str(item.get("content") or "").strip()
+    return ""
+
+
+def _attach_question_type_plan(result: Any, question_type_plan: Dict[str, Any]) -> Any:
+    """把题型决策写入专家结果，供消息协议和前端展示。"""
+    if not isinstance(result, dict):
+        return result
+    payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+    meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+    return {
+        **result,
+        "payload": {**payload, "question_type_plan": question_type_plan},
+        "meta": {**meta, "question_type_plan": question_type_plan},
+    }
+
+
+def _merge_quiz_batch_results(topic: str, results: List[Dict[str, Any]], question_type_plan: Dict[str, Any]) -> Dict[str, Any]:
+    """合并多题型小练习批次，保持前端只收到一个 quiz_set。"""
+    from agent.multi_agent.quiz_parser import build_quiz_payload, build_quiz_text_from_questions, questions_from_quiz_text
+
+    questions: List[Dict[str, Any]] = []
+    batch_meta: List[Dict[str, Any]] = []
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+        batch_questions = payload.get("questions") if isinstance(payload.get("questions"), list) else []
+        if not batch_questions:
+            batch_questions = questions_from_quiz_text(str(result.get("text") or ""), topic).get("questions", [])
+        for item in batch_questions or []:
+            if isinstance(item, dict):
+                questions.append(dict(item))
+        batch_meta.append(result.get("meta") if isinstance(result.get("meta"), dict) else {})
+
+    if not questions:
+        return results[0] if results else {
+            "kind": "chat",
+            "render_mode": "markdown",
+            "text": "本次多题型练习生成失败，请稍后重试。",
+            "payload": {},
+            "meta": {"question_type_plan": question_type_plan},
+        }
+
+    for idx, question in enumerate(questions, start=1):
+        question["id"] = idx
+    payload = build_quiz_payload(topic or "练习题", questions)
+    text = build_quiz_text_from_questions(questions)
+    return {
+        "kind": "quiz_set",
+        "render_mode": "interactive_cards",
+        "text": text,
+        "payload": {**payload, "question_type_plan": question_type_plan},
+        "meta": {
+            "delivery_mode": "full",
+            "question_type_plan": question_type_plan,
+            "merged_quiz_batches": len(results),
+            "batch_meta": batch_meta,
+        },
+    }
+
+
 # ==================== SubAgent 节点 ====================
 
 async def rag_subagent_node(state: SupervisorState) -> SupervisorState:
@@ -1642,19 +2030,24 @@ async def rag_subagent_node(state: SupervisorState) -> SupervisorState:
         history_lines.append(f"{role}: {msg.content[:300]}")
     recent_history = "\n".join(history_lines) if history_lines else "（无近期对话）"
 
-    try:
-        rag = await get_rag_service()
-        # retrieve_context 只检索、不调 LLM，避免冗余的双重 LLM 调用
-        retrieve_start = time.time()
-        context = await rag.retrieve_context(topic, mode="rag_chat")
-        logger.info(f"[Latency] rag_retrieve_ms={int((time.time() - retrieve_start) * 1000)}")
-        # 如果检索为空，给出友好提示
-        if not context or context.strip() == "":
-            logger.warning("[RAG SubAgent] 知识库为空，请先上传课件")
-            context = "【提示】当前知识库为空，请先上传课件后再提问。你可以通过点击「上传课件」按钮来添加复习资料。"
-    except Exception as e:
-        logger.warning(f"[RAG SubAgent] 检索失败: {e}")
-        context = "【提示】知识库检索遇到问题，请确保已上传课件。如未上传，请先上传复习资料。"
+    orchestrator_context = _format_orchestrator_observations(state, {"search_courseware"}, title="ReAct课件检索结果")
+    if orchestrator_context:
+        context = orchestrator_context
+        logger.info("[RAG SubAgent] 复用 ReAct 课件 observation，跳过重复检索")
+    else:
+        try:
+            rag = await get_rag_service()
+            # retrieve_context 只检索、不调 LLM，避免冗余的双重 LLM 调用
+            retrieve_start = time.time()
+            context = await rag.retrieve_context(topic, mode="rag_chat")
+            logger.info(f"[Latency] rag_retrieve_ms={int((time.time() - retrieve_start) * 1000)}")
+            # 如果检索为空，给出友好提示
+            if not context or context.strip() == "":
+                logger.warning("[RAG SubAgent] 知识库为空，请先上传课件")
+                context = "【提示】当前知识库为空，请先上传课件后再提问。你可以通过点击「上传课件」按钮来添加复习资料。"
+        except Exception as e:
+            logger.warning(f"[RAG SubAgent] 检索失败: {e}")
+            context = "【提示】知识库检索遇到问题，请确保已上传课件。如未上传，请先上传复习资料。"
 
     llm_start = time.time()
     result_raw = await _call_llm(
@@ -1721,16 +2114,27 @@ async def quiz_subagent_node(state: SupervisorState) -> SupervisorState:
         return {"subagent_result": structured, "final_answer": structured["text"]}
 
     from agent.multi_agent.quiz_agent import run_quiz_agent
+    from agent.multi_agent.question_type_resolver import resolve_question_type_plan
     from api.routers.knowledge import get_sample_paper_context
     from utils.memory_service import memory_manager
 
     sample_ctx = get_sample_paper_context(sid)
 
     topic = params.get('topic', '')
-    quiz_type = params.get('quiz_type') or '选择题'
-    num = _safe_int(params.get('num', 3), default=3, minimum=1, maximum=20)
-    if not params.get('num'):
-        logger.warning(f"[Quiz SubAgent] num 参数缺失/非法，已回退默认值 num={num}")
+    question_type_plan = await resolve_question_type_plan(
+        query=str(state.get("input") or ""),
+        route="quiz",
+        session_id=str(sid),
+        sample_paper_context=sample_ctx,
+        route_params=params,
+    )
+    quiz_batches = [
+        (str(item.get("type") or "选择题"), _safe_int(item.get("count"), default=0, minimum=0, maximum=20))
+        for item in question_type_plan.get("question_type_plan", [])
+        if isinstance(item, dict) and _safe_int(item.get("count"), default=0, minimum=0, maximum=20) > 0
+    ]
+    if not quiz_batches:
+        quiz_batches = [("选择题", 3)]
 
     # 如果 topic 为空或只有意图词（题、出题等），视为通用出题请求
     # 不拦截，让 LLM 自己选择合适的知识点出题
@@ -1761,14 +2165,29 @@ async def quiz_subagent_node(state: SupervisorState) -> SupervisorState:
     )
     if recent_signatures:
         logger.info(f"[Quiz SubAgent] 已加载最近15轮签名 {len(recent_signatures)} 条，启用跨轮去重")
-    quiz_result = await run_quiz_agent(
-        effective_topic + weak_context,
-        quiz_type,
-        num,
-        sample_ctx,
-        force_llm_critic=bool(state.get("quiz_force_llm_critic", False)),
-        forbidden_question_signatures=recent_signatures,
-    )
+    if len(quiz_batches) > 1:
+        batch_results: List[Dict[str, Any]] = []
+        for quiz_type, num in quiz_batches:
+            batch_results.append(await run_quiz_agent(
+                effective_topic + weak_context,
+                quiz_type,
+                num,
+                sample_ctx,
+                force_llm_critic=bool(state.get("quiz_force_llm_critic", False)),
+                forbidden_question_signatures=recent_signatures,
+            ))
+        quiz_result = _merge_quiz_batch_results(effective_topic, batch_results, question_type_plan)
+    else:
+        quiz_type, num = quiz_batches[0]
+        quiz_result = await run_quiz_agent(
+            effective_topic + weak_context,
+            quiz_type,
+            num,
+            sample_ctx,
+            force_llm_critic=bool(state.get("quiz_force_llm_critic", False)),
+            forbidden_question_signatures=recent_signatures,
+        )
+        quiz_result = _attach_question_type_plan(quiz_result, question_type_plan)
     quiz_text = quiz_result.get("text", "") if isinstance(quiz_result, dict) else quiz_result
     if not quiz_text:
         quiz_text = "抱歉，出题失败了，请稍后重试。"
@@ -1801,6 +2220,7 @@ async def exam_subagent_node(state: SupervisorState) -> SupervisorState:
     logger.info(f"[Exam SubAgent] stage_plan={state.get('exam_stage_plan', False)}, rerun_stage={state.get('exam_rerun_stage')}")
 
     from agent.multi_agent.quiz_agent import run_exam_agent
+    from agent.multi_agent.question_type_resolver import resolve_question_type_plan
     from api.routers.knowledge import get_sample_paper_context
     from utils.memory_service import memory_manager
 
@@ -1813,6 +2233,7 @@ async def exam_subagent_node(state: SupervisorState) -> SupervisorState:
         return {"subagent_result": structured, "final_answer": structured["text"]}
 
     sample_ctx = get_sample_paper_context(sid)
+    search_format_observation = _get_orchestrator_observation_content(state, "search_exam_format")
 
     topics = params.get('topics', [])
     quiz_types = params.get('quiz_types')
@@ -1823,6 +2244,7 @@ async def exam_subagent_node(state: SupervisorState) -> SupervisorState:
         logger.warning(f"[Exam SubAgent] total_questions 缺失/非法，已回退默认值 total={total}")
     raw_quantity_dist = params.get('quantity_dist', {}) or {}
     quantity_dist = {}
+    quantity_dist_is_fallback = False
     if isinstance(raw_quantity_dist, dict):
         for key in ("choice", "fill", "judge", "essay"):
             if key in raw_quantity_dist:
@@ -1847,7 +2269,24 @@ async def exam_subagent_node(state: SupervisorState) -> SupervisorState:
             w in raw_input for w in ["综合测试卷", "综合试卷", "期末试卷", "出一套试卷", "生成试卷"]
         ):
             quantity_dist = {"choice": 10, "fill": 5, "judge": 5, "essay": 3}
+            quantity_dist_is_fallback = True
             logger.warning("[Exam SubAgent] route_params 缺失，已按综合卷默认分布回填 quantity_dist=10/5/5/3")
+
+    resolver_params = params if quantity_dist_is_fallback or not quantity_dist else {**params, "quantity_dist": quantity_dist}
+    question_type_plan = await resolve_question_type_plan(
+        query=raw_input,
+        route="exam",
+        session_id=str(sid),
+        sample_paper_context=sample_ctx,
+        search_observation=search_format_observation,
+        route_params=resolver_params,
+    )
+    quantity_dist = question_type_plan.get("quantity_dist", {}) if isinstance(question_type_plan.get("quantity_dist"), dict) else {}
+    quiz_types = question_type_plan.get("quiz_types", []) if isinstance(question_type_plan.get("quiz_types"), list) else quiz_types
+    total = _safe_int(question_type_plan.get("total_questions", total), default=total, minimum=1, maximum=60)
+    raw_format_reference = str(question_type_plan.get("raw_reference") or "").strip()
+    if raw_format_reference and question_type_plan.get("source") == "web_search":
+        sample_ctx = (sample_ctx or "") + "\n\n【联网题型参考】\n" + raw_format_reference[:2000]
 
     if any(int(quantity_dist.get(k, 0)) > 0 for k in ("choice", "fill", "judge", "essay")):
         total = int(sum(int(quantity_dist.get(k, 0) or 0) for k in ("choice", "fill", "judge", "essay")))
@@ -1912,6 +2351,7 @@ async def exam_subagent_node(state: SupervisorState) -> SupervisorState:
             exam_result = {**exam_result, "text": exam_text}
         else:
             exam_result = exam_text
+    exam_result = _attach_question_type_plan(exam_result, question_type_plan)
     return {"subagent_result": exam_result, "final_answer": exam_text}
 
 
@@ -1922,6 +2362,69 @@ async def ops_subagent_node(state: SupervisorState) -> SupervisorState:
     sid = state.get('session_id') or current_session_id.get() or 'default'
     current_session_id.set(sid)
     user_input = str(state.get("input", "") or "").strip()
+    params = state.get("route_params", {}) if isinstance(state.get("route_params", {}), dict) else {}
+    orchestrator = params.get("orchestrator") if isinstance(params.get("orchestrator"), dict) else {}
+    observations = orchestrator.get("observations") if isinstance(orchestrator.get("observations"), list) else []
+    if bool(orchestrator.get("guard_blocked", False)):
+        tool_plan = orchestrator.get("tool_plan") if isinstance(orchestrator.get("tool_plan"), dict) else {}
+        calls = tool_plan.get("tool_calls") if isinstance(tool_plan.get("tool_calls"), list) else []
+        first_call = calls[0] if calls and isinstance(calls[0], dict) else {}
+        tool_name = str(first_call.get("tool_name") or "unknown_tool")
+        pending_args = first_call.get("args") if isinstance(first_call.get("args"), dict) else {}
+        trace = orchestrator.get("trace") if isinstance(orchestrator.get("trace"), list) else []
+        required_phrase, arg_error = _ops_required_confirmation_phrase(tool_name, pending_args)
+        reason = arg_error or f"检测到高风险操作 `{tool_name}`，需要二次确认后执行。"
+        structured = _build_ops_guard_reply(
+            trace=trace,
+            tool_name=tool_name,
+            pending_args=pending_args,
+            required_phrase=required_phrase,
+            reason=reason,
+        )
+        structured["meta"]["orchestrator_used"] = True
+        structured["meta"]["agent_trace"] = trace
+        structured["payload"]["agent_trace"] = trace
+        return {"subagent_result": structured, "final_answer": structured["text"]}
+
+    final_answer = str(orchestrator.get("final_answer") or "").strip()
+    if final_answer and not observations:
+        trace = orchestrator.get("trace") if isinstance(orchestrator.get("trace"), list) else []
+        structured = {
+            "kind": "chat",
+            "render_mode": "markdown",
+            "text": final_answer,
+            "payload": {"ops_trace": trace, "agent_trace": trace},
+            "meta": {
+                "ops_react": True,
+                "orchestrator_used": True,
+                "agent_trace": trace,
+            },
+        }
+        return {"subagent_result": structured, "final_answer": final_answer}
+
+    if observations and str(observations[0].get("tool_name") or "") in {"web_search", "search_exam_format"}:
+        lines = ["## 联网搜索结果", ""]
+        for item in observations:
+            tool_name = str(item.get("tool_name") or "tool")
+            content = str(item.get("content") or "").strip()
+            lines.append(f"### {tool_name}")
+            lines.append(content or "工具已调用，但没有返回可展示内容。")
+            lines.append("")
+        text = "\n".join(lines).strip()
+        trace = orchestrator.get("trace") if isinstance(orchestrator.get("trace"), list) else []
+        structured = {
+            "kind": "chat",
+            "render_mode": "markdown",
+            "text": text,
+            "payload": {"ops_trace": trace, "agent_trace": trace},
+            "meta": {
+                "ops_react": True,
+                "orchestrator_used": True,
+                "agent_trace": trace,
+            },
+        }
+        return {"subagent_result": structured, "final_answer": text}
+
     tool_map = _build_ops_tool_map()
     if not tool_map:
         text = "当前未注册可用的管理工具，请稍后重试。"
@@ -1931,7 +2434,6 @@ async def ops_subagent_node(state: SupervisorState) -> SupervisorState:
     recent_history = _format_history_with_limit(state.get('chat_history', []), max_chars=500)
     trace: List[Dict[str, Any]] = []
     max_steps = 2
-    params = state.get("route_params", {}) if isinstance(state.get("route_params", {}), dict) else {}
     limit = _safe_int(params.get("limit", 20), default=20, minimum=1, maximum=200)
 
     if params.get("action") == "context_reference":
@@ -1977,6 +2479,34 @@ async def ops_subagent_node(state: SupervisorState) -> SupervisorState:
             }
             return {"subagent_result": structured, "final_answer": text}
 
+    if params.get("target") == "knowledge" and params.get("action") == "list":
+        tool_obj = tool_map.get("list_knowledge_files_tool")
+        if tool_obj is None:
+            text = "课件列表工具未注册，无法读取当前知识库状态。"
+            return {"subagent_result": text, "final_answer": text}
+        try:
+            result = await tool_obj.ainvoke({"session_id": str(sid)})
+            result_text = _safe_json_dumps(result) if isinstance(result, (dict, list)) else str(result)
+            trace.append({"step": 1, "tool": "list_knowledge_files_tool", "args": {"session_id": str(sid)}, "observation": result_text[:1200]})
+            structured = {
+                "kind": "chat",
+                "render_mode": "markdown",
+                "text": result_text,
+                "payload": {"ops_trace": trace},
+                "meta": {"ops_react": True, "ops_steps": 1, "ops_deterministic": True},
+            }
+            return {"subagent_result": structured, "final_answer": result_text}
+        except Exception as e:
+            text = f"读取课件列表失败：{e}"
+            structured = {
+                "kind": "chat",
+                "render_mode": "markdown",
+                "text": text,
+                "payload": {"ops_trace": trace},
+                "meta": {"ops_react": True, "ops_steps": len(trace), "ops_deterministic": True},
+            }
+            return {"subagent_result": structured, "final_answer": text}
+
     direct_tool, direct_args = _resolve_ops_deterministic_tool(user_input, str(sid), limit)
     if direct_tool:
         logger.info(f"[Ops SubAgent] 命中确定性工具分支 tool={direct_tool}")
@@ -1987,16 +2517,17 @@ async def ops_subagent_node(state: SupervisorState) -> SupervisorState:
         if direct_tool in OPS_DANGEROUS_TOOLS:
             required_phrase, arg_error = _ops_required_confirmation_phrase(direct_tool, direct_args)
             reason = arg_error or f"检测到高风险操作 `{direct_tool}`，需要二次确认后执行。"
-            trace.append({"step": 1, "tool": direct_tool, "args": direct_args, "guard_blocked": True, "required_confirmation_phrase": required_phrase})
-            structured = _build_ops_guard_reply(
-                trace=trace,
-                tool_name=direct_tool,
-                pending_args=direct_args,
-                required_phrase=required_phrase,
-                reason=reason,
-            )
-            structured["meta"]["ops_deterministic"] = True
-            return {"subagent_result": structured, "final_answer": structured["text"]}
+            if arg_error or not _is_ops_confirmation_match(user_input, required_phrase, direct_tool):
+                trace.append({"step": 1, "tool": direct_tool, "args": direct_args, "guard_blocked": True, "required_confirmation_phrase": required_phrase})
+                structured = _build_ops_guard_reply(
+                    trace=trace,
+                    tool_name=direct_tool,
+                    pending_args=direct_args,
+                    required_phrase=required_phrase,
+                    reason=reason,
+                )
+                structured["meta"]["ops_deterministic"] = True
+                return {"subagent_result": structured, "final_answer": structured["text"]}
         try:
             result = await tool_obj.ainvoke(direct_args)
             result_text = _safe_json_dumps(result) if isinstance(result, (dict, list)) else str(result)
@@ -2131,6 +2662,10 @@ async def ops_subagent_node(state: SupervisorState) -> SupervisorState:
         final_answer = str(decision.get("final_answer", "") or "").strip()
         tool_name = str(decision.get("tool_name", "") or "").strip()
         tool_args = decision.get("tool_args", {}) if isinstance(decision.get("tool_args", {}), dict) else {}
+
+        # 模型有时会同时给 done=true 和 tool_name；此时以工具调用为准。
+        if done and tool_name:
+            done = False
 
         if done:
             claimed_success_without_tool = bool(
@@ -2589,6 +3124,507 @@ def _render_planner_markdown(plan: Dict[str, Any], *, basis_text: str = "") -> s
     return "\n".join(lines).strip()
 
 
+def _extract_learning_loop_evidence(context: str, limit: int = 3) -> List[Dict[str, Any]]:
+    """从 RAG context 中提炼前端证据卡，供学习闭环展示课件依据。"""
+    text = str(context or "")
+    if not text:
+        return []
+    cards: List[Dict[str, Any]] = []
+    seen = set()
+    pattern = r"\[参考资料\d+\]:参考资料:(.*?)\|参考元数据:(\{.*?\})(?:\n|$)"
+    for match in re.finditer(pattern, text, flags=re.DOTALL):
+        quote = re.sub(r"\s+", " ", str(match.group(1) or "")).strip()[:140]
+        metadata_text = str(match.group(2) or "").strip()
+        source = "课件片段"
+        page = None
+        for parser in (ast.literal_eval, json.loads):
+            try:
+                parsed = parser(metadata_text)
+            except Exception:
+                continue
+            if isinstance(parsed, dict):
+                source = str(parsed.get("source_filename") or parsed.get("source") or source).strip() or source
+                page = parsed.get("page")
+                break
+        key = f"{source}|{page}|{quote}"
+        if not quote or key in seen:
+            continue
+        seen.add(key)
+        card: Dict[str, Any] = {"source": source, "quote": quote, "grounded": True}
+        if page not in (None, ""):
+            card["page"] = page
+        cards.append(card)
+        if len(cards) >= max(1, min(int(limit or 3), 8)):
+            break
+    if cards:
+        return cards
+
+    simple_pattern = r"\[source=(?P<source>[^\]\s]+)(?:\s+page=(?P<page>[^\]]+))?\]\s*(?P<quote>.*?)(?=\n\[source=|\Z)"
+    for match in re.finditer(simple_pattern, text, flags=re.DOTALL):
+        source = str(match.group("source") or "课件片段").strip()
+        page = str(match.group("page") or "").strip()
+        quote = re.sub(r"\s+", " ", str(match.group("quote") or "")).strip()[:140]
+        key = f"{source}|{page}|{quote}"
+        if not quote or key in seen:
+            continue
+        seen.add(key)
+        card = {"source": source, "quote": quote, "grounded": True}
+        if page:
+            card["page"] = page
+        cards.append(card)
+        if len(cards) >= max(1, min(int(limit or 3), 8)):
+            break
+    if cards:
+        return cards
+
+    for match in re.finditer(r"(?P<source>[^：:\n]{1,80}\.(?:pdf|pptx?|docx?|txt))[:：]\s*(?P<quote>[^\n]{10,})", text, flags=re.IGNORECASE):
+        source = str(match.group("source") or "课件片段").strip()
+        quote = re.sub(r"\s+", " ", str(match.group("quote") or "")).strip()[:140]
+        key = f"{source}|{quote}"
+        if key in seen:
+            continue
+        seen.add(key)
+        cards.append({"source": source, "quote": quote, "grounded": True})
+        if len(cards) >= max(1, min(int(limit or 3), 8)):
+            break
+    return cards
+
+
+def _learning_loop_focus_points(user_input: str, snapshot: Dict[str, Any]) -> List[str]:
+    """根据真实画像和用户输入选择闭环优先考点。"""
+    priority = snapshot.get("mastery_priority", []) if isinstance(snapshot.get("mastery_priority", []), list) else []
+    points = [
+        str(item.get("knowledge_point", "")).strip()
+        for item in priority
+        if isinstance(item, dict) and str(item.get("knowledge_point", "")).strip()
+    ]
+    if points:
+        return list(dict.fromkeys(points))[:5]
+
+    weak_points = snapshot.get("weak_points", []) if isinstance(snapshot.get("weak_points", []), list) else []
+    points = [str(item).strip() for item in weak_points if str(item).strip()]
+    if points:
+        return list(dict.fromkeys(points))[:5]
+
+    text = str(user_input or "")
+    topic_matches = re.findall(r"(进程|线程|内存|虚拟内存|死锁|调度|文件系统|I/O|同步|信号量|TLB)", text, flags=re.IGNORECASE)
+    normalized = [str(item).strip() for item in topic_matches if str(item).strip()]
+    if normalized:
+        return list(dict.fromkeys(normalized))[:5]
+
+    return ["基线诊断与知识框架梳理", "课件核心概念复习", "综合练习与错因复盘"]
+
+
+def _build_learning_loop_plan(
+    user_input: str,
+    snapshot: Dict[str, Any],
+    evidence_cards: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """构建确定性学习闭环计划，保证空画像和每日任务约束稳定。"""
+    constraints = _extract_planner_constraints(user_input)
+    cycle_days = _safe_int(constraints.get("cycle_days", 0), default=3, minimum=1, maximum=7)
+    if not constraints.get("cycle_days"):
+        cycle_days = 3
+    daily_minutes = _safe_int(constraints.get("daily_minutes", 0), default=60, minimum=20, maximum=180)
+    if not constraints.get("daily_minutes"):
+        daily_minutes = 60
+
+    total_attempts = int(snapshot.get("total_attempts", 0) or 0)
+    has_practice_profile = total_attempts > 0
+    focus_points = _learning_loop_focus_points(user_input, snapshot)
+
+    daily_plan: List[Dict[str, Any]] = []
+    for day in range(1, cycle_days + 1):
+        focus = focus_points[(day - 1) % len(focus_points)]
+        daily_plan.append(
+            {
+                "day": day,
+                "focus": focus,
+                "tasks": [
+                    f"复习「{focus}」对应课件要点，整理 3 条关键词",
+                    f"练习「{focus}」选择题 3 道，完成后立即提交作答",
+                    "复盘错因：记录错误类型、正确依据和下一次避免策略",
+                ],
+                "duration_min": daily_minutes,
+            }
+        )
+
+    day1_focus = daily_plan[0]["focus"]
+    basis_text = (
+        f"基于真实练习画像（累计 {total_attempts} 题，正确率 {snapshot.get('accuracy', 0.0)}%）"
+        if has_practice_profile
+        else "暂无错题画像，先用课件结构做基线诊断"
+    )
+    return {
+        "title": "自主学习闭环",
+        "basis": basis_text,
+        "has_practice_profile": has_practice_profile,
+        "cycle_days": cycle_days,
+        "daily_plan": daily_plan,
+        "day1_quiz_request": {
+            "topic": day1_focus,
+            "quiz_type": "选择题",
+            "num": 3,
+            "prompt": f"请针对「{day1_focus}」出3道选择题，我作答后请判分并记录错因。",
+        },
+        "next_action": f"先执行 Day1：复习「{day1_focus}」10-15 分钟，然后让 DR 出 3 道选择题。",
+        "evidence_count": len(evidence_cards),
+    }
+
+
+def _critic_learning_loop_plan(plan: Dict[str, Any], snapshot: Dict[str, Any]) -> tuple[Dict[str, Any], List[str], str]:
+    """校验并修复学习闭环计划，返回修复后的计划、问题列表和状态。"""
+    findings: List[str] = []
+    partial = False
+    total_attempts = int(snapshot.get("total_attempts", 0) or 0)
+    if total_attempts <= 0 and "最近错题" in str(plan.get("basis", "")):
+        findings.append("空画像不能声称基于最近错题。")
+        plan = {**plan, "basis": "暂无错题画像，先用课件结构做基线诊断", "has_practice_profile": False}
+
+    fixed_daily: List[Dict[str, Any]] = []
+    raw_daily = plan.get("daily_plan", []) if isinstance(plan.get("daily_plan", []), list) else []
+    for row in raw_daily:
+        item = dict(row) if isinstance(row, dict) else {}
+        focus = str(item.get("focus") or "核心主题").strip()
+        tasks = [str(task).strip() for task in item.get("tasks", []) if str(task).strip()] if isinstance(item.get("tasks", []), list) else []
+        joined = " ".join(tasks)
+        required_tasks = {
+            "复习": f"复习「{focus}」核心概念并整理关键词",
+            "练习": f"练习「{focus}」选择题 3 道并提交作答",
+            "复盘": "复盘错因并写下下一步纠偏动作",
+        }
+        for key, fallback in required_tasks.items():
+            if key not in joined:
+                findings.append(f"Day {item.get('day', '?')} 缺少{key}任务，已补齐。")
+                tasks.append(fallback)
+        item["tasks"] = tasks
+        fixed_daily.append(item)
+    if not fixed_daily:
+        partial = True
+        findings.append("每日计划为空，已降级为确定性模板。")
+        fallback_focus = "基线诊断与知识框架梳理" if total_attempts <= 0 else "最低掌握度考点"
+        fixed_daily = [
+            {
+                "day": 1,
+                "focus": fallback_focus,
+                "tasks": [
+                    f"复习「{fallback_focus}」核心概念并整理关键词",
+                    f"练习「{fallback_focus}」选择题 3 道并提交作答",
+                    "复盘错因并写下下一步纠偏动作",
+                ],
+                "duration_min": 60,
+            }
+        ]
+        plan = {
+            **plan,
+            "title": plan.get("title") or "自主学习闭环",
+            "basis": plan.get("basis") or ("暂无错题画像，先用课件结构做基线诊断" if total_attempts <= 0 else "基于真实练习画像"),
+            "cycle_days": 1,
+            "critic_degrade_reason": "daily_plan_empty",
+        }
+    plan = {**plan, "daily_plan": fixed_daily}
+
+    day1 = plan.get("day1_quiz_request") if isinstance(plan.get("day1_quiz_request"), dict) else {}
+    if not str(day1.get("prompt", "")).strip():
+        findings.append("缺少 Day1 练习建议，已补齐。")
+        focus = str((fixed_daily[0] if fixed_daily else {}).get("focus") or "核心主题")
+        plan["day1_quiz_request"] = {
+            "topic": focus,
+            "quiz_type": "选择题",
+            "num": 3,
+            "prompt": f"请针对「{focus}」出3道选择题，我作答后请判分并记录错因。",
+        }
+
+    if not str(plan.get("next_action", "")).strip():
+        focus = str((fixed_daily[0] if fixed_daily else {}).get("focus") or "核心主题")
+        findings.append("缺少下一步动作，已补齐。")
+        plan["next_action"] = f"先执行 Day1：复习「{focus}」后完成 3 道练习并复盘。"
+
+    return plan, findings, ("partial" if partial else "repaired" if findings else "pass")
+
+
+def _render_learning_loop_markdown(plan: Dict[str, Any], critic_findings: List[str], evidence_cards: List[Dict[str, Any]]) -> str:
+    """将学习闭环结构渲染为用户可读 Markdown。"""
+    lines = [
+        f"## {plan.get('title', '自主学习闭环')}",
+        f"- 依据：{plan.get('basis', '')}",
+        f"- 周期：{plan.get('cycle_days', 3)}天",
+    ]
+    if evidence_cards:
+        sources = []
+        for card in evidence_cards[:3]:
+            label = str(card.get("source") or "课件片段")
+            page = card.get("page")
+            sources.append(f"{label}{f' p.{page}' if page not in (None, '') else ''}")
+        lines.append(f"- 课件证据：{'；'.join(sources)}")
+    else:
+        lines.append("- 课件证据：本轮未检索到稳定片段，先按画像/基线任务执行。")
+
+    lines.extend(["", "### Day1 今日闭环"])
+    first = (plan.get("daily_plan", [{}]) or [{}])[0]
+    first_tasks = first.get("tasks", []) if isinstance(first.get("tasks", []), list) else []
+    for task in first_tasks:
+        lines.append(f"- {task}")
+
+    lines.extend(["", "### 短期安排"])
+    rendered_daily = plan.get("daily_plan", []) if isinstance(plan.get("daily_plan", []), list) else []
+    for row in rendered_daily:
+        tasks = "；".join(str(task) for task in row.get("tasks", []) if str(task).strip()) if isinstance(row.get("tasks", []), list) else ""
+        lines.append(f"- Day {row.get('day')}（{row.get('duration_min', 60)} 分钟）：{row.get('focus')}；{tasks}")
+
+    quiz_req = plan.get("day1_quiz_request", {}) if isinstance(plan.get("day1_quiz_request", {}), dict) else {}
+    lines.extend(
+        [
+            "",
+            "### Day1 练习建议",
+            f"- {quiz_req.get('prompt', '')}",
+            "",
+            "### 下一步",
+            f"- {plan.get('next_action', '')}",
+        ]
+    )
+    if critic_findings:
+        lines.extend(["", "### 系统校验"])
+        lines.append("- 已自动修复计划格式，确保每天包含复习、练习、复盘。")
+    return "\n".join(lines).strip()
+
+
+def _build_learning_loop_state(
+    session_id: str,
+    snapshot: Dict[str, Any],
+    focus_points: List[str],
+    plan: Dict[str, Any],
+    evidence_cards: List[Dict[str, Any]],
+    critic_status: str,
+) -> Dict[str, Any]:
+    """构造可持久化的学习闭环状态。"""
+    now_ms = int(time.time() * 1000)
+    return {
+        "agent": "learning_loop",
+        "status": "active",
+        "phase": "planned",
+        "session_id": str(session_id or "default"),
+        "current_day": 1,
+        "cycle_days": int(plan.get("cycle_days", 3) or 3),
+        "snapshot": snapshot,
+        "priority_points": focus_points,
+        "daily_plan": plan.get("daily_plan", []),
+        "day1_quiz_request": plan.get("day1_quiz_request", {}),
+        "next_action": plan.get("next_action", ""),
+        "critic_status": critic_status,
+        "evidence_count": len(evidence_cards),
+        "created_at": now_ms,
+        "updated_at": now_ms,
+    }
+
+
+def _learning_loop_quiz_route_params(loop_state: Dict[str, Any]) -> Dict[str, Any]:
+    """从闭环状态中提取 QuizAgent 可执行参数。"""
+    req = loop_state.get("day1_quiz_request") if isinstance(loop_state.get("day1_quiz_request"), dict) else {}
+    topic = str(req.get("topic") or "").strip()
+    if not topic:
+        daily = loop_state.get("daily_plan") if isinstance(loop_state.get("daily_plan"), list) else []
+        topic = str((daily[0] if daily and isinstance(daily[0], dict) else {}).get("focus") or "核心主题").strip()
+    return {
+        "topic": topic or "核心主题",
+        "quiz_type": str(req.get("quiz_type") or "选择题"),
+        "num": _safe_int(req.get("num", 3), default=3, minimum=1, maximum=10),
+        "source": "learning_loop",
+    }
+
+
+def _learning_loop_next_quiz_plan(
+    loop_state: Dict[str, Any],
+    snapshot: Dict[str, Any],
+) -> tuple[Dict[str, Any], Dict[str, Any], str]:
+    """根据复盘结果决定继续闭环时的下一张题卡。"""
+    now_ms = int(time.time() * 1000)
+    base_params = _learning_loop_quiz_route_params(loop_state)
+    summary = loop_state.get("last_practice_summary") if isinstance(loop_state.get("last_practice_summary"), dict) else {}
+    wrong_points = [
+        str(item).strip()
+        for item in summary.get("wrong_points", [])
+        if str(item).strip()
+    ] if isinstance(summary.get("wrong_points", []), list) else []
+
+    if wrong_points:
+        topic = wrong_points[0]
+        params = {
+            **base_params,
+            "topic": topic,
+            "num": 1,
+            "source": "learning_loop_remediation",
+        }
+        updated = {
+            **loop_state,
+            "phase": "remediation_quiz_issued",
+            "last_quiz_params": params,
+            "next_action": f"完成「{topic}」补救题并提交，系统会继续复盘错因是否消除。",
+            "updated_at": now_ms,
+        }
+        return params, updated, f"生成错因补救题：{topic}"
+
+    current_day = _safe_int(loop_state.get("current_day", 1), default=1, minimum=1, maximum=30)
+    cycle_days = _safe_int(loop_state.get("cycle_days", 3), default=3, minimum=1, maximum=30)
+    next_day = min(current_day + 1, cycle_days)
+    priorities = [
+        str(item).strip()
+        for item in loop_state.get("priority_points", [])
+        if str(item).strip()
+    ] if isinstance(loop_state.get("priority_points", []), list) else []
+    daily_plan = loop_state.get("daily_plan") if isinstance(loop_state.get("daily_plan"), list) else []
+    daily_focus = ""
+    if len(daily_plan) >= next_day and isinstance(daily_plan[next_day - 1], dict):
+        daily_focus = str(daily_plan[next_day - 1].get("focus") or "").strip()
+    topic = daily_focus or (priorities[next_day - 1] if len(priorities) >= next_day else "") or (priorities[0] if priorities else "")
+    if not topic:
+        mastery = snapshot.get("mastery_priority") if isinstance(snapshot.get("mastery_priority"), list) else []
+        if mastery and isinstance(mastery[0], dict):
+            topic = str(mastery[0].get("knowledge_point") or "").strip()
+    topic = topic or str(base_params.get("topic") or "核心主题").strip()
+
+    params = {
+        **base_params,
+        "topic": topic,
+        "num": max(1, _safe_int(base_params.get("num", 2), default=2, minimum=1, maximum=10)),
+        "source": "learning_loop_next_day",
+    }
+    updated = {
+        **loop_state,
+        "phase": f"day{next_day}_quiz_issued",
+        "current_day": next_day,
+        "snapshot": snapshot or loop_state.get("snapshot", {}),
+        "last_quiz_params": params,
+        "next_action": f"完成 Day{next_day}「{topic}」进阶练习并提交，系统会继续自动复盘。",
+        "updated_at": now_ms,
+    }
+    return params, updated, f"生成 Day{next_day} 进阶练习：{topic}"
+
+
+def _merge_learning_loop_quiz_result(
+    quiz_result: Dict[str, Any],
+    loop_state: Dict[str, Any],
+    agent_trace: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """把 QuizAgent 题卡包装成学习闭环推进结果。"""
+    structured = dict(quiz_result) if isinstance(quiz_result, dict) else {}
+    payload = structured.get("payload") if isinstance(structured.get("payload"), dict) else {}
+    meta = structured.get("meta") if isinstance(structured.get("meta"), dict) else {}
+    payload = {
+        **payload,
+        "learning_loop_data": {
+            "snapshot": loop_state.get("snapshot", {}),
+            "priority_points": loop_state.get("priority_points", []),
+            "daily_plan": loop_state.get("daily_plan", []),
+            "day1_quiz_request": loop_state.get("day1_quiz_request", {}),
+            "next_action": "完成这组题并提交作答，系统会刷新画像后继续复盘。",
+            "loop_state": loop_state,
+        },
+        "agent_trace": agent_trace,
+    }
+    structured["payload"] = payload
+    structured["meta"] = {
+        **meta,
+        "agent_mode": "learning_loop",
+        "learning_loop_structured": True,
+        "learning_loop_stateful": True,
+        "learning_loop_phase": loop_state.get("phase", "day1_quiz_issued"),
+        "planner_data_driven": True,
+        "critic_status": loop_state.get("critic_status") or "pass",
+        "agent_trace": agent_trace,
+    }
+    return structured
+
+
+def _render_learning_loop_review_markdown(
+    loop_state: Dict[str, Any],
+    snapshot: Dict[str, Any],
+    agent_trace: List[Dict[str, Any]],
+) -> tuple[str, Dict[str, Any]]:
+    """渲染作答后的闭环复盘，并返回更新后的状态。"""
+    current_phase = str(loop_state.get("phase") or "")
+    day_match = re.fullmatch(r"day(\d+)_answered", current_phase)
+    review_phase = f"day{day_match.group(1)}_reviewed" if day_match else (
+        "remediation_reviewed" if current_phase == "remediation_answered" else "day1_reviewed"
+    )
+    review_title = f"Day{day_match.group(1)} 作答复盘" if day_match else (
+        "补救练习作答复盘" if current_phase == "remediation_answered" else "Day1 作答复盘"
+    )
+    summary = loop_state.get("last_practice_summary") if isinstance(loop_state.get("last_practice_summary"), dict) else {}
+    total = _safe_int(summary.get("total", 0), default=0, minimum=0, maximum=200)
+    correct = _safe_int(summary.get("correct", 0), default=0, minimum=0, maximum=200)
+    wrong_count = _safe_int(summary.get("wrong_count", max(0, total - correct)), default=0, minimum=0, maximum=200)
+    accuracy = float(summary.get("accuracy", round((correct / total) * 100.0, 1) if total else 0.0) or 0.0)
+    wrong_points = [str(item).strip() for item in summary.get("wrong_points", []) if str(item).strip()] if isinstance(summary.get("wrong_points", []), list) else []
+    wrong_reasons = [str(item).strip() for item in summary.get("wrong_reasons", []) if str(item).strip()] if isinstance(summary.get("wrong_reasons", []), list) else []
+
+    def _clip_reason(reason: str, max_len: int = 180) -> str:
+        """压缩复盘错因，避免长解析撑爆学习闭环消息。"""
+        compact = re.sub(r"\s+", " ", str(reason or "")).strip()
+        if len(compact) <= max_len:
+            return compact
+        return compact[:max_len].rstrip() + "..."
+
+    if wrong_points:
+        next_action = f"先复习「{wrong_points[0]}」的课件要点，再继续闭环生成 1 道补救题。"
+        review_decision = "remedial_practice"
+        completion_status = "active"
+    elif total > 0:
+        current_day = _safe_int(loop_state.get("current_day", 1), default=1, minimum=1, maximum=30)
+        cycle_days = _safe_int(loop_state.get("cycle_days", 3), default=3, minimum=1, maximum=30)
+        if current_day < cycle_days:
+            next_action = f"本轮全对，可以进入 Day{current_day + 1} 或提高难度继续练习。"
+            completion_status = "active"
+        else:
+            next_action = "本轮全对，已完成当前周期，可以提高难度继续练习或重新生成新周期。"
+            review_phase = "cycle_completed"
+            completion_status = "completed"
+        review_decision = "advance_or_raise_difficulty"
+    else:
+        next_action = "还没有检测到本轮作答记录，请先完成题卡并提交答案。"
+        review_decision = "await_answer"
+        completion_status = "active"
+
+    lines = [
+        f"## {review_title}",
+        f"- 本次结果：{correct}/{total}，正确率 {accuracy:.1f}%",
+        f"- 最新画像：累计 {snapshot.get('total_attempts', 0)} 题，整体正确率 {snapshot.get('accuracy', 0.0)}%",
+    ]
+    if wrong_points:
+        lines.append(f"- 错题考点：{'、'.join(wrong_points[:5])}")
+    else:
+        lines.append("- 错题考点：本轮未发现错题")
+    if wrong_reasons:
+        clipped_reasons = [_clip_reason(reason) for reason in wrong_reasons[:3]]
+        lines.append(f"- 错因线索：{'；'.join(clipped_reasons)}")
+    lines.extend(
+        [
+            "",
+            "### 下一步",
+            f"- {next_action}",
+        ]
+    )
+
+    updated_state = {
+        **loop_state,
+        "status": completion_status,
+        "phase": review_phase,
+        "review_decision": review_decision,
+        "next_action": next_action,
+        "snapshot": snapshot,
+        "updated_at": int(time.time() * 1000),
+    }
+    agent_trace.append(
+        {
+            "task_id": "critic.review",
+            "agent": "CriticAgent",
+            "status": "success",
+            "summary": f"完成作答复盘：wrong={wrong_count}, decision={review_decision}",
+        }
+    )
+    return "\n".join(lines).strip(), updated_state
+
+
 async def planner_subagent_node(state: SupervisorState) -> SupervisorState:
     """Planner SubAgent: 制定结构化复习计划并落入消息 payload。"""
     logger.info("[Planner SubAgent] 生成复习计划...")
@@ -2602,6 +3638,13 @@ async def planner_subagent_node(state: SupervisorState) -> SupervisorState:
     constraints = _extract_planner_constraints(state.get("input", ""))
     snapshot = _build_planner_practice_snapshot(sid)
     snapshot_text = _render_planner_snapshot(snapshot)
+    observation_snapshot = _format_orchestrator_observations(
+        state,
+        {"get_practice_stats_tool", "get_weak_points_tool", "get_practice_history"},
+        title="ReAct练习画像观察",
+    )
+    if observation_snapshot:
+        snapshot_text = f"{snapshot_text}\n\n{observation_snapshot}"
     default_plan = _build_default_planner_payload(state.get("input", ""), snapshot, constraints)
 
     result_raw = ""
@@ -2664,6 +3707,282 @@ async def planner_subagent_node(state: SupervisorState) -> SupervisorState:
         "meta": {"planner_structured": True, "planner_data_driven": True},
     }
     return {"subagent_result": structured, "final_answer": plan_text}
+
+
+async def learning_loop_subagent_node(state: SupervisorState) -> SupervisorState:
+    """LearningLoopAgent: 画像、课件、计划、练习建议和 critic 的轻量闭环。"""
+    logger.info("[LearningLoopAgent] 启动自主学习闭环...")
+    import asyncio
+    from utils.memory_service import memory_manager
+
+    sid = state.get("session_id") or current_session_id.get() or "default"
+    current_session_id.set(str(sid))
+
+    agent_trace: List[Dict[str, Any]] = []
+    persisted_state = memory_manager.get_agent_state(str(sid), "learning_loop")
+    persisted_phase = str(persisted_state.get("phase") or "")
+    if (
+        persisted_state.get("status") == "active"
+        and (re.fullmatch(r"day\d+_answered", persisted_phase) or persisted_phase == "remediation_answered")
+        and (_is_learning_loop_review_intent(state.get("input", "")) or _is_learning_loop_continue_intent(state.get("input", "")))
+    ):
+        agent_trace.append(
+            {
+                "task_id": "loop.state",
+                "agent": "LearningLoopAgent",
+                "status": "success",
+                "summary": f"读取已提交作答的闭环状态，进入复盘：phase={persisted_phase}",
+            }
+        )
+        snapshot = _build_planner_practice_snapshot(str(sid))
+        agent_trace.append(
+            {
+                "task_id": "history.snapshot",
+                "agent": "HistoryAgent",
+                "status": "success",
+                "summary": f"刷新练习画像：{snapshot.get('total_attempts', 0)} 题，正确率 {snapshot.get('accuracy', 0.0)}%",
+            }
+        )
+        answer, reviewed_state = _render_learning_loop_review_markdown(persisted_state, snapshot, agent_trace)
+        memory_manager.set_agent_state(str(sid), "learning_loop", reviewed_state)
+        structured = {
+            "kind": "chat",
+            "render_mode": "markdown",
+            "text": answer,
+            "payload": {
+                "learning_loop_data": {
+                    "snapshot": snapshot,
+                    "priority_points": reviewed_state.get("priority_points", []),
+                    "daily_plan": reviewed_state.get("daily_plan", []),
+                    "day1_quiz_request": reviewed_state.get("day1_quiz_request", {}),
+                    "next_action": reviewed_state.get("next_action", ""),
+                    "loop_state": reviewed_state,
+                    "last_practice_summary": reviewed_state.get("last_practice_summary", {}),
+                },
+                "agent_trace": agent_trace,
+            },
+            "meta": {
+                "agent_mode": "learning_loop",
+                "learning_loop_structured": True,
+                "learning_loop_stateful": True,
+                "learning_loop_phase": reviewed_state.get("phase", "day1_reviewed"),
+                "planner_data_driven": True,
+                "critic_status": reviewed_state.get("critic_status") or "pass",
+                "agent_trace": agent_trace,
+            },
+        }
+        return {"subagent_result": structured, "final_answer": answer}
+
+    if _is_learning_loop_continue_intent(state.get("input", "")) and persisted_state.get("phase") == "cycle_completed":
+        agent_trace.append(
+            {
+                "task_id": "loop.state",
+                "agent": "LearningLoopAgent",
+                "status": "success",
+                "summary": "上一周期已完成，本轮开启新的学习闭环周期",
+            }
+        )
+        persisted_state = {}
+
+    if _is_learning_loop_continue_intent(state.get("input", "")) and persisted_state.get("status") == "active":
+        agent_trace.append(
+            {
+                "task_id": "loop.state",
+                "agent": "LearningLoopAgent",
+                "status": "success",
+                "summary": f"读取已有闭环状态：phase={persisted_state.get('phase', 'planned')}",
+            }
+        )
+        snapshot = _build_planner_practice_snapshot(str(sid))
+        if re.fullmatch(r"day\d+_reviewed", str(persisted_state.get("phase") or "")) or str(persisted_state.get("phase") or "") == "remediation_reviewed":
+            quiz_params, updated_loop_state, next_summary = _learning_loop_next_quiz_plan(persisted_state, snapshot)
+        else:
+            quiz_params = _learning_loop_quiz_route_params(persisted_state)
+            updated_loop_state = {
+                **persisted_state,
+                "phase": "day1_quiz_issued",
+                "snapshot": snapshot or persisted_state.get("snapshot", {}),
+                "last_quiz_params": quiz_params,
+                "updated_at": int(time.time() * 1000),
+            }
+            next_summary = f"执行 Day1 练习：{quiz_params.get('topic')}"
+        agent_trace.append(
+            {
+                "task_id": "quiz.day1",
+                "agent": "QuizAgent",
+                "status": "running",
+                "summary": f"{next_summary}，{quiz_params.get('num')} 道{quiz_params.get('quiz_type')}",
+            }
+        )
+        quiz_state = {
+            **state,
+            "input": str(quiz_params.get("topic") or state.get("input") or ""),
+            "route": "quiz",
+            "route_params": quiz_params,
+            "session_id": str(sid),
+        }
+        quiz_result = await quiz_subagent_node(quiz_state)
+        memory_manager.set_agent_state(str(sid), "learning_loop", updated_loop_state)
+        agent_trace[-1] = {
+            **agent_trace[-1],
+            "status": "success",
+            "summary": f"下一步题卡已生成：{quiz_params.get('topic')}",
+        }
+        raw_quiz = quiz_result.get("subagent_result", {}) if isinstance(quiz_result, dict) else {}
+        if isinstance(raw_quiz, dict):
+            structured = _merge_learning_loop_quiz_result(raw_quiz, updated_loop_state, agent_trace)
+            return {"subagent_result": structured, "final_answer": structured.get("text", quiz_result.get("final_answer", ""))}
+        answer = str(quiz_result.get("final_answer", "") if isinstance(quiz_result, dict) else raw_quiz)
+        structured = {
+            "kind": "chat",
+            "render_mode": "markdown",
+            "text": answer or "Day1 练习生成失败，请稍后重试。",
+            "payload": {"learning_loop_data": {"loop_state": updated_loop_state}, "agent_trace": agent_trace},
+            "meta": {
+                "agent_mode": "learning_loop",
+                "learning_loop_structured": True,
+                "learning_loop_stateful": True,
+                "learning_loop_phase": "day1_quiz_issued",
+                "agent_trace": agent_trace,
+            },
+        }
+        return {"subagent_result": structured, "final_answer": structured["text"]}
+    elif _is_learning_loop_continue_intent(state.get("input", "")):
+        agent_trace.append(
+            {
+                "task_id": "loop.state",
+                "agent": "LearningLoopAgent",
+                "status": "partial",
+                "summary": "未找到可继续的闭环状态，本轮先重新生成学习闭环计划",
+            }
+        )
+
+    snapshot = _build_planner_practice_snapshot(str(sid))
+    agent_trace.append(
+        {
+            "task_id": "history.snapshot",
+            "agent": "HistoryAgent",
+            "status": "success",
+            "summary": f"读取练习画像：{snapshot.get('total_attempts', 0)} 题，薄弱点 {len(snapshot.get('weak_points', []) or [])} 个",
+        }
+    )
+
+    focus_points = _learning_loop_focus_points(state.get("input", ""), snapshot)
+    evidence_cards: List[Dict[str, Any]] = []
+    evidence_query = " ".join(focus_points[:3]) or state.get("input", "")
+    orchestrator_context = _format_orchestrator_observations(state, {"search_courseware"}, title="ReAct课件检索结果")
+    if orchestrator_context:
+        evidence_cards = _extract_learning_loop_evidence(orchestrator_context, limit=3)
+        agent_trace.append(
+            {
+                "task_id": "rag.evidence",
+                "agent": "RagAgent",
+                "status": "success" if evidence_cards else "partial",
+                "summary": f"复用 ReAct 课件证据：命中 {len(evidence_cards)} 条",
+            }
+        )
+    else:
+        try:
+            rag = await get_rag_service()
+            context = await asyncio.wait_for(rag.retrieve_context(evidence_query, mode="rag_chat"), timeout=12.0)
+            evidence_cards = _extract_learning_loop_evidence(context, limit=3)
+            agent_trace.append(
+                {
+                    "task_id": "rag.evidence",
+                    "agent": "RagAgent",
+                    "status": "success" if evidence_cards else "partial",
+                    "summary": f"检索课件证据：命中 {len(evidence_cards)} 条",
+                }
+            )
+        except Exception as e:
+            logger.warning(f"[LearningLoopAgent] 课件检索失败 sid={sid}: {e}")
+            agent_trace.append(
+                {
+                    "task_id": "rag.evidence",
+                    "agent": "RagAgent",
+                    "status": "partial",
+                    "summary": "课件检索未完成，本轮按画像和基线任务降级生成",
+                }
+            )
+
+    plan = _build_learning_loop_plan(state.get("input", ""), snapshot, evidence_cards)
+    agent_trace.append(
+        {
+            "task_id": "planner.loop",
+            "agent": "PlannerAgent",
+            "status": "success",
+            "summary": f"生成 {plan.get('cycle_days', 3)} 天闭环计划，Day1 聚焦 {((plan.get('daily_plan') or [{}])[0] or {}).get('focus', '核心主题')}",
+        }
+    )
+
+    plan, critic_findings, critic_status = _critic_learning_loop_plan(plan, snapshot)
+    agent_trace.append(
+        {
+            "task_id": "critic.learning_loop",
+            "agent": "CriticAgent",
+            "status": critic_status,
+            "summary": "校验通过" if not critic_findings else f"发现并修复 {len(critic_findings)} 个计划问题",
+        }
+    )
+
+    # 若本轮发现历史考点脏数据，给 trace 留提示，但不主动执行写操作。
+    try:
+        noisy_count = sum(1 for kp in memory_manager.get_knowledge_point_stats(str(sid)).keys() if _is_noisy_kp_name(kp))
+        if noisy_count:
+            agent_trace.append(
+                {
+                    "task_id": "data_quality.notice",
+                    "agent": "HistoryAgent",
+                    "status": "partial",
+                    "summary": f"检测到 {noisy_count} 个疑似题干式考点名，可后续回填归一化",
+                }
+            )
+    except Exception:
+        pass
+
+    answer = _render_learning_loop_markdown(plan, critic_findings, evidence_cards)
+    loop_state = _build_learning_loop_state(str(sid), snapshot, focus_points, plan, evidence_cards, critic_status)
+    memory_manager.set_agent_state(str(sid), "learning_loop", loop_state)
+    agent_trace.append(
+        {
+            "task_id": "loop.state",
+            "agent": "LearningLoopAgent",
+            "status": "success",
+            "summary": "已保存闭环状态，可继续执行 Day1 练习",
+        }
+    )
+    structured = {
+        "kind": "chat",
+        "render_mode": "markdown",
+        "text": answer,
+        "payload": {
+            "learning_loop_data": {
+                "snapshot": snapshot,
+                "priority_points": focus_points,
+                "daily_plan": plan.get("daily_plan", []),
+                "day1_quiz_request": plan.get("day1_quiz_request", {}),
+                "next_action": plan.get("next_action", ""),
+                "critic_findings": critic_findings,
+                "loop_state": loop_state,
+            },
+            "evidence_cards": evidence_cards,
+            "agent_trace": agent_trace,
+        },
+        "meta": {
+            "agent_mode": "learning_loop",
+            "learning_loop_structured": True,
+            "learning_loop_stateful": True,
+            "learning_loop_phase": loop_state.get("phase", "planned"),
+            "planner_data_driven": True,
+            "critic_status": critic_status,
+            "agent_trace": agent_trace,
+            "evidence_status": "grounded" if evidence_cards else "none",
+            "evidence_count": len(evidence_cards),
+            **({"degrade_reason": plan.get("critic_degrade_reason")} if plan.get("critic_degrade_reason") else {}),
+            **({"evidence_source": f"课件引用 {len(evidence_cards)} 条"} if evidence_cards else {}),
+        },
+    }
+    return {"subagent_result": structured, "final_answer": answer}
 
 
 async def chitchat_node(state: SupervisorState) -> SupervisorState:
@@ -3043,7 +4362,7 @@ async def history_subagent_node(state: SupervisorState) -> SupervisorState:
 def route_to_subagent(state: SupervisorState) -> str:
     """根据 Supervisor 决策路由到对应 SubAgent"""
     route = state.get('route', 'rag')
-    valid = {"rag", "quiz", "exam", "ops", "planner", "history", "chitchat"}
+    valid = {"rag", "quiz", "exam", "ops", "planner", "history", "learning_loop", "chitchat"}
     return route if route in valid else "rag"
 
 
@@ -3052,26 +4371,30 @@ def route_to_subagent(state: SupervisorState) -> str:
 def build_supervisor_graph() -> StateGraph:
     """
     Supervisor 工作流：
-    supervisor → (路由判断) → [rag_agent | quiz_agent | exam_agent | ops_agent | planner_agent | history_agent | chitchat] → END
+    supervisor → tool_orchestrator → [rag_agent | quiz_agent | exam_agent | ops_agent | planner_agent | history_agent | learning_loop | chitchat] → END
     """
     graph = StateGraph(SupervisorState)
 
     # 注册节点
     graph.add_node("supervisor", supervisor_node)
+    graph.add_node("tool_orchestrator", tool_orchestrator_node)
     graph.add_node("rag_agent", rag_subagent_node)
     graph.add_node("quiz_agent", quiz_subagent_node)
     graph.add_node("exam_agent", exam_subagent_node)
     graph.add_node("ops_agent", ops_subagent_node)
     graph.add_node("planner_agent", planner_subagent_node)
     graph.add_node("history_agent", history_subagent_node)
+    graph.add_node("learning_loop", learning_loop_subagent_node)
     graph.add_node("chitchat", chitchat_node)
 
     # 入口
     graph.set_entry_point("supervisor")
 
-    # Supervisor 条件路由
+    graph.add_edge("supervisor", "tool_orchestrator")
+
+    # Orchestrator 可能基于工具计划调整目标专家 Agent。
     graph.add_conditional_edges(
-        "supervisor",
+        "tool_orchestrator",
         route_to_subagent,
         {
             "rag": "rag_agent",
@@ -3080,12 +4403,13 @@ def build_supervisor_graph() -> StateGraph:
             "ops": "ops_agent",
             "planner": "planner_agent",
             "history": "history_agent",
+            "learning_loop": "learning_loop",
             "chitchat": "chitchat",
         }
     )
 
     # 所有 SubAgent 执行完毕后结束
-    for node in ("rag_agent", "quiz_agent", "exam_agent", "ops_agent", "planner_agent", "history_agent", "chitchat"):
+    for node in ("rag_agent", "quiz_agent", "exam_agent", "ops_agent", "planner_agent", "history_agent", "learning_loop", "chitchat"):
         graph.add_edge(node, END)
 
     return graph.compile()

@@ -27,6 +27,10 @@ const ROUTE_STYLES: Record<string, { label: string; className: string }> = {
     label: "学习分析 Agent",
     className: "border-cyan-200 bg-cyan-50 text-cyan-700",
   },
+  learning_loop: {
+    label: "学习闭环 Agent",
+    className: "border-teal-200 bg-teal-50 text-teal-700",
+  },
   chitchat: {
     label: "对话 Agent",
     className: "border-slate-200 bg-slate-50 text-slate-600",
