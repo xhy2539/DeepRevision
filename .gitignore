@@ -4,12 +4,14 @@
 .vscode/
 .DS_Store
 Thumbs.db
+.~*
 
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
 venv/
+.venv/
 .env
 .pytest_cache/
 .mypy_cache/
@@ -48,3 +50,6 @@ log.md
 # 测试/调试临时文本
 test_*.txt
 *_output.txt
+
+# Local interview artifacts
+interview_materials/
