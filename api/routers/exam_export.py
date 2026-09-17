@@ -11,7 +11,7 @@ import io
 import uuid
 import os
 
-router = APIRouter(prefix="/api/exam", tags=["exam_export"])
+router = APIRouter()
 
 # 临时文件目录
 TEMP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data", "temp")

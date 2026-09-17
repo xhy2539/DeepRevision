@@ -1,0 +1,43 @@
+{
+  "name": "大型平台分析与设计课件检索基线报告",
+  "dataset": "docs/rag_eval_benchmark.json",
+  "dataset_version": "1.0",
+  "evaluated_at": "2026-09-13",
+  "session_id": "大型平台课件",
+  "case_count": 15,
+  "label_unit": "parent_document",
+  "k": 5,
+  "pipeline": "query_rewrite -> BM25 + vector -> weighted_RRF -> qwen3.7-text-rerank -> parent_expansion",
+  "metrics": {
+    "precision_at_5": 0.2933333333,
+    "recall_at_5": 0.9666666667,
+    "hit_at_5": 1.0,
+    "mrr": 1.0,
+    "ndcg_at_5": 0.9585241674
+  },
+  "interpretation": {
+    "precision_at_5": "标注采用严格证据口径，多数问题只标1个相关父块，因此即使正确证据排第1，Precision@5通常也只有0.2；该指标需要结合MRR和nDCG判断。",
+    "recall_at_5": "15条问题中绝大多数相关父块被Top5覆盖。",
+    "hit_at_5": "每条问题的Top5均至少命中一个人工相关父块。",
+    "mrr": "每条问题的第1条结果均为人工标注的相关父块。",
+    "ndcg_at_5": "相关父块整体排序靠前，且多相关证据问题的排序质量较好。"
+  },
+  "weak_case": {
+    "id": "platform-ch03-002",
+    "query": "领域驱动设计如何指导微服务拆分？",
+    "relevant_parent_ids": [
+      "par_ac21eb4c_6",
+      "par_ac21eb4c_7"
+    ],
+    "observed": "Top5命中第一个父块但遗漏第二个父块。",
+    "recall_at_5": 0.5,
+    "ndcg_at_5": 0.6131471928,
+    "next_actions": [
+      "检查查询改写是否同时保留‘领域建模’与‘拆分原则’两个子意图",
+      "对复合问题增加多查询召回或按子问题分别检索后合并",
+      "比较扩大候选池与调整BM25/向量权重后的召回变化",
+      "保持评测集标签冻结，在独立配置上对比，避免为单题修改标签"
+    ]
+  },
+  "reproducibility_note": "本报告记录一次真实在线检索基线。评测依赖当时的知识库、Embedding、重排服务和配置；修改切分、模型、权重或候选数量后应生成新报告，不覆盖本基线。"
+}

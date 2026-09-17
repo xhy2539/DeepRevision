@@ -213,7 +213,7 @@ RAG_SUBAGENT_PROMPT = """你是知识问答专家。你必须基于检索到的�
 }}
 
 约束：
-- 必须至少提供 1 条 evidence。
+- 有检索资料时必须至少提供 1 条 evidence；没有检索资料时 evidence 必须为 []。
 - evidence.quote 必须可在【检索到的课件资料】文本中直接匹配到。
 - 不要输出 JSON 之外的任何文字。"""
 
@@ -622,7 +622,7 @@ def _infer_duplicate_keep_filename(query: str, session_id: str) -> str:
         session_dir = os.path.join(get_abs_path(chroma_conf["data_path"]), session_id)
         if not os.path.isdir(session_dir):
             return ""
-        allowed = {".txt", ".pdf", ".docx", ".doc", ".ppt", ".pptx", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+        allowed = {".txt", ".pdf", ".docx", ".pptx", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
         groups: Dict[str, List[str]] = {}
         for fname in os.listdir(session_dir):
             if fname.startswith(".") or os.path.splitext(fname)[1].lower() not in allowed:
@@ -894,12 +894,19 @@ def _extract_json(text: str) -> dict:
     return {}
 
 
-def _extract_grounded_evidence(parsed: dict, context: str) -> list[dict]:
+def _extract_grounded_evidence(
+    parsed: dict,
+    context: str,
+    *,
+    retrieval_status: str = "success",
+) -> list[dict]:
     """
     从结构化结果中提取并校验证据：
     - 证据格式必须包含 source + quote
     - quote 必须能在检索 context 中直接命中
     """
+    if retrieval_status != "success" or not str(context or "").strip():
+        return []
     if not isinstance(parsed, dict):
         return []
     evidence = parsed.get("evidence", [])
@@ -938,7 +945,14 @@ def _extract_grounded_evidence(parsed: dict, context: str) -> list[dict]:
     return grounded
 
 
-def _build_rag_structured_result(answer: str, evidence: list[dict], reason: str = "") -> dict:
+def _build_rag_structured_result(
+    answer: str,
+    evidence: list[dict],
+    reason: str = "",
+    *,
+    retrieval_status: str = "success",
+    retrieval_trace: list[dict] | None = None,
+) -> dict:
     """把 RAG 输出包装为前端可展示的证据卡协议。"""
     evidence_cards = []
     for item in evidence or []:
@@ -961,10 +975,14 @@ def _build_rag_structured_result(answer: str, evidence: list[dict], reason: str 
     if reason == "evidence_partial" and not evidence_cards:
         evidence_status = "partial"
 
-    payload = {"evidence_cards": evidence_cards}
+    payload = {
+        "evidence_cards": evidence_cards,
+        "retrieval_trace": list(retrieval_trace or []),
+    }
     meta = {
         "evidence_status": evidence_status,
         "evidence_count": len(evidence_cards),
+        "retrieval_status": retrieval_status,
     }
     if evidence_cards:
         meta["evidence_source"] = f"课件证据 {len(evidence_cards)} 条"
@@ -978,6 +996,32 @@ def _build_rag_structured_result(answer: str, evidence: list[dict], reason: str 
         "evidence": evidence,
         **({"reason": reason} if reason else {}),
     }
+
+
+def _classify_retrieval_context(context: str) -> str:
+    """Classify tool text so error/help messages never become evidence context."""
+    text = str(context or "").strip()
+    if not text:
+        return "empty"
+    failed_markers = (
+        "检索失败",
+        "检索超时",
+        "知识库检索遇到问题",
+        "需要 DASHSCOPE_API_KEY",
+        "需要 QWEN_API_KEY",
+        "embedding unavailable",
+    )
+    empty_markers = (
+        "未检索到",
+        "知识库为空",
+        "请先上传课件",
+        "请输入要检索的课件关键词",
+    )
+    if any(marker.lower() in text.lower() for marker in failed_markers):
+        return "failed"
+    if any(marker in text for marker in empty_markers):
+        return "empty"
+    return "success"
 
 
 def _validate_supervisor_decision(
@@ -2031,23 +2075,33 @@ async def rag_subagent_node(state: SupervisorState) -> SupervisorState:
     recent_history = "\n".join(history_lines) if history_lines else "（无近期对话）"
 
     orchestrator_context = _format_orchestrator_observations(state, {"search_courseware"}, title="ReAct课件检索结果")
+    retrieval_trace: list[dict] = []
+    retrieval_status = "empty"
     if orchestrator_context:
-        context = orchestrator_context
-        logger.info("[RAG SubAgent] 复用 ReAct 课件 observation，跳过重复检索")
+        retrieval_status = _classify_retrieval_context(orchestrator_context)
+        context = orchestrator_context if retrieval_status == "success" else ""
+        retrieval_trace.append({"stage": "orchestrator_reuse", "status": retrieval_status})
+        logger.info(f"[RAG SubAgent] 复用 ReAct 课件 observation，status={retrieval_status}")
     else:
         try:
             rag = await get_rag_service()
             # retrieve_context 只检索、不调 LLM，避免冗余的双重 LLM 调用
             retrieve_start = time.time()
-            context = await rag.retrieve_context(topic, mode="rag_chat")
+            context = await rag.retrieve_context(topic, mode="rag_chat", trace=retrieval_trace)
             logger.info(f"[Latency] rag_retrieve_ms={int((time.time() - retrieve_start) * 1000)}")
-            # 如果检索为空，给出友好提示
+            final_trace = next(
+                (item for item in reversed(retrieval_trace) if item.get("stage") == "finalize"),
+                {},
+            )
+            retrieval_status = str(final_trace.get("status") or ("success" if context.strip() else "empty"))
             if not context or context.strip() == "":
                 logger.warning("[RAG SubAgent] 知识库为空，请先上传课件")
-                context = "【提示】当前知识库为空，请先上传课件后再提问。你可以通过点击「上传课件」按钮来添加复习资料。"
+                context = ""
         except Exception as e:
             logger.warning(f"[RAG SubAgent] 检索失败: {e}")
-            context = "【提示】知识库检索遇到问题，请确保已上传课件。如未上传，请先上传复习资料。"
+            context = ""
+            retrieval_status = "failed"
+            retrieval_trace.append({"stage": "finalize", "status": "failed", "error": str(e)[:200]})
 
     llm_start = time.time()
     result_raw = await _call_llm(
@@ -2061,14 +2115,23 @@ async def rag_subagent_node(state: SupervisorState) -> SupervisorState:
 
     parsed = _extract_json(result_raw)
     answer = str(parsed.get("answer", "")).strip() if isinstance(parsed, dict) else ""
-    grounded_evidence = _extract_grounded_evidence(parsed, context)
+    grounded_evidence = _extract_grounded_evidence(
+        parsed,
+        context,
+        retrieval_status=retrieval_status,
+    )
 
     if answer and grounded_evidence:
         rag_inc("rag_grounded_pass_count", 1)
         logger.info(f"[RAG SubAgent] 回答依据校验通过，evidence_count={len(grounded_evidence)}")
         logger.info(f"[Latency] rag_total_ms={int((time.time() - rag_start) * 1000)}")
         return {
-            "subagent_result": _build_rag_structured_result(answer, grounded_evidence),
+            "subagent_result": _build_rag_structured_result(
+                answer,
+                grounded_evidence,
+                retrieval_status=retrieval_status,
+                retrieval_trace=retrieval_trace,
+            ),
             "final_answer": answer,
         }
 
@@ -2078,7 +2141,13 @@ async def rag_subagent_node(state: SupervisorState) -> SupervisorState:
         logger.warning("[RAG SubAgent] 回答依据条目不足，按课件优先策略继续返回答案")
         logger.info(f"[Latency] rag_total_ms={int((time.time() - rag_start) * 1000)}")
         return {
-            "subagent_result": _build_rag_structured_result(answer, grounded_evidence, "evidence_partial"),
+            "subagent_result": _build_rag_structured_result(
+                answer,
+                grounded_evidence,
+                "evidence_partial",
+                retrieval_status=retrieval_status,
+                retrieval_trace=retrieval_trace,
+            ),
             "final_answer": answer,
         }
 
@@ -2090,7 +2159,13 @@ async def rag_subagent_node(state: SupervisorState) -> SupervisorState:
         "为避免误导，请换个更具体的问题，或补充相关课件后再试。"
     )
     return {
-        "subagent_result": _build_rag_structured_result(fallback, grounded_evidence, "no_grounded_evidence"),
+        "subagent_result": _build_rag_structured_result(
+            fallback,
+            grounded_evidence,
+            "no_grounded_evidence",
+            retrieval_status=retrieval_status,
+            retrieval_trace=retrieval_trace,
+        ),
         "final_answer": fallback,
     }
 
@@ -2818,14 +2893,29 @@ def _extract_planner_constraints(user_input: str) -> Dict[str, Any]:
 
     day_match = re.search(r"(\d{1,2})\s*(?:天|日)(?:内|计划|冲刺|复习)?", text)
     week_match = re.search(r"(\d{1,2})\s*周(?:内|计划|冲刺|复习)?", text)
-    if week_match:
+    single_day = any(token in text for token in ["今晚", "今天", "今夜", "当晚"])
+    if single_day:
+        cycle_days = 1
+    elif week_match:
         cycle_days = _safe_int(int(week_match.group(1)) * 7, default=7, minimum=1, maximum=30)
     elif day_match:
         cycle_days = _safe_int(day_match.group(1), default=7, minimum=1, maximum=30)
 
-    min_match = re.search(r"(?:每天|每日)\s*(\d{2,3})\s*分钟", text) or re.search(r"(\d{2,3})\s*分钟\s*(?:每天|每日)", text)
+    min_match = (
+        re.search(r"(?:每天|每日)\s*(\d{1,3})\s*分钟", text)
+        or re.search(r"(\d{1,3})\s*分钟\s*(?:每天|每日)", text)
+        or (re.search(r"(\d{1,3})\s*分钟", text) if single_day else None)
+    )
     if min_match:
         daily_minutes = _safe_int(min_match.group(1), default=60, minimum=10, maximum=300)
+    else:
+        hour_match = re.search(r"(\d{1,2})(?:\s*个)?\s*(半)?\s*小时", text)
+        half_hour_match = re.search(r"(?<!\d)半\s*小时", text)
+        if hour_match:
+            hours = int(hour_match.group(1)) + (0.5 if hour_match.group(2) else 0.0)
+            daily_minutes = _safe_int(round(hours * 60), default=60, minimum=10, maximum=300)
+        elif half_hour_match:
+            daily_minutes = 30
 
     if any(token in text for token in ["冲刺", "临考", "考试前", "最后"]):
         target_mode = "sprint"
@@ -3022,7 +3112,9 @@ def _normalize_planner_payload(
     goal = str(parsed.get("goal", "") or "完成本轮复习目标").strip() or "完成本轮复习目标"
     hinted_days = _safe_int(cycle_days_hint, default=0, minimum=0, maximum=30)
     cycle_default = hinted_days if hinted_days > 0 else 7
-    cycle_days = _safe_int(parsed.get("cycle_days", cycle_default), default=cycle_default, minimum=1, maximum=30)
+    cycle_days = hinted_days if hinted_days > 0 else _safe_int(
+        parsed.get("cycle_days", cycle_default), default=cycle_default, minimum=1, maximum=30
+    )
     hinted_minutes = _safe_int(daily_minutes_hint, default=0, minimum=0, maximum=300)
     duration_default = hinted_minutes if hinted_minutes > 0 else 60
 
@@ -3040,7 +3132,9 @@ def _normalize_planner_payload(
             tasks = [str(item).strip() for item in raw_tasks if str(item).strip()]
         else:
             tasks = [str(raw_tasks).strip()] if str(raw_tasks).strip() else []
-        duration = _safe_int(row.get("duration_min", duration_default), default=duration_default, minimum=10, maximum=300)
+        duration = hinted_minutes if hinted_minutes > 0 else _safe_int(
+            row.get("duration_min", duration_default), default=duration_default, minimum=10, maximum=300
+        )
         day_map[day] = {"day": day, "focus": focus, "tasks": tasks or _build_default_day_tasks(focus), "duration_min": duration}
 
     daily_plan: List[Dict[str, Any]] = []
@@ -4368,7 +4462,7 @@ def route_to_subagent(state: SupervisorState) -> str:
 
 # ==================== 构建工作流图 ====================
 
-def build_supervisor_graph() -> StateGraph:
+def build_supervisor_graph(checkpointer=None) -> StateGraph:
     """
     Supervisor 工作流：
     supervisor → tool_orchestrator → [rag_agent | quiz_agent | exam_agent | ops_agent | planner_agent | history_agent | learning_loop | chitchat] → END
@@ -4412,7 +4506,7 @@ def build_supervisor_graph() -> StateGraph:
     for node in ("rag_agent", "quiz_agent", "exam_agent", "ops_agent", "planner_agent", "history_agent", "learning_loop", "chitchat"):
         graph.add_edge(node, END)
 
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
 
 
 supervisor_workflow = build_supervisor_graph()

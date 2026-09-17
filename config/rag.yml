@@ -1,5 +1,8 @@
 chat_model_name: MiniMax-M2.7
-embedding_model_name: text-embedding-v3
+embedding_model_name: qwen3.7-text-embedding
+embedding_dimensions: 1024
+embedding_batch_size: 20
+embedding_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
 light_model_name: MiniMax-M2.7
 max_tokens: 32768
 vision_api_key: ${DASHSCOPE_API_KEY}

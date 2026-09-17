@@ -498,9 +498,10 @@ def _save_session_sync(db: str, session_id: str, session: Dict):
         conn.close()
 
 
-def _delete_session_sync(db: str, session_id: str):
+def _delete_session_sync(db: str, session_id: str) -> bool:
     conn = sqlite3.connect(db)
     try:
+        changes_before = conn.total_changes
         conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM graph_nodes WHERE session_id = ?", (session_id,))
@@ -509,6 +510,7 @@ def _delete_session_sync(db: str, session_id: str):
         conn.execute("DELETE FROM quiz_round_questions WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM agent_states WHERE session_id = ?", (session_id,))
         conn.commit()
+        return conn.total_changes > changes_before
     finally:
         conn.close()
 
@@ -1179,16 +1181,9 @@ class SessionMemoryManager:
         return True
 
     def clear_session(self, session_id: str) -> bool:
-        if session_id not in self.store:
-            return False
-        del self.store[session_id]
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            _delete_session_sync(self.db, session_id)
-        else:
-            loop.run_in_executor(None, partial(_delete_session_sync, self.db, session_id))
-        return True
+        existed_in_memory = self.store.pop(session_id, None) is not None
+        deleted_persisted = _delete_session_sync(self.db, session_id)
+        return existed_in_memory or deleted_persisted
 
     def add_practice_record(self, session_id: str, question_id: str, question_content: str,
                            knowledge_point: str, user_answer: str, correct_answer: str,

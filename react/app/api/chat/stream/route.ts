@@ -23,38 +23,20 @@ function sseErrorResponse(message: string, status: number): Response {
 export async function POST(request: NextRequest) {
   // 读取原始 body 直传后端，避免代理层改写请求结构。
   const body = await request.text();
-  const backendCandidates = [
-    process.env.BACKEND_API_BASE?.trim(),
-    'http://127.0.0.1:8001',
-    'http://127.0.0.1:8000',
-  ].filter((v): v is string => Boolean(v));
+  const backend = (process.env.BACKEND_API_BASE || 'http://127.0.0.1:8001').replace(/\/$/, '');
   const upstreamAbort = new AbortController();
   const onClientAbort = () => upstreamAbort.abort();
   request.signal.addEventListener('abort', onClientAbort);
 
   try {
-    let response: Response | null = null;
-    for (const base of backendCandidates) {
-      try {
-        response = await fetch(`${base}/api/chat/stream`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json; charset=utf-8',
-          },
-          body: body,
-          signal: upstreamAbort.signal,
-        });
-        if (response.ok) {
-          break;
-        }
-      } catch {
-        response = null;
-      }
-    }
-
-    if (!response) {
-      return sseErrorResponse('Backend unreachable', 502);
-    }
+    const response = await fetch(`${backend}/api/chat/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+      },
+      body,
+      signal: upstreamAbort.signal,
+    });
 
     if (!response.ok) {
       return sseErrorResponse('Backend error', response.status);
