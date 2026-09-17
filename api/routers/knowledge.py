@@ -17,11 +17,12 @@ from utils.logger_handler import logger
 from utils.kb_version import bump_kb_version
 from utils.knowledge_ingest_policy import should_treat_batch_duplicate, can_retry_failed_meta
 from agent.tools.agent_tools import _rag_cache
+from api.security import authorize_session
 
 router = APIRouter()
 
 MAX_FILES = 5
-ALLOWED_SUFFIX = {".pdf", ".docx", ".txt", ".ppt", ".pptx", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+ALLOWED_SUFFIX = {".pdf", ".docx", ".txt", ".pptx", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 
 # session_id 白名单校验（防止路径遍历，允许中文）
 _VALID_SESSION_ID = re.compile(r'^[\u4e00-\u9fa5a-zA-Z0-9_\-]{1,64}$')
@@ -34,7 +35,7 @@ def _validate_session_id(session_id: str) -> str:
             status_code=400,
             detail="session_id 格式非法，只允许字母、数字、中文、下划线和连字符（最长64位）",
         )
-    return session_id
+    return authorize_session(session_id)
 
 
 def _resolve_session_file_path(session_data_dir: str, raw_filename: str) -> tuple[str, str]:

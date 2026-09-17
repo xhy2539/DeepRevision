@@ -1,0 +1,160 @@
+{
+  "name": "大型平台分析与设计课件检索评测集",
+  "version": "1.0",
+  "session_id": "大型平台课件",
+  "label_unit": "parent_document",
+  "k": 5,
+  "description": "基于五章已入库课件逐条核对父块内容后标注。相关项使用最终生成上下文对应的parent_id。",
+  "cases": [
+    {
+      "id": "platform-ch01-001",
+      "chapter": "第1章",
+      "query_type": "comparison",
+      "query": "传统单体服务和微服务分别有什么优缺点？",
+      "relevant_chunk_ids": ["par_9d5e674d_3"],
+      "source": "大型平台分析与设计ch01-刘宝.pdf",
+      "pages": "12-15",
+      "expected_answer_points": "单体研发成本低、本地性能好；业务增长后庞大且牵一发而动全身；微服务是分布式架构的特例"
+    },
+    {
+      "id": "platform-ch01-002",
+      "chapter": "第1章",
+      "query_type": "definition",
+      "query": "CDN为什么能够改善大型网站的访问速度？",
+      "relevant_chunk_ids": ["par_9d5e674d_5"],
+      "source": "大型平台分析与设计ch01-刘宝.pdf",
+      "pages": "20-23",
+      "expected_answer_points": "边缘服务器、负载均衡和内容分发、就近访问、降低网络拥塞"
+    },
+    {
+      "id": "platform-ch01-003",
+      "chapter": "第1章",
+      "query_type": "enumeration",
+      "query": "衡量大型平台性能通常看哪些指标？",
+      "relevant_chunk_ids": ["par_9d5e674d_7"],
+      "source": "大型平台分析与设计ch01-刘宝.pdf",
+      "pages": "28-29",
+      "expected_answer_points": "响应时间、并发数、吞吐量、TPS、HPS、QPS"
+    },
+    {
+      "id": "platform-ch02-001",
+      "chapter": "第2章",
+      "query_type": "enumeration",
+      "query": "分布式系统有哪些典型特点？",
+      "relevant_chunk_ids": ["par_001cef30_2"],
+      "source": "大型平台分析与设计ch02-刘宝.pdf",
+      "pages": "6-9",
+      "expected_answer_points": "分布性、对等性、并发性、全局时钟、故障总会发生"
+    },
+    {
+      "id": "platform-ch02-002",
+      "chapter": "第2章",
+      "query_type": "reasoning",
+      "query": "为什么分布式系统不能同时满足CAP三个目标？",
+      "relevant_chunk_ids": ["par_001cef30_7"],
+      "source": "大型平台分析与设计ch02-刘宝.pdf",
+      "pages": "26-29",
+      "expected_answer_points": "一致性、可用性、分区容错性；网络分区时必须取舍"
+    },
+    {
+      "id": "platform-ch02-003",
+      "chapter": "第2章",
+      "query_type": "comparison",
+      "query": "服务熔断和服务降级有什么区别？",
+      "relevant_chunk_ids": ["par_001cef30_14", "par_001cef30_15"],
+      "source": "大型平台分析与设计ch02-刘宝.pdf",
+      "pages": "54-61",
+      "expected_answer_points": "熔断保护调用方，可按失败率或耗时触发；降级从整体负荷和业务优先级考虑"
+    },
+    {
+      "id": "platform-ch02-004",
+      "chapter": "第2章",
+      "query_type": "mechanism",
+      "query": "Raft中Leader、Candidate和Follower如何完成选举与故障恢复？",
+      "relevant_chunk_ids": ["par_001cef30_18", "par_001cef30_19"],
+      "source": "大型平台分析与设计ch02-刘宝.pdf",
+      "pages": "70-77",
+      "expected_answer_points": "三类角色、任期、选举定时器、多数票、心跳、Leader故障后重新选举"
+    },
+    {
+      "id": "platform-ch02-005",
+      "chapter": "第2章",
+      "query_type": "mechanism",
+      "query": "Seata的全局事务执行流程是什么，UNDO_LOG有什么作用？",
+      "relevant_chunk_ids": ["par_001cef30_29"],
+      "source": "大型平台分析与设计ch02-刘宝.pdf",
+      "pages": "114-117",
+      "expected_answer_points": "TM向TC开启事务、XID传播、RM注册分支、TC提交或回滚、UNDO_LOG保存回滚数据"
+    },
+    {
+      "id": "platform-ch03-001",
+      "chapter": "第3章",
+      "query_type": "reasoning",
+      "query": "为什么说引入微服务不是简单拆服务，而是引入一整套体系？",
+      "relevant_chunk_ids": ["par_ac21eb4c_4"],
+      "source": "大型平台分析与设计ch03-刘宝.pdf",
+      "pages": "14-17",
+      "expected_answer_points": "监控告警、DevOps、开发流程、人员能力、服务划分、测试体系"
+    },
+    {
+      "id": "platform-ch03-002",
+      "chapter": "第3章",
+      "query_type": "method",
+      "query": "领域驱动设计如何指导微服务拆分？",
+      "relevant_chunk_ids": ["par_ac21eb4c_6", "par_ac21eb4c_7"],
+      "source": "大型平台分析与设计ch03-刘宝.pdf",
+      "pages": "22-29",
+      "expected_answer_points": "领域上下文、子域、实体和值对象；按业务领域、可靠性和主链路拆分"
+    },
+    {
+      "id": "platform-ch03-003",
+      "chapter": "第3章",
+      "query_type": "mechanism",
+      "query": "微服务注册与发现包含哪些角色和核心能力？",
+      "relevant_chunk_ids": ["par_ac21eb4c_25", "par_ac21eb4c_26", "par_ac21eb4c_27"],
+      "source": "大型平台分析与设计ch03-刘宝.pdf",
+      "pages": "98-109",
+      "expected_answer_points": "provider、consumer、register center、服务实例元数据、高可用、动态扩容、权限控制"
+    },
+    {
+      "id": "platform-ch04-001",
+      "chapter": "第4章",
+      "query_type": "definition",
+      "query": "DevOps、持续交付和容器化之间有什么关系？",
+      "relevant_chunk_ids": ["par_9419eaa4_2"],
+      "source": "大型平台分析与设计ch04-刘宝.pdf",
+      "pages": "6-9",
+      "expected_answer_points": "开发运维协作、频繁且不影响用户地发布、容器屏蔽技术栈差异"
+    },
+    {
+      "id": "platform-ch04-002",
+      "chapter": "第4章",
+      "query_type": "comparison",
+      "query": "Service Mesh解决了什么问题，它有哪些优势和代价？",
+      "relevant_chunk_ids": ["par_9419eaa4_3", "par_9419eaa4_5", "par_9419eaa4_8"],
+      "source": "大型平台分析与设计ch04-刘宝.pdf",
+      "pages": "10-33",
+      "expected_answer_points": "非侵入式代理、屏蔽通信复杂性、语言无关、应用透明、性能资源开销和运维挑战"
+    },
+    {
+      "id": "platform-ch04-003",
+      "chapter": "第4章",
+      "query_type": "optimization",
+      "query": "FaaS冷启动包含哪些步骤，可以从哪些方向优化？",
+      "relevant_chunk_ids": ["par_9419eaa4_13"],
+      "source": "大型平台分析与设计ch04-刘宝.pdf",
+      "pages": "50-53",
+      "expected_answer_points": "创建虚拟机或容器、下载函数代码包、打通VPC网络、平台侧和业务侧优化"
+    },
+    {
+      "id": "platform-ch05-001",
+      "chapter": "第5章",
+      "query_type": "scenario",
+      "query": "面对多产品线独立运营的大型平台，系统设计前需要分析哪些核心问题？",
+      "relevant_chunk_ids": ["par_ea8e6c58_0", "par_ea8e6c58_1"],
+      "source": "大型平台分析与设计ch05-刘宝.pdf",
+      "pages": "1-7",
+      "expected_answer_points": "业务目标和边界、产品线差异、共性能力抽象、组织协作与平台治理"
+    }
+  ]
+}

@@ -33,6 +33,10 @@ from utils.user_profile_service import (
 )
 from rag.vector_store import VectorStoreService
 from model.factory import light_chat_model, backup_light_chat_model, chat_model
+from api.security import (
+    authorize_session, delete_session_acl, allowed_session_ids,
+    begin_idempotent, complete_idempotent, fail_idempotent,
+)
 
 router = APIRouter()
 _VALID_SESSION_ID = re.compile(r'^[\u4e00-\u9fa5a-zA-Z0-9_\-]{1,64}$')
@@ -364,7 +368,7 @@ def _validate_session_id(session_id: str) -> str:
     """统一校验 session_id，防止非法字符进入存储或路径逻辑。"""
     if not _VALID_SESSION_ID.match(session_id):
         raise HTTPException(status_code=400, detail="非法 session_id")
-    return session_id
+    return authorize_session(session_id)
 
 
 _INTERNAL_USER_PROMPT_PREFIXES = (
@@ -870,6 +874,7 @@ async def chat_stream_endpoint(request: Request):
     exam_stage_plan = bool(body.get("exam_stage_plan", True))
     exam_rerun_stage = body.get("exam_rerun_stage")
     exam_partial_questions = body.get("exam_partial_questions") if isinstance(body.get("exam_partial_questions"), list) else []
+    resume_checkpoint_id = str(body.get("resume_checkpoint_id") or "").strip()
     exam_fast_mode = bool(body.get("exam_fast_mode", True))  # True=快速路径(格式检查), False=完整路径(LLM Critique)
     # 兼容旧前端“full模式”只传 exam_fast_mode=false 的场景：quiz 也强制走 LLM Critic
     quiz_force_llm_critic = bool(body.get("quiz_force_llm_critic", not exam_fast_mode))
@@ -1226,22 +1231,40 @@ async def chat_stream_endpoint(request: Request):
                                     event_name="action",
                                 )
                             retrieve_start = time.time()
-                            rag = await get_rag_service()
-                            context = await rag.retrieve_context(topic, mode="rag_chat")
+                            retrieval_trace: List[Dict[str, Any]] = []
+                            retrieval_status = "empty"
+                            try:
+                                rag = await get_rag_service()
+                                context = await rag.retrieve_context(topic, mode="rag_chat", trace=retrieval_trace)
+                                final_trace = next(
+                                    (item for item in reversed(retrieval_trace) if item.get("stage") == "finalize"),
+                                    {},
+                                )
+                                retrieval_status = str(
+                                    final_trace.get("status") or ("success" if str(context or "").strip() else "empty")
+                                )
+                            except Exception as exc:
+                                logger.warning(f"[StreamV2-RAG] 检索失败: {exc}")
+                                context = ""
+                                retrieval_status = "failed"
+                                retrieval_trace.append(
+                                    {"stage": "finalize", "status": "failed", "error": str(exc)[:200]}
+                                )
                             if not context or not str(context).strip():
-                                logger.warning("[StreamV2-RAG] 检索结果为空，注入友好提示上下文")
-                                context = "【提示】当前知识库为空，请先上传课件后再提问。你可以通过点击「上传课件」按钮来添加复习资料。"
+                                logger.warning(f"[StreamV2-RAG] 无可用检索上下文 status={retrieval_status}")
+                                context = ""
                             rag_citations = _extract_citations_from_context(context)
                             retrieve_cost_ms = int((time.time() - retrieve_start) * 1000)
                             if emit_sections:
                                 _record_stream_event("action_result")
-                                retrieve_summary = f"命中引用 {len(rag_citations)} 条"
+                                retrieve_summary = f"检索状态 {retrieval_status}，命中引用 {len(rag_citations)} 条"
                                 stream_sections["actions"].append(
                                     {
                                         "name": "retrieve_context",
                                         "status": "completed",
                                         "cost_ms": retrieve_cost_ms,
                                         "detail": retrieve_summary,
+                                        "retrieval_trace": retrieval_trace,
                                     }
                                 )
                                 stream_sections["tool_calls"].append(
@@ -1250,6 +1273,7 @@ async def chat_stream_endpoint(request: Request):
                                         "status": "completed",
                                         "cost_ms": retrieve_cost_ms,
                                         "result_summary": retrieve_summary,
+                                        "retrieval_trace": retrieval_trace,
                                         "source": "stream_v2_rag",
                                     }
                                 )
@@ -1268,6 +1292,7 @@ async def chat_stream_endpoint(request: Request):
                                             "detail": retrieve_summary,
                                             "result_summary": retrieve_summary,
                                             "source": "stream_v2_rag",
+                                            "retrieval_trace": retrieval_trace,
                                         },
                                     ),
                                     event_name="action_result",
@@ -1316,8 +1341,10 @@ async def chat_stream_endpoint(request: Request):
                                 )
                             chain = (
                                 PromptTemplate.from_template(
-                                    "你是复习助手，请严格基于检索资料回答学生问题。\n"
-                                    "要求：直接回答，不要输出思考过程；若资料不足请明确说明“根据当前检索资料”。\n"
+                                    "你是复习助手。检索状态为 {retrieval_status}。\n"
+                                    "有检索资料时严格基于资料回答；没有资料时明确说明未检索到课件内容，"
+                                    "可以基于常识简要回答，但不得伪造课件引用。\n"
+                                    "要求：直接回答，不要输出思考过程。\n"
                                     "【长期记忆】\n{memory_context}\n\n"
                                     "【近期对话】\n{recent_history}\n\n"
                                     "【检索资料】\n{context}\n\n"
@@ -1330,6 +1357,7 @@ async def chat_stream_endpoint(request: Request):
                                 "memory_context": graph_context,
                                 "recent_history": _format_recent_history_for_prompt(chat_history),
                                 "context": context,
+                                "retrieval_status": retrieval_status,
                                 "input": rewritten_query,
                             }
                         else:
@@ -1470,6 +1498,7 @@ async def chat_stream_endpoint(request: Request):
                                 evidence_cards = _build_evidence_cards_from_citations(rag_citations)
                                 if evidence_cards:
                                     payload = {**payload, "evidence_cards": evidence_cards}
+                                payload = {**payload, "retrieval_trace": retrieval_trace}
                             if bool(stream_v2_cfg.get("emit_sections", True)):
                                 payload = {**payload, "stream_sections": stream_sections}
                             message["payload"] = payload
@@ -1489,6 +1518,7 @@ async def chat_stream_endpoint(request: Request):
                                     "grounded_reason": rag_grounding_reason or ("pass" if rag_grounded_evidence else "partial"),
                                     "evidence_status": evidence_status,
                                     "evidence_count": len(evidence_cards),
+                                    "retrieval_status": retrieval_status,
                                 }
                                 if evidence_cards:
                                     meta["evidence_source"] = f"课件引用 {len(evidence_cards)} 条"
@@ -1510,6 +1540,8 @@ async def chat_stream_endpoint(request: Request):
                             RUNTIME_METRICS["routes"][route] += 1
                         stream_v2_completed = True
                         raise _StreamV2Handled()
+                    except _StreamV2Handled:
+                        raise
                     except asyncio.CancelledError:
                         raise
                     except Exception as stream_v2_error:
@@ -1542,7 +1574,21 @@ async def chat_stream_endpoint(request: Request):
             heartbeat_interval_s = 8.0
             deadline = time.time() + workflow_timeout_s
             last_heartbeat_at = time.time()
-            workflow_task = asyncio.create_task(supervisor_workflow.ainvoke(initial_state))
+            # 稳定 thread_id 让同一身份/课程的图状态可跨请求恢复；checkpoint_ns
+            # 对不同工作流版本隔离，防止升级后的 State schema 污染旧快照。
+            principal_id = getattr(getattr(request, "state", None), "principal_id", "local")
+            workflow = getattr(request.app.state, "supervisor_workflow", supervisor_workflow)
+            workflow_config = {
+                "configurable": {
+                    "thread_id": f"{principal_id}:{session_id}:supervisor-v1",
+                }
+            }
+            if resume_checkpoint_id:
+                # Time-travel 采用“从旧快照创建新分支”，不删除之后的业务事实。
+                workflow_config["configurable"]["checkpoint_id"] = resume_checkpoint_id
+            workflow_task = asyncio.create_task(
+                workflow.ainvoke(initial_state, config=workflow_config)
+            )
 
             while True:
                 if await request.is_disconnected():
@@ -1992,16 +2038,29 @@ def _update_learning_loop_after_practice(
 
 
 @router.post("/practice/submit")
-async def submit_practice_records(req: PracticeSubmitRequest = Body(...)):
+async def submit_practice_records(request: Request, req: PracticeSubmitRequest = Body(...)):
     """
     提交练习记录（错题追踪主入口）。
     """
+    idem_key = request.headers.get("Idempotency-Key", "").strip()
+    # 本地 Demo 兼容旧前端；开启强制认证后，所有写请求必须显式携带幂等键。
+    auth_required = __import__("os").getenv("DEEPREVISION_AUTH_REQUIRED", "0").lower() in {"1", "true", "yes"}
+    request_hash = hashlib.sha256(req.model_dump_json().encode()).hexdigest()
+    if idem_key:
+        cached = begin_idempotent("practice.submit", idem_key, request_hash)
+        if cached is not None:
+            return cached
+    elif auth_required:
+        raise HTTPException(status_code=400, detail="写操作缺少 Idempotency-Key")
     try:
         session_id = req.session_id or "default"
         _validate_session_id(session_id)
 
         if not req.records:
-            return {"code": 200, "message": "无记录需要提交", "saved": 0}
+            response = {"code": 200, "message": "无记录需要提交", "saved": 0}
+            if idem_key:
+                complete_idempotent("practice.submit", idem_key, response)
+            return response
 
         current_session_id.set(session_id)
         saved = 0
@@ -2086,7 +2145,7 @@ async def submit_practice_records(req: PracticeSubmitRequest = Body(...)):
         priority_review_points = memory_manager.get_priority_review_points(session_id, limit=10)
         RUNTIME_METRICS["mastery_rows_total"] = mastery_rows_total
         logger.info(f"[Practice] session={session_id}, saved={saved}, weak_points={weak_points}")
-        return {
+        response = {
             "code": 200,
             "message": f"已保存 {saved} 条练习记录",
             "saved": saved,
@@ -2098,9 +2157,16 @@ async def submit_practice_records(req: PracticeSubmitRequest = Body(...)):
             "learning_loop_phase": learning_loop_state.get("phase") if learning_loop_state else None,
             "learning_loop_next_action": learning_loop_state.get("next_action") if learning_loop_state else None,
         }
+        if idem_key:
+            complete_idempotent("practice.submit", idem_key, response)
+        return response
     except HTTPException:
+        if idem_key:
+            fail_idempotent("practice.submit", idem_key)
         raise
     except Exception as e:
+        if idem_key:
+            fail_idempotent("practice.submit", idem_key)
         logger.error(f"[Practice] submit 接口异常: {e}", exc_info=True)
         return JSONResponse(
             status_code=500,
@@ -2231,6 +2297,32 @@ async def get_practice_history(session_id: str, limit: int = 200):
     safe_limit = max(1, min(int(limit or 200), 500))
     history = memory_manager.get_practice_history(session_id, limit=safe_limit)
     return {"code": 200, "data": history, "count": len(history)}
+
+
+@router.get("/workflow/checkpoints")
+async def get_workflow_checkpoints(request: Request, session_id: str, limit: int = 20):
+    """列出节点快照元数据，不返回完整提示词及 State 内容。"""
+    _validate_session_id(session_id)
+    safe_limit = max(1, min(int(limit), 100))
+    principal_id = getattr(request.state, "principal_id", "local")
+    workflow = getattr(request.app.state, "supervisor_workflow", supervisor_workflow)
+    config = {"configurable": {
+        "thread_id": f"{principal_id}:{session_id}:supervisor-v1",
+    }}
+    rows = []
+    async for snapshot in workflow.aget_state_history(config):
+        configurable = (snapshot.config or {}).get("configurable", {})
+        metadata = snapshot.metadata if isinstance(snapshot.metadata, dict) else {}
+        rows.append({
+            "checkpoint_id": configurable.get("checkpoint_id"),
+            "created_at": getattr(snapshot, "created_at", None),
+            "next_nodes": list(snapshot.next or ()),
+            "step": metadata.get("step"),
+            "source": metadata.get("source"),
+        })
+        if len(rows) >= safe_limit:
+            break
+    return {"code": 200, "data": rows}
 
 
 @router.delete("/practice/history/item")
@@ -2378,6 +2470,7 @@ async def delete_session(session_id: str):
     clear_rag_cache(session_id)
     success = memory_manager.clear_session(session_id)
     if success:
+        delete_session_acl(session_id)
         return {"code": 200, "message": f"科目会话 {session_id} 及其专属知识库已被永久销毁！"}
     return {"code": 404, "message": "该会话不存在"}
 
@@ -2409,7 +2502,11 @@ class SessionCleanupRequest(BaseModel):
 @router.post("/session")
 async def register_session(req: SessionCreateRequest = Body(...)):
     """创建/注册新会话，用于前端会话树管理。"""
-    _validate_session_id(req.session_id)
+    if not _VALID_SESSION_ID.match(req.session_id):
+        raise HTTPException(status_code=400, detail="非法 session_id")
+    authorize_session(req.session_id, create=True)
+    if req.parent_id:
+        _validate_session_id(req.parent_id)
     memory_manager.register_session(req.session_id, req.name, req.parent_id)
     return {"code": 200, "message": "会话注册成功"}
 
@@ -2449,6 +2546,14 @@ async def cleanup_legacy_session(req: SessionCleanupRequest = Body(...)):
 async def get_all_sessions():
     """返回全部会话列表（含层级关系字段）。"""
     sessions = memory_manager.get_all_sessions()
+    allowed = allowed_session_ids()
+    if allowed is not None:
+        sessions = {
+            sid: value for sid, value in sessions.items() if sid in allowed
+        } if isinstance(sessions, dict) else [
+            row for row in sessions
+            if str(row.get("session_id") or row.get("id")) in allowed
+        ]
     return {"code": 200, "data": sessions}
 
 

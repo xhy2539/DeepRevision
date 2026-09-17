@@ -1,0 +1,4 @@
+# Optional PDF parser. The pipeline extra is required for local PDF parsing.
+# It installs torch and local model/runtime dependencies and is intentionally
+# kept out of the default requirements.txt to avoid a large deployment image.
+mineru[pipeline]>=3.4.5

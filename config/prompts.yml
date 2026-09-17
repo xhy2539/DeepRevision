@@ -2,9 +2,6 @@
 # 系统提示词
 main_prompt_path: prompts/main_prompt.txt
 
-# RAG相关
-rag_summarize_prompt_path: prompts/rag_summarize.txt
-
 # 出题相关（单题）
 quiz_generate_structured_path: prompts/quiz_generate_structured.txt
 quiz_generate_reasoning_path: prompts/quiz_generate_reasoning.txt
@@ -22,4 +19,3 @@ exam_contract_path: prompts/exam_contract.txt
 
 # 格式示例
 format_examples_path: prompts/format_examples.txt
-

@@ -9,6 +9,9 @@ from langchain_core.messages import HumanMessage
 from model.factory import vision_model
 from typing import List, Dict, Any, Optional
 import re
+import shutil
+import subprocess
+import tempfile
 
 
 def get_file_md5_hex(filepath: str) -> str:
@@ -53,129 +56,22 @@ def txt_loader(filepath: str) -> list[Document]:
 
 def word_loader(filepath: str) -> list[Document]:
     """Word(.docx)解析器"""
-    from langchain_community.document_loaders import Docx2txtLoader
-    ext = os.path.splitext(filepath)[1].lower()
-    # .doc 老格式优先走 Unstructured，Docx2txt 对 .doc 支持不稳定
-    if ext == ".doc":
-        return _unstructured_loader(filepath)
-    try:
-        return Docx2txtLoader(filepath).load()
-    except Exception as e:
-        logger.warning(f"[Word解析] Docx2txt 失败，回退 Unstructured: {e}")
-        return _unstructured_loader(filepath)
-
-
-# ================= Unstructured 文档加载器 =================
-def _unstructured_loader(filepath: str) -> list[Document]:
-    """
-    使用 Unstructured 库提取文档内容
-    自动识别文件类型并提取元素
-    """
-    from unstructured.partition.auto import partition
-
-    logger.info(f"[Unstructured] 开始解析: {filepath}")
+    from docx import Document as WordDocument
 
     try:
-        # partition 自动检测文件类型并提取
-        elements = partition(filename=filepath)
-
-        # 将元素转换为 LangChain Document
-        # 按页面/章节分组
-        docs = []
-        current_content = ""
-        current_metadata = {"source": filepath}
-
-        for idx, elem in enumerate(elements):
-            elem_type = type(elem).__name__
-            elem_text = str(elem).strip()
-
-            if not elem_text:
-                continue
-
-            # 记录元素类型用于调试
-            if idx == 0:
-                current_metadata["element_types"] = [elem_type]
-            else:
-                current_metadata["element_types"] = current_metadata.get("element_types", []) + [elem_type]
-
-            # 根据元素类型添加标记
-            prefix = ""
-            if "Title" in elem_type:
-                prefix = "【标题】"
-            elif "NarrativeText" in elem_type:
-                prefix = "【段落】"
-            elif "ListItem" in elem_type:
-                prefix = "【列表项】"
-            elif "Table" in elem_type:
-                prefix = "【表格】"
-            elif "Image" in elem_type:
-                prefix = "【图片】"
-
-            current_content += f"{prefix}{elem_text}\n"
-
-        if current_content.strip():
-            docs.append(Document(
-                page_content=current_content,
-                metadata=current_metadata
-            ))
-
-        logger.info(f"[Unstructured] 解析完成: {filepath}, 共 {len(elements)} 个元素")
-        return docs
-
+        source = WordDocument(filepath)
+        chunks = [paragraph.text.strip() for paragraph in source.paragraphs if paragraph.text.strip()]
+        for table in source.tables:
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells]
+                if any(cells):
+                    chunks.append(" | ".join(cells))
+        content = "\n".join(chunks).strip()
+        if not content:
+            return []
+        return [Document(page_content=content, metadata={"source": filepath, "type": "docx"})]
     except Exception as e:
-        logger.error(f"[Unstructured] 解析失败: {filepath}, 错误: {e}")
-        return []
-
-
-# ================= Unstructured PDF 专用加载器 =================
-def _unstructured_pdf_loader(filepath: str) -> list[Document]:
-    """
-    使用 Unstructured 提取 PDF 内容
-    更好地保留文档结构
-    """
-    from unstructured.partition.pdf import partition_pdf
-
-    logger.info(f"[Unstructured PDF] 开始解析: {filepath}")
-
-    try:
-        # 提取 PDF 元素
-        elements = partition_pdf(filename=filepath)
-
-        docs = []
-        current_content = ""
-        current_metadata = {"source": filepath, "type": "pdf"}
-
-        for idx, elem in enumerate(elements):
-            elem_type = type(elem).__name__
-            elem_text = str(elem).strip()
-
-            if not elem_text:
-                continue
-
-            # 添加类型标记
-            prefix = ""
-            if "Title" in elem_type:
-                prefix = "【标题】"
-            elif "Text" in elem_type:
-                prefix = "【文本】"
-            elif "Table" in elem_type:
-                prefix = "【表格】"
-            elif "Image" in elem_type:
-                prefix = "【图片】"
-
-            current_content += f"{prefix}{elem_text}\n"
-
-        if current_content.strip():
-            docs.append(Document(
-                page_content=current_content,
-                metadata=current_metadata
-            ))
-
-        logger.info(f"[Unstructured PDF] 解析完成: {filepath}")
-        return docs
-
-    except Exception as e:
-        logger.error(f"[Unstructured PDF] 解析失败: {filepath}, 错误: {e}")
+        logger.error(f"[Word解析] 失败: {filepath}, 错误: {e}")
         return []
 
 
@@ -219,16 +115,15 @@ def _detect_formulas(text: str) -> List[Dict[str, Any]]:
 # ================= PPT 解析器 =================
 def ppt_loader(filepath: str) -> list[Document]:
     """
-    PPT/PPTX 解析器 - 优先使用自定义按页解析（保留图片多模态理解）
-    回退到 Unstructured 兜底
+    PPTX 解析器 - 按页提取文本、表格和图片元数据
     """
     from pptx import Presentation
 
     try:
         prs = Presentation(filepath)
-    except Exception:
-        logger.info(f"[PPT解析] python-pptx 打开失败，回退到 Unstructured: {filepath}")
-        return _unstructured_loader(filepath)
+    except Exception as e:
+        logger.error(f"[PPT解析] 无法打开 {filepath}: {e}")
+        return []
 
     documents = []
     logger.info(f"[PPT解析] 开始解析: {filepath}, 共 {len(prs.slides)} 页")
@@ -396,16 +291,53 @@ def _ocr_image(image_bytes: bytes) -> Optional[str]:
 # ================= 升级版 PDF 解析器 =================
 def pdf_loader(filepath: str, passwd=None) -> list[Document]:
     """
-    PDF 加载器 - 优先使用自定义按页解析（保留图片/表格/OCR增强）
-    回退到 Unstructured 兜底
+    PDF 加载器。若配置启用且本机安装 MinerU，优先使用 MinerU 输出的 Markdown；
+    MinerU 不可用或解析失败时回退到项目内置的 PyMuPDF 解析器。
     """
-    docs = _custom_pdf_loader(filepath, passwd)
-    if docs:
-        return docs
+    use_mineru = str(os.environ.get("DEEPREVISION_PDF_PARSER", "mineru")).lower() in {"mineru", "auto"}
+    if use_mineru:
+        parsed = _mineru_pdf_loader(filepath)
+        if parsed:
+            return parsed
+    return _custom_pdf_loader(filepath, passwd)
 
-    # 回退到 Unstructured
-    logger.info(f"[PDF解析] 自定义解析器无输出，回退到 Unstructured: {filepath}")
-    return _unstructured_pdf_loader(filepath)
+
+def _mineru_pdf_loader(filepath: str) -> list[Document]:
+    """通过 MinerU CLI 解析 PDF；保持可选依赖，不影响无 MinerU 的部署。"""
+    mineru_bin = shutil.which("mineru")
+    if not mineru_bin:
+        logger.info("[PDF解析] MinerU 未安装，回退 PyMuPDF: %s", filepath)
+        return []
+
+    output_dir = tempfile.mkdtemp(prefix="deeprevision-mineru-")
+    try:
+        command = [mineru_bin, "-p", filepath, "-o", output_dir]
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=300, check=False)
+        if completed.returncode != 0:
+            logger.warning("[PDF解析] MinerU 失败，回退 PyMuPDF: %s", (completed.stderr or completed.stdout)[-500:])
+            return []
+
+        markdown_files = []
+        for root, _, names in os.walk(output_dir):
+            markdown_files.extend(os.path.join(root, name) for name in names if name.lower().endswith(".md"))
+        if not markdown_files:
+            logger.warning("[PDF解析] MinerU 未生成 Markdown，回退 PyMuPDF: %s", filepath)
+            return []
+
+        documents = []
+        for markdown_path in sorted(markdown_files):
+            with open(markdown_path, "r", encoding="utf-8", errors="ignore") as stream:
+                content = stream.read().strip()
+            if content:
+                documents.append(Document(page_content=content, metadata={"source": filepath, "type": "pdf", "parser": "mineru"}))
+        if documents:
+            logger.info("[PDF解析] MinerU 解析完成: %s, 文档数=%s", filepath, len(documents))
+        return documents
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("[PDF解析] MinerU 调用异常，回退 PyMuPDF: %s", exc)
+        return []
+    finally:
+        shutil.rmtree(output_dir, ignore_errors=True)
 
 
 def _custom_pdf_loader(filepath: str, passwd=None) -> list[Document]:
@@ -537,6 +469,7 @@ def _custom_pdf_loader(filepath: str, passwd=None) -> list[Document]:
                     "source": filepath,
                     "page": page_num + 1,
                     "type": "pdf",
+                    "parser": "pymupdf",
                     "total_pages": len(doc),
                     "has_images": len(image_list) > 0,
                     "title": title,
@@ -603,7 +536,7 @@ def image_loader(filepath: str) -> list[Document]:
 # ================= 通用文档加载器 =================
 def document_loader(filepath: str) -> list[Document]:
     """
-    通用文档加载器 - 优先使用自定义按页解析，Unstructured 作兜底
+    通用文档加载器
     """
     ext = os.path.splitext(filepath)[1].lower()
 
@@ -611,15 +544,12 @@ def document_loader(filepath: str) -> list[Document]:
         return txt_loader(filepath)
     elif ext == ".pdf":
         return pdf_loader(filepath)
-    elif ext in [".doc", ".docx"]:
+    elif ext == ".docx":
         return word_loader(filepath)
-    elif ext in [".ppt", ".pptx"]:
+    elif ext == ".pptx":
         return ppt_loader(filepath)
     elif ext in [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"]:
         return image_loader(filepath)
     else:
-        # 未知格式尝试 Unstructured 兜底
-        docs = _unstructured_loader(filepath)
-        if not docs:
-            logger.warning(f"[document_loader] 不支持的文件类型: {ext}")
-        return docs
+        logger.warning(f"[document_loader] 不支持的文件类型: {ext}")
+        return []

@@ -53,3 +53,5 @@ test_*.txt
 
 # Local interview artifacts
 interview_materials/
+.docx_render*/
+artifacts/agent_architecture_assets/

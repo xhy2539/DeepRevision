@@ -23,15 +23,33 @@ separators: [
   ""             # 字符级
 ]
 
+# ============== 结构感知父子索引 ==============
+# 子块进入 BM25/向量索引，召回和重排后通过 parent_id 回溯完整父块。
+hierarchical_index_enabled: true
+courseware_chunking:
+  parent_size: 2600
+  parent_max_pages: 4
+  child_size: 700
+  child_overlap: 100
+dense_document_chunking:
+  parent_size: 2400
+  child_size: 1000
+  child_overlap: 150
+parent_context_fast_k: 5
+parent_context_full_k: 6
+
 # ============== 混合检索配置 ==============
 # BM25 + 向量 RRF 混合检索
 bm25_weight: 0.4      # BM25 权重 (关键词匹配)
 vector_weight: 0.6    # 向量权重 (语义匹配)
 rrf_k: 30            # RRF 公式参数（降低30，重视高排名结果）
+rerank_enabled: true # RRF 后对小候选集调用 DashScope 重排；无 Key/失败自动回退
+rerank_model: qwen3.7-text-rerank
+rerank_timeout_seconds: 8
+query_rewrite_timeout_seconds: 6
 
-# 检索参数 - 扩大覆盖范围
-retrieve_top_k: 20    # 混合检索召回数量
-rerank_final_k: 12   # 最终返回数量
+# 向量召回候选池；RRF 的 fast/full 最终上限在 rag_service.py 中集中定义
+retrieve_top_k: 20
 retrieve_fast_to_full_min_docs: 3   # fast 档命中不足时自动升级到 full 的阈值
 retrieve_fast_to_full_min_sources: 2   # fast 档来源多样性不足时自动升级到 full 的阈值
 retrieve_context_cache_ttl_seconds: 1200   # 检索上下文缓存 TTL（秒），20 分钟

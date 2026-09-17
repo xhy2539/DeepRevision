@@ -803,7 +803,7 @@ async def delete_duplicate_knowledge_files_tool(keep_filename: str, session_id: 
     if not os.path.isfile(keep_path):
         return f"保留文件不存在: {keep}"
 
-    allowed = {".txt", ".pdf", ".docx", ".doc", ".ppt", ".pptx", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+    allowed = {".txt", ".pdf", ".docx", ".pptx", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
     with open(keep_path, "rb") as f:
         keep_md5 = hashlib.md5(f.read()).hexdigest()
 

@@ -23,13 +23,6 @@ def load_system_prompts():
     return _load_prompt_from_config("main_prompt_path")
 
 
-# ============ RAG提示词 ============
-
-def load_rag_prompts():
-    """加载RAG总结提示词"""
-    return _load_prompt_from_config("rag_summarize_prompt_path")
-
-
 # ============ 出题提示词（单题）============
 
 def load_quiz_generate_structured():
@@ -127,4 +120,3 @@ if __name__ == '__main__':
     print("Exam prompts:", list(load_all_exam_prompts().keys()))
     print("Quiz prompts:", list(load_all_quiz_prompts().keys()))
     print("Contract:", load_exam_contract()[:100], "...")
-

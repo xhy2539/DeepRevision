@@ -1,9 +1,8 @@
 from langchain_core.documents import Document
 from langchain_core.runnables import Runnable
 from langchain_community.retrievers import BM25Retriever
-from model.factory import chat_model, embed_model, light_chat_model
+from model.factory import chat_model, light_chat_model
 from rag.vector_store import VectorStoreService
-from utils.prompt_loader import load_rag_prompts
 from utils.config_handler import chroma_conf
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -13,143 +12,12 @@ from utils.session_context import current_session_id
 from utils.rag_metrics import rag_inc, rag_append_sample
 from utils.kb_version import read_kb_version
 import asyncio
-import sqlite3
 import os
 import json
 import hashlib
-import math
 import time
 import random
 import re
-
-# Cross-Encoder 已禁用（网络问题），使用纯 RRF 检索
-
-
-class SemanticCache:
-    """
-    RAG 语义缓存：用 embedding 相似度匹配相同/近似问题，直接返回缓存的 LLM 回复。
-    缓存失效：文件上传/删除时按 session_id 清空。
-    """
-
-    def __init__(self, similarity_threshold: float = 0.92, max_candidates: int = 200):
-        self.sim_threshold = similarity_threshold
-        self.max_candidates = max(20, int(max_candidates or 200))
-        self.db_path = os.path.join(os.getcwd(), "data", "semantic_cache.db")
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        self._init_db()
-
-    def _init_db(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS cache (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id  TEXT    NOT NULL,
-                scope_key   TEXT    NOT NULL DEFAULT '',
-                query_text  TEXT    NOT NULL,
-                query_hash  TEXT    NOT NULL,
-                embedding   TEXT    NOT NULL,
-                response    TEXT    NOT NULL,
-                created_at  INTEGER NOT NULL
-            );
-        """)
-        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(cache);").fetchall()}
-        if "scope_key" not in columns:
-            conn.execute("ALTER TABLE cache ADD COLUMN scope_key TEXT NOT NULL DEFAULT ''")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_session ON cache(session_id);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_hash ON cache(query_hash);")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_session_created ON cache(session_id, created_at DESC);")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_cache_session_scope_created "
-            "ON cache(session_id, scope_key, created_at DESC);"
-        )
-        conn.commit()
-        conn.close()
-
-    def _cosine_sim(self, a: List[float], b: List[float]) -> float:
-        dot = sum(x * y for x, y in zip(a, b))
-        norm_a = math.sqrt(sum(x * x for x in a))
-        norm_b = math.sqrt(sum(x * x for x in b))
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-        return dot / (norm_a * norm_b)
-
-    async def get(self, query: str, session_id: str, scope_key: str = "") -> Optional[str]:
-        """
-        查询语义缓存。命中返回缓存的 response，未命中返回 None。
-        """
-        scope = str(scope_key or "")
-        q_hash = hashlib.md5(f"{scope}|{query}".encode("utf-8")).hexdigest()
-        conn = sqlite3.connect(self.db_path)
-        try:
-            # 1) 精确命中优先
-            exact_row = conn.execute(
-                "SELECT response FROM cache "
-                "WHERE session_id = ? AND scope_key = ? AND query_hash = ? "
-                "ORDER BY created_at DESC LIMIT 1",
-                (session_id, scope, q_hash),
-            ).fetchone()
-            if exact_row and exact_row[0]:
-                logger.info("[语义缓存] 精确命中")
-                return str(exact_row[0])
-
-            # 2) 语义命中仅扫描最近窗口，避免全量扫描拖慢
-            rows = conn.execute(
-                "SELECT embedding, response FROM cache "
-                "WHERE session_id = ? AND scope_key = ? "
-                "ORDER BY created_at DESC LIMIT ?",
-                (session_id, scope, self.max_candidates),
-            ).fetchall()
-        finally:
-            conn.close()
-
-        # 精确命中失败后再计算 embedding，避免 embedding 故障导致精确缓存不可用
-        try:
-            loop = asyncio.get_event_loop()
-            emb = await loop.run_in_executor(None, lambda: embed_model.embed_query(query))
-        except Exception as e:
-            logger.warning(f"[语义缓存] embedding 失败，仅可使用精确缓存: {e}")
-            return None
-
-        for cached_emb_str, cached_resp in rows:
-            try:
-                cached_emb = json.loads(cached_emb_str)
-                sim = self._cosine_sim(emb, cached_emb)
-                if sim >= self.sim_threshold:
-                    logger.info(f"[语义缓存] 语义命中 (相似度={sim:.3f})")
-                    return cached_resp
-            except Exception:
-                continue
-        return None
-
-    def set(self, query: str, response: str, session_id: str, scope_key: str = ""):
-        """写入缓存"""
-        try:
-            emb = embed_model.embed_query(query)
-        except Exception as e:
-            logger.warning(f"[语义缓存] embedding 失败，跳过写入: {e}")
-            return
-
-        scope = str(scope_key or "")
-        q_hash = hashlib.md5(f"{scope}|{query}".encode("utf-8")).hexdigest()
-        conn = sqlite3.connect(self.db_path)
-        conn.execute(
-            "INSERT INTO cache (session_id, scope_key, query_text, query_hash, embedding, response, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (session_id, scope, query, q_hash, json.dumps(emb), response, int(time.time()))
-        )
-        conn.commit()
-        conn.close()
-        logger.info("[语义缓存] 已写入")
-
-    def invalidate(self, session_id: str):
-        """按 session 清空缓存（知识库变更时调用）"""
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("DELETE FROM cache WHERE session_id = ?", (session_id,))
-        conn.commit()
-        conn.close()
-        logger.info(f"[语义缓存] 已失效 session={session_id}")
-
 
 class RRFRetriever(Runnable):
     """
@@ -162,14 +30,14 @@ class RRFRetriever(Runnable):
         bm25_retriever=None,
         vector_retriever=None,
         rrf_k=60,
-        rerank_top_k=8,
+        result_limit=8,
         bm25_weight: float = 0.5,
         vector_weight: float = 0.5,
     ):
         self.bm25_retriever = bm25_retriever
         self.vector_retriever = vector_retriever
         self.rrf_k = rrf_k
-        self.rerank_top_k = rerank_top_k
+        self.result_limit = result_limit
         self.bm25_weight = max(0.0, float(bm25_weight or 0.0))
         self.vector_weight = max(0.0, float(vector_weight or 0.0))
 
@@ -193,7 +61,7 @@ class RRFRetriever(Runnable):
 
         # RRF 融合
         fused_docs = self._rrf_fuse(bm25_results, vector_results)
-        return fused_docs[:self.rerank_top_k]
+        return fused_docs[:self.result_limit]
 
     @staticmethod
     def _doc_signature(doc: Document) -> str:
@@ -208,22 +76,37 @@ class RRFRetriever(Runnable):
         """RRF 融合算法"""
         doc_scores: Dict[str, float] = {}
         doc_map: Dict[str, Document] = {}
+        bm25_ranks: Dict[str, int] = {}
+        vector_ranks: Dict[str, int] = {}
 
         # 对第一个检索结果打分
         for rank, doc in enumerate(docs1, 1):
             key = self._doc_signature(doc)
             doc_scores[key] = doc_scores.get(key, 0) + (self.bm25_weight / (self.rrf_k + rank))
             doc_map[key] = doc
+            bm25_ranks[key] = rank
 
         # 对第二个检索结果打分
         for rank, doc in enumerate(docs2, 1):
             key = self._doc_signature(doc)
             doc_scores[key] = doc_scores.get(key, 0) + (self.vector_weight / (self.rrf_k + rank))
             doc_map[key] = doc
+            vector_ranks[key] = rank
 
         # 按分数排序
         sorted_keys = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)
-        return [doc_map[key] for key, _ in sorted_keys]
+        fused: List[Document] = []
+        for key, score in sorted_keys:
+            doc = doc_map[key]
+            metadata = dict(doc.metadata or {})
+            metadata["retrieval_chunk_id"] = key
+            metadata["rrf_score"] = round(float(score), 8)
+            if key in bm25_ranks:
+                metadata["bm25_rank"] = bm25_ranks[key]
+            if key in vector_ranks:
+                metadata["vector_rank"] = vector_ranks[key]
+            fused.append(Document(page_content=doc.page_content, metadata=metadata))
+        return fused
 
 # Cross-Encoder disabled, using RRF hybrid search
 
@@ -238,16 +121,10 @@ class RagSummarizeService:
         self.vector_store_service = VectorStoreService()
         self.vector_retriever = self.vector_store_service.get_retriever()
         self.bm25_retriever = None
-        self.semantic_cache = SemanticCache()
-
         # ============== 检索配置（从 chroma.yml 读取）==============
-        self.rerank_top_k = chroma_conf.get('retrieve_top_k', 10)
-        self.final_top_k = chroma_conf.get('rerank_final_k', 8)
         self.rrf_k = chroma_conf.get('rrf_k', 30)
         self.bm25_weight = chroma_conf.get('bm25_weight', 0.4)
         self.vector_weight = chroma_conf.get('vector_weight', 0.6)
-        self.mmr_enabled = chroma_conf.get('mmr_enabled', False)
-        self.mmr_lambda = chroma_conf.get('mmr_lambda', 0.5)
         self.ingest_wait_seconds = int(chroma_conf.get('ingest_wait_seconds', 8))
         self.ingest_poll_interval = float(chroma_conf.get('ingest_poll_interval', 1.0))
         self.fast_to_full_min_docs = max(1, int(chroma_conf.get('retrieve_fast_to_full_min_docs', 3)))
@@ -258,16 +135,20 @@ class RagSummarizeService:
         self.hyde_enabled = bool(chroma_conf.get('hyde_enabled', True))
         self.hyde_trigger_min_docs = max(1, int(chroma_conf.get('hyde_trigger_min_docs', 3)))
         self.hyde_max_chars = max(80, int(chroma_conf.get('hyde_max_chars', 180)))
+        self.rerank_enabled = bool(chroma_conf.get('rerank_enabled', False))
+        self.rerank_model = str(chroma_conf.get('rerank_model', 'qwen3.7-text-rerank'))
+        self.rerank_timeout_seconds = float(chroma_conf.get('rerank_timeout_seconds', 8.0))
+        self.query_rewrite_timeout_seconds = float(chroma_conf.get("query_rewrite_timeout_seconds", 6.0))
         self._context_cache: Dict[str, Dict[str, Any]] = {}
         self._kb_version = 0
         self._kb_version_check_ts = 0.0
         self._retrieve_config_signature = ""
-        self.prompt_version = ""
-        self.model_tag = ""
         self.fast_retrieve_top_k = 8
         self.fast_final_top_k = 6
         self.full_retrieve_top_k = 16
         self.full_final_top_k = 10
+        self.parent_context_fast_k = max(1, int(chroma_conf.get("parent_context_fast_k", 4)))
+        self.parent_context_full_k = max(1, int(chroma_conf.get("parent_context_full_k", 6)))
 
         logger.info("[RAG] 初始化混合检索系统 (BM25 + 向量 RRF)")
 
@@ -282,7 +163,6 @@ class RagSummarizeService:
         self._kb_version = self._get_kb_version(force_reload=True)
         self._retrieve_config_signature = self._build_retrieve_config_signature()
         if invalidate_cache:
-            self.semantic_cache.invalidate(self.vector_store_service.session_id)
             self._context_cache.clear()
         # 提取当前库中所有的文档供BM25建立本地索引
         all_docs = self.vector_store_service.vector_store.get()
@@ -300,7 +180,7 @@ class RagSummarizeService:
                 bm25_retriever=bm25_fast,
                 vector_retriever=self.vector_retriever,
                 rrf_k=self.rrf_k,
-                rerank_top_k=self.fast_retrieve_top_k,
+                result_limit=self.fast_retrieve_top_k,
                 bm25_weight=self.bm25_weight,
                 vector_weight=self.vector_weight,
             )
@@ -308,7 +188,7 @@ class RagSummarizeService:
                 bm25_retriever=bm25_full,
                 vector_retriever=self.vector_retriever,
                 rrf_k=self.rrf_k,
-                rerank_top_k=self.full_retrieve_top_k,
+                result_limit=self.full_retrieve_top_k,
                 bm25_weight=self.bm25_weight,
                 vector_weight=self.vector_weight,
             )
@@ -321,7 +201,7 @@ class RagSummarizeService:
                 bm25_retriever=None,
                 vector_retriever=self.vector_retriever,
                 rrf_k=self.rrf_k,
-                rerank_top_k=self.fast_retrieve_top_k,
+                result_limit=self.fast_retrieve_top_k,
                 bm25_weight=0.0,
                 vector_weight=1.0,
             )
@@ -329,7 +209,7 @@ class RagSummarizeService:
                 bm25_retriever=None,
                 vector_retriever=self.vector_retriever,
                 rrf_k=self.rrf_k,
-                rerank_top_k=self.full_retrieve_top_k,
+                result_limit=self.full_retrieve_top_k,
                 bm25_weight=0.0,
                 vector_weight=1.0,
             )
@@ -348,19 +228,6 @@ class RagSummarizeService:
             "原问题: {question}"
         )
         self.rewrite_chain = rewrite_prompt | light_chat_model | StrOutputParser()
-
-        # --- 步骤三：打包装配最终总结的 Chain ---
-        self.prompt_text = load_rag_prompts()
-        self.prompt_template = PromptTemplate.from_template(self.prompt_text)
-        self.model = chat_model
-        self.prompt_version = hashlib.md5(self.prompt_text.encode("utf-8")).hexdigest()[:10]
-        self.model_tag = self._resolve_model_tag(self.model)
-        self.chain = self._init_chain()
-
-    def _init_chain(self):
-        """最终问答总结链：把检索上下文交给主模型生成回答。"""
-        chain = self.prompt_template | self.model | StrOutputParser()
-        return chain
 
     async def retriever_docs(self, query: str, profile: str = "full") -> list[Document]:
         """按检索档位调用 retriever（`fast` 或 `full`）。"""
@@ -402,7 +269,7 @@ class RagSummarizeService:
                 if fname.startswith("."):
                     continue
                 base, ext = os.path.splitext(fname)
-                if ext.lower() not in {".pdf", ".docx", ".doc", ".txt", ".ppt", ".pptx", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}:
+                if ext.lower() not in {".pdf", ".docx", ".txt", ".pptx", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}:
                     continue
                 cleaned = str(base).replace("_", " ").replace("-", " ")
                 for token in cleaned.split():
@@ -449,28 +316,14 @@ class RagSummarizeService:
             "fast_final_k": int(self.fast_final_top_k),
             "full_top_k": int(self.full_retrieve_top_k),
             "full_final_k": int(self.full_final_top_k),
+            "rerank_enabled": self.rerank_enabled,
+            "rerank_model": self.rerank_model,
+            "parent_context_fast_k": self.parent_context_fast_k,
+            "parent_context_full_k": self.parent_context_full_k,
             "source_cap": 2,
         }
         raw = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.md5(raw.encode("utf-8")).hexdigest()[:10]
-
-    @staticmethod
-    def _resolve_model_tag(model_obj: Any) -> str:
-        """提取模型标识，失败时回退到类名。"""
-        for attr in ("model", "model_name", "model_id"):
-            value = str(getattr(model_obj, attr, "") or "").strip()
-            if value:
-                return value
-        return model_obj.__class__.__name__
-
-    def _build_answer_cache_scope(self) -> str:
-        """构造答案缓存作用域，隔离模型/提示词/知识库版本差异。"""
-        return (
-            f"kb:{self._get_kb_version()}"
-            f"|model:{self.model_tag or self._resolve_model_tag(self.model)}"
-            f"|prompt:{self.prompt_version}"
-            f"|retr:{self._retrieve_config_signature}"
-        )
 
     def _build_context_cache_key(self, query: str, mode: str) -> str:
         """构造检索上下文缓存键：`session + mode + normalized_query + kb_version + top_k签名`。"""
@@ -526,14 +379,33 @@ class RagSummarizeService:
             seen.add(norm)
             anchors.append(t)
 
+        # 疑问/停用/虚词：剥离后不留下检索价值，避免把「讲了什么/是什么」当锚点
+        _cjk_stop = re.compile(
+            r"什么|怎么|如何|为什么|为啥|哪些|哪项|哪一|哪个|哪|"
+            r"吗|呢|啊|吧|哦|呀|"
+            r"讲了|讲什么|讲一下|介绍|介绍一下|解释|说说|说明|简述|描述|"
+            r"是什么|有哪些|有什么|有没有|是不是|"
+            r"一下|帮我|请问|"
+            r"的|了|是|在|有|和|与|及|或|这|那"
+        )
+
+        def _clean_cjk(segment: str) -> str:
+            return _cjk_stop.sub("", str(segment or "")).strip()
+
         for m in re.findall(r"`([^`]{1,80})`", text):
             _add(m)
         for m in re.findall(r"\bgit\s+[a-zA-Z0-9][a-zA-Z0-9\-]*(?:\s+--?[a-zA-Z0-9\-]+)*", text, flags=re.IGNORECASE):
             _add(m)
-        for m in re.findall(r"\b[A-Za-z][A-Za-z0-9_/\-]{1,}\b", text):
+        for m in re.findall(r"\b[A-Za-z][A-Za-z0-9_/\-]{1,}\b", text, flags=re.ASCII):
             _add(m)
+        # 结构锚点：第 N 章/节/部分/讲/篇/单元（如「第3章」「第 3 节」）
+        for m in re.findall(r"第\s*[0-9零一二三四五六七八九十百]+\s*[章节部分讲篇单元]", text):
+            _add(re.sub(r"\s+", "", m))
+        # 中文片段：剥离疑问/停用词后仍保留 ≥2 个实词字符才作为锚点
         for m in re.findall(r"[\u4e00-\u9fa5]{2,10}", text):
-            _add(m)
+            cleaned = _clean_cjk(m)
+            if len(cleaned) >= 2:
+                _add(cleaned)
 
         return anchors[:10]
 
@@ -667,75 +539,60 @@ class RagSummarizeService:
             picked.extend(overflow[:need])
         return picked[:final_limit]
 
-    async def _rerank(self, query: str, docs: list[Document]) -> list[Document]:
-        """
-        使用 LLM 对检索结果重排序（fix #9：改为 async，使用 ainvoke 避免阻塞 event loop）
-        529错误时快速失败，避免长时间等待
-        """
-        if not docs or len(docs) <= 1:
+    async def _rerank_documents(self, query: str, docs: List[Document], top_n: int, trace: List[Dict[str, Any]]) -> List[Document]:
+        """Use DashScope rerank on the small RRF candidate set; fail open to RRF order."""
+        api_key = os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("QWEN_API_KEY")
+        if not self.rerank_enabled or not api_key or not docs:
+            trace.append({"stage": "rerank", "status": "skipped", "reason": "disabled_or_missing_key"})
             return docs
-
         try:
-            doc_texts = "\n\n".join([
-                f"【文档{i+1}】{doc.page_content[:500]}"
-                for i, doc in enumerate(docs)
-            ])
+            from dashscope import TextReRank
+            texts = [str(doc.page_content or "")[:6000] for doc in docs]
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    TextReRank.call,
+                    model=self.rerank_model,
+                    query=str(query),
+                    documents=texts,
+                    top_n=min(max(1, int(top_n)), len(docs)),
+                    return_documents=False,
+                    api_key=api_key,
+                ),
+                timeout=self.rerank_timeout_seconds,
+            )
+            output = getattr(response, "output", None) or {}
+            results = output.get("results", []) if isinstance(output, dict) else []
+            ranked: List[Document] = []
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                idx = item.get("index")
+                if isinstance(idx, int) and 0 <= idx < len(docs):
+                    doc = docs[idx]
+                    meta = dict(doc.metadata or {})
+                    meta["rerank_score"] = item.get("relevance_score")
+                    ranked.append(Document(page_content=doc.page_content, metadata=meta))
+            if ranked:
+                trace.append({"stage": "rerank", "status": "success", "model": self.rerank_model, "candidate_count": len(docs), "selected_count": len(ranked)})
+                return ranked
+            trace.append({"stage": "rerank", "status": "empty", "model": self.rerank_model})
+        except Exception as exc:
+            trace.append({"stage": "rerank", "status": "failed", "model": self.rerank_model, "error": str(exc)[:240]})
+            logger.warning(f"[RAG] rerank failed, fallback RRF: {exc}")
+        return docs
 
-            rerank_prompt = f"""请根据用户问题，对以下文档进行相关性排序。
-
-用户问题：{query}
-
-文档列表：
-{doc_texts}
-
-请按相关性从高到低排序，返回文档编号列表（格式：1, 2, 3... 只返回编号列表，不需要其他内容）。"""
-
-            # 用 asyncio.wait_for 加 3 秒超时（原10秒太长，10个topic浪费100秒），529 错误快速失败
-            try:
-                response = await asyncio.wait_for(
-                    light_chat_model.ainvoke(rerank_prompt),
-                    timeout=3.0
-                )
-            except asyncio.TimeoutError:
-                logger.warning("[LLM Rerank] 超时（3秒），跳过重排")
-                return docs[:self.final_top_k]
-            except Exception as e:
-                # 529 等 API 错误快速失败
-                if '529' in str(e) or 'overloaded' in str(e).lower():
-                    logger.warning(f"[LLM Rerank] API 过载（529），跳过重排")
-                else:
-                    logger.warning(f"[LLM Rerank] 调用失败: {e}")
-                return docs[:self.final_top_k]
-
-            ranking = response.content.strip()
-
-            try:
-                ranks = [int(x.strip()) for x in ranking.split(",") if x.strip().isdigit()]
-                if ranks:
-                    reranked = []
-                    for rank in ranks:
-                        if 0 < rank <= len(docs):
-                            reranked.append(docs[rank - 1])
-                    for doc in docs:
-                        if doc not in reranked:
-                            reranked.append(doc)
-                    print(f"[LLM Rerank] 原始 {len(docs)} 个 -> 重排后 {len(reranked)} 个")
-                    return reranked[:self.final_top_k]
-            except Exception:  # fix #15：不用裸 except
-                pass
-
-            return docs[:self.final_top_k]
-
-        except Exception as e:
-            logger.warning(f"[LLM Rerank] 重排序失败: {e}")
-            return docs[:self.final_top_k]
-
-    async def retrieve_context(self, query: str, mode: str = "rag_chat") -> str:
+    async def retrieve_context(
+        self,
+        query: str,
+        mode: str = "rag_chat",
+        trace: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
         """
         只做检索，返回格式化后的原始课件片段字符串，不调用最终 LLM。
         供 Supervisor RAG SubAgent 使用，避免双重 LLM 调用。
         """
         retrieve_start = time.time()
+        trace = trace if trace is not None else []
         rag_inc("rag_retrieve_calls", 1)
         cache_eligible = (mode == "rag_chat")
         # 仅 rag_chat 走上下文缓存：quiz/exam 侧通常希望实时检索，不复用旧上下文。
@@ -747,31 +604,60 @@ class RagSummarizeService:
                 rag_inc("rag_retrieve_cache_hit", 1)
             rag_append_sample("rag_retrieve_latency_samples_ms", int((time.time() - retrieve_start) * 1000))
             logger.info(f"[RAG] retrieve_context 缓存命中 mode={mode}, len={len(cached_context)}")
+            trace.append({
+                "stage": "cache_lookup",
+                "status": "hit",
+                "mode": mode,
+                "duration_ms": int((time.time() - retrieve_start) * 1000),
+            })
+            trace.append({
+                "stage": "finalize",
+                "status": "success",
+                "profile": "cache",
+                "selected_chunks": [],
+                "duration_ms": int((time.time() - retrieve_start) * 1000),
+            })
             return cached_context
         if cache_eligible:
             rag_inc("rag_retrieve_cache_miss", 1)
 
+        rewrite_start = time.time()
+        rewrite_status = "success"
+        guard_applied = False
         try:
             rewritten = await asyncio.wait_for(
                 self.rewrite_chain.ainvoke({"question": query}),
-                timeout=3.0,
+                timeout=self.query_rewrite_timeout_seconds,
             )
             # 改写后再过 guard，防止关键词“改飞”导致召回偏移。
             expanded_query = self._rewrite_guard(query, rewritten)
-            if self._normalize_query(expanded_query) != self._normalize_query(str(rewritten or "")):
+            guard_applied = self._normalize_query(expanded_query) != self._normalize_query(str(rewritten or ""))
+            if guard_applied:
                 logger.info(f"[RAG] rewrite_guard 生效，补齐关键锚点。query={str(query)[:80]}")
         except Exception:
             expanded_query = query
+            rewrite_status = "fallback"
+        trace.append({
+            "stage": "query_rewrite",
+            "status": rewrite_status,
+            "original_query": str(query),
+            "rewritten_query": str(expanded_query),
+            "guard_applied": guard_applied,
+            "duration_ms": int((time.time() - rewrite_start) * 1000),
+        })
 
         profile = self._select_profile(query)
         _, profile_final_k = self._profile_limits(profile)
 
         context_docs: List[Document] = []
+        retrieval_succeeded = False
+        hybrid_start = time.time()
         try:
             context_docs = await asyncio.wait_for(
                 self.retriever_docs(expanded_query, profile=profile),
                 timeout=8.0,
             )
+            retrieval_succeeded = True
         except Exception as e:
             logger.warning(f"[RAG] retrieve_context 主查询失败，进入回退检索: {e}")
             fallback_queries: List[str] = []
@@ -781,11 +667,21 @@ class RagSummarizeService:
             for fq in fallback_queries:
                 try:
                     context_docs = await asyncio.wait_for(self.retriever_docs(fq, profile=profile), timeout=6.0)
+                    retrieval_succeeded = True
                     if context_docs:
                         logger.info(f"[RAG] retrieve_context 回退检索成功: {fq[:80]}")
                         break
                 except Exception:
                     continue
+        trace.append({
+            "stage": "hybrid_retrieval",
+            "status": "success" if retrieval_succeeded else "failed",
+            "profile": profile,
+            "bm25_candidates": sum(1 for doc in context_docs if (doc.metadata or {}).get("bm25_rank")),
+            "vector_candidates": sum(1 for doc in context_docs if (doc.metadata or {}).get("vector_rank")),
+            "fused_candidates": len(context_docs),
+            "duration_ms": int((time.time() - hybrid_start) * 1000),
+        })
 
         # 低延迟优先：fast 档命中不足或来源过于单一时升级 full 档重试
         unique_sources = self._count_unique_sources(context_docs)
@@ -801,8 +697,16 @@ class RagSummarizeService:
             logger.info(
                 f"[RAG] fast 档触发升级（{', '.join(reason)}），升级 full 档重试"
             )
+            trace.append({
+                "stage": "profile_escalation",
+                "status": "triggered",
+                "from": "fast",
+                "to": "full",
+                "reason": reason,
+            })
             try:
                 full_docs = await asyncio.wait_for(self.retriever_docs(expanded_query, profile="full"), timeout=6.0)
+                retrieval_succeeded = True
                 if full_docs:
                     context_docs = full_docs
                 profile = "full"
@@ -818,6 +722,7 @@ class RagSummarizeService:
                 self.refresh(invalidate_cache=False)
                 try:
                     context_docs = await asyncio.wait_for(self.retriever_docs(expanded_query, profile=profile), timeout=6.0)
+                    retrieval_succeeded = True
                     if context_docs:
                         logger.info("[RAG] ingest processing wait-retry 命中结果")
                         break
@@ -828,17 +733,52 @@ class RagSummarizeService:
             # 仅低召回触发 HyDE，避免每次都增加额外延迟。
             rag_inc("hyde_trigger_count", 1)
             hyde_query = await self._generate_hyde_query(query, expanded_query)
+            hyde_added = 0
             if hyde_query:
                 try:
                     hyde_docs = await asyncio.wait_for(self.vector_retriever.ainvoke(hyde_query), timeout=6.0)
                 except Exception:
                     hyde_docs = []
                 if hyde_docs:
+                    before_hyde = len(context_docs)
                     context_docs = self._merge_ranked_doc_lists(
                         [(context_docs, 1.0), (hyde_docs, 0.8)],
                         rrf_k=self.rrf_k,
                     )
+                    hyde_added = max(0, len(context_docs) - before_hyde)
                     logger.info(f"[RAG] HyDE 补召回命中 docs={len(hyde_docs)}")
+            trace.append({
+                "stage": "hyde",
+                "status": "success" if hyde_added else "empty",
+                "triggered": True,
+                "added_candidates": hyde_added,
+            })
+
+        # RRF 先缩小候选集，再调用重排模型，避免对整库逐条打分。
+        if context_docs:
+            context_docs = await self._rerank_documents(
+                query,
+                context_docs,
+                top_n=profile_final_k,
+                trace=trace,
+            )
+
+        # 检索与重排都在细粒度子块上完成，生成前再回溯完整父块。
+        if context_docs:
+            child_count = len(context_docs)
+            parent_limit = self.parent_context_full_k if profile == "full" else self.parent_context_fast_k
+            context_docs = self.vector_store_service.expand_parent_documents(
+                context_docs,
+                limit=parent_limit,
+            )
+            trace.append({
+                "stage": "parent_expansion",
+                "status": "success" if context_docs else "empty",
+                "child_count": child_count,
+                "parent_count": len(context_docs),
+                "parent_limit": parent_limit,
+            })
+            profile_final_k = min(profile_final_k, parent_limit)
 
         # 泛化提问：保留前部高相关锚点，再对候选尾部做随机化
         if context_docs and self._is_generic_query(query):
@@ -852,9 +792,6 @@ class RagSummarizeService:
                 rng = random.Random(rng_seed)
                 rng.shuffle(tail)
             context_docs = (anchors + tail)[: profile_final_k]
-        # 跳过 LLM rerank（rerank 每次都超时 3 秒，10 个 topic 浪费 ~30 秒，且效果不明显）
-        # RRF 检索结果已经足够好
-
         # 来源多样性约束：单来源最多保留 2 条，不足则回填。
         context_docs = self._apply_source_cap(context_docs, final_limit=profile_final_k, per_source_cap=2)
 
@@ -867,51 +804,33 @@ class RagSummarizeService:
             self._set_cached_context(query, mode, context)
 
         rag_append_sample("rag_retrieve_latency_samples_ms", int((time.time() - retrieve_start) * 1000))
+        selected_chunks = []
+        for doc in context_docs:
+            meta = doc.metadata or {}
+            selected_chunks.append({
+                "chunk_id": str(meta.get("chunk_id") or meta.get("retrieval_chunk_id") or ""),
+                "parent_id": str(meta.get("parent_id") or ""),
+                "matched_child_id": str(meta.get("matched_child_id") or ""),
+                "source": self._get_doc_source(doc),
+                "page": meta.get("page"),
+                "page_start": meta.get("page_start"),
+                "page_end": meta.get("page_end"),
+                "chapter": meta.get("chapter"),
+                "section": meta.get("section"),
+                "content_type": meta.get("content_type"),
+                "bm25_rank": meta.get("bm25_rank"),
+                "vector_rank": meta.get("vector_rank"),
+                "rrf_score": meta.get("rrf_score"),
+                "rerank_score": meta.get("rerank_score"),
+            })
+        trace.append({
+            "stage": "finalize",
+            "status": "success" if context_docs else ("empty" if retrieval_succeeded else "failed"),
+            "profile": profile,
+            "selected_chunks": selected_chunks,
+            "duration_ms": int((time.time() - retrieve_start) * 1000),
+        })
         logger.info(
             f"[RAG] retrieve_context 完成 mode={mode}, profile={profile}, docs={len(context_docs)}, context_len={len(context)}"
         )
         return context
-
-    async def rag_summarize(self, query: str) -> str:
-        """完整 RAG 问答链（检索 + 总结），会写入语义缓存。"""
-        session_id = current_session_id.get() or "default"
-        cache_scope = self._build_answer_cache_scope()
-
-        cached = await self.semantic_cache.get(query, session_id, scope_key=cache_scope)
-        if cached is not None:
-            return cached
-
-        # [高级流机制1] Query Rewrite
-        try:
-            expanded_query = await self.rewrite_chain.ainvoke({"question": query})
-            print(f"[Query Rewrite] 改写前: {query} -> 改写后: {expanded_query}")
-        except Exception as e:
-            # 兼容：如果大模型临时阻断，依然跑原始query
-            print(f"[Query Rewrite error] {e}")
-            expanded_query = query
-
-        # [高级流机制2] 带着重写好的搜索词去执行混合检索
-        context_docs = await self.retriever_docs(expanded_query)
-
-        # [高级流机制3] Cross-Encoder 重排序，精筛 Top 3
-        # 跳过 LLM rerank（rerank 每次都超时 3 秒，10 个 topic 浪费 ~30 秒，且效果不明显）
-        # RRF 检索结果已经足够好
-
-        context = ""
-        counter = 0
-        for doc in context_docs:
-            counter += 1
-            # 将文档的元数据合并上，这会在最后出处呈现上发挥大作用
-            context += f"[参考资料{counter}]:参考资料:{doc.page_content}|参考元数据:{doc.metadata}\n"
-
-        response = await self.chain.ainvoke(
-            {"input": query,
-             "context": context,
-             }
-        )
-        self.semantic_cache.set(query, response, session_id, scope_key=cache_scope)
-        return response
-
-if __name__ == "__main__":
-    rag_service = RagSummarizeService()
-    print(rag_service.rag_summarize("帮我复习一下第三章的核心考点是什么"))

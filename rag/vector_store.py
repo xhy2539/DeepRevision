@@ -13,6 +13,7 @@ from utils.path_tool import get_abs_path
 from utils.file_handler import pdf_loader, txt_loader, ppt_loader, image_loader, word_loader, listdir_with_allowed_type, get_file_md5_hex
 from utils.logger_handler import logger
 from utils.session_context import current_session_id
+from rag.hierarchical_chunker import HierarchicalChunker
 import shutil
 
 
@@ -21,6 +22,8 @@ class VectorStoreService():
     MAX_CONCURRENT_IMAGES = 5
 
     def __init__(self):
+        if embed_model is None:
+            raise RuntimeError("课件向量功能需要 DASHSCOPE_API_KEY 或 QWEN_API_KEY")
         self.session_id = current_session_id.get()
         self._image_semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_IMAGES)
         _md5 = hashlib.md5(self.session_id.encode("utf-8")).hexdigest()[:16]
@@ -41,9 +44,11 @@ class VectorStoreService():
                 separators=chroma_conf['separators'],
                 length_function=len,
             )
+            self.hierarchical_chunker = HierarchicalChunker(chroma_conf)
             self.session_data_path = os.path.join(get_abs_path(chroma_conf['data_path']), self.session_id)
             self.session_md5_path = os.path.join(self.session_data_path, chroma_conf['md5_hex_store'])
             self._file_vector_map_path = os.path.join(self.session_data_path, '.file_vector_map.json')
+            self._parent_store_path = os.path.join(self.session_data_path, '.parent_documents.json')
         except Exception as e:
             logger.error(f"初始化向量库失败: {e}")
             raise
@@ -103,6 +108,83 @@ class VectorStoreService():
         with open(self._file_vector_map_path, "w", encoding="utf-8") as f:
             json.dump(mapping, f, ensure_ascii=False)
 
+    def _load_parent_store(self) -> Dict[str, Dict]:
+        if not os.path.exists(self._parent_store_path):
+            return {}
+        try:
+            with open(self._parent_store_path, "r", encoding="utf-8") as f:
+                payload = json.load(f) or {}
+            parents = payload.get("parents", payload) if isinstance(payload, dict) else {}
+            return parents if isinstance(parents, dict) else {}
+        except Exception as exc:
+            logger.warning(f"[父文档存储] 读取失败，将按空存储处理: {exc}")
+            return {}
+
+    def _save_parent_store(self, parents: Dict[str, Dict]) -> None:
+        os.makedirs(self.session_data_path, exist_ok=True)
+        temp_path = self._parent_store_path + ".tmp"
+        payload = {"schema_version": 2, "parents": parents}
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(temp_path, self._parent_store_path)
+
+    def _replace_file_parents(self, filename: str, parent_documents: List[Document]) -> None:
+        store = self._load_parent_store()
+        store = {
+            parent_id: item
+            for parent_id, item in store.items()
+            if str((item.get("metadata", {}) or {}).get("source_filename", "")) != filename
+        }
+        for parent in parent_documents:
+            parent_id = str(parent.id or (parent.metadata or {}).get("parent_id") or "")
+            if not parent_id:
+                continue
+            store[parent_id] = {
+                "page_content": str(parent.page_content or ""),
+                "metadata": dict(parent.metadata or {}),
+            }
+        self._save_parent_store(store)
+
+    def _delete_file_parents(self, filename: str) -> None:
+        store = self._load_parent_store()
+        filtered = {
+            parent_id: item
+            for parent_id, item in store.items()
+            if str((item.get("metadata", {}) or {}).get("source_filename", "")) != filename
+        }
+        if len(filtered) != len(store):
+            self._save_parent_store(filtered)
+
+    def expand_parent_documents(self, child_documents: List[Document], limit: Optional[int] = None) -> List[Document]:
+        """Replace ranked child hits with their stored parents while preserving scores."""
+        store = self._load_parent_store()
+        expanded: List[Document] = []
+        seen_parent_ids = set()
+        for child in child_documents or []:
+            child_meta = dict(child.metadata or {})
+            parent_id = str(child_meta.get("parent_id") or "")
+            item = store.get(parent_id) if parent_id else None
+            dedupe_key = parent_id or str(child_meta.get("chunk_id") or child_meta.get("retrieval_chunk_id") or child.page_content)
+            if dedupe_key in seen_parent_ids:
+                continue
+            seen_parent_ids.add(dedupe_key)
+            if item:
+                metadata = dict(item.get("metadata", {}) or {})
+                for key in ("bm25_rank", "vector_rank", "rrf_score", "rerank_score", "retrieval_chunk_id"):
+                    if key in child_meta:
+                        metadata[key] = child_meta[key]
+                metadata["matched_child_id"] = str(child_meta.get("chunk_id") or child_meta.get("retrieval_chunk_id") or "")
+                metadata["matched_child_excerpt"] = str(child.page_content or "")[:240]
+                metadata["expanded_from_child"] = True
+                expanded.append(Document(id=parent_id, page_content=str(item.get("page_content", "")), metadata=metadata))
+            else:
+                # Backward compatibility for vectors created before parent/child indexing.
+                child_meta["expanded_from_child"] = False
+                expanded.append(Document(page_content=child.page_content, metadata=child_meta))
+            if limit and len(expanded) >= limit:
+                break
+        return expanded
+
     async def delete_file_vectors(self, filename: str) -> bool:
         mapping = self._load_file_vector_map()
         if filename not in mapping:
@@ -125,6 +207,7 @@ class VectorStoreService():
                 self.vector_store.delete(ids=doc_ids)
             del mapping[filename]
             self._save_file_vector_map(mapping)
+            self._delete_file_parents(filename)
             if shared_with_others:
                 logger.info(f"[删除向量] 文件 {filename} 与其他文件共享向量，已仅移除映射")
             else:
@@ -147,11 +230,13 @@ class VectorStoreService():
                 logger.info(f"[向量重建] 映射缺失，按 source_filename 条件清理: file={filename}")
             except Exception:
                 pass
+            self._delete_file_parents(filename)
             return
         try:
             self.vector_store.delete(ids=old_ids)
             mapping.pop(filename, None)
             self._save_file_vector_map(mapping)
+            self._delete_file_parents(filename)
             logger.info(f"[向量重建] 已清理旧向量: file={filename}, chunks={len(old_ids)}")
         except Exception as e:
             logger.warning(f"[向量重建] 清理旧向量失败 file={filename}: {e}")
@@ -185,9 +270,9 @@ class VectorStoreService():
                 return txt_loader(read_path)
             elif ext == ".pdf":
                 return pdf_loader(read_path)
-            elif ext in {".docx", ".doc"}:
+            elif ext == ".docx":
                 return word_loader(read_path)
-            elif ext in {".pptx", ".ppt"}:
+            elif ext == ".pptx":
                 return ppt_loader(read_path)
             elif ext in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}:
                 return image_loader(read_path)
@@ -199,6 +284,14 @@ class VectorStoreService():
             图片字节暂存在 metadata['_image_blobs']，处理后追加到 page_content 并清除。
             """
             from utils.file_handler import _summarize_image
+
+            # 离线评测或大批量导入时可关闭视觉增强，避免每张图片触发一次模型调用。
+            if str(os.environ.get("DEEPREVISION_DISABLE_IMAGE_ENRICHMENT", "0")).lower() in {"1", "true", "yes"}:
+                for doc in documents:
+                    doc.metadata.pop("_image_blobs", None)
+                    doc.metadata.pop("_slide_context", None)
+                logger.info("[图片增强] 已按环境变量关闭")
+                return documents
 
             async def _describe_one(blob: bytes, context: str, label: str) -> str:
                 # 用 Semaphore 控制并发，避免触发 API rate limit
@@ -273,24 +366,45 @@ class VectorStoreService():
                 # 并发处理图片（PPT/PDF 中的图片字节暂存在 metadata）
                 documents = await _enrich_images(documents)
 
-                split_document = self.spliter.split_documents(documents)
+                document_id = f"doc_{md5_hex[:16]}"
+                if bool(chroma_conf.get("hierarchical_index_enabled", True)):
+                    parent_documents, split_document = self.hierarchical_chunker.build(
+                        documents,
+                        filename=fname,
+                        document_id=document_id,
+                    )
+                else:
+                    parent_documents = []
+                    split_document = self.spliter.split_documents(documents)
+                    for idx, doc in enumerate(split_document):
+                        doc.id = f"vec_{hashlib.md5(fname.encode()).hexdigest()[:8]}_{idx}"
+                        doc.metadata.update({
+                            "document_id": document_id,
+                            "chunk_id": doc.id,
+                            "chunk_type": "child",
+                            "source_filename": fname,
+                            "metadata_schema_version": 2,
+                        })
                 if not split_document:
                     logger.info(f"[加载知识库]{path}分片内无有效内容，跳过")
                     result_map[fname] = {"status": "failed", "detail": "文档分片后无有效内容"}
                     continue
 
-                # 为每个 chunk 生成确定性ID（包含文件名），便于后续追踪删除
-                for idx, doc in enumerate(split_document):
-                    doc.id = f"vec_{hashlib.md5(fname.encode()).hexdigest()[:8]}_{idx}"
-                    doc.metadata["source_filename"] = fname
-
                 self.vector_store.add_documents(split_document)
+                self._replace_file_parents(fname, parent_documents)
                 # 记录文件→向量ID映射
                 doc_ids = [doc.id for doc in split_document]
                 update_file_vector_map(fname, doc_ids)
                 save_md5_hex(md5_hex)
-                logger.info(f"[加载知识库]{path}加载成功，共 {len(split_document)} 个chunk")
-                result_map[fname] = {"status": "completed", "detail": f"向量化完成，共{len(split_document)}个片段"}
+                logger.info(
+                    f"[加载知识库]{path}加载成功，父块={len(parent_documents)}，子块={len(split_document)}"
+                )
+                result_map[fname] = {
+                    "status": "completed",
+                    "detail": f"父子索引完成，共{len(parent_documents)}个父块、{len(split_document)}个子块",
+                    "parent_count": len(parent_documents),
+                    "child_count": len(split_document),
+                }
             except Exception as e:
                 logger.error(f"[加载知识库]{path}加载失败: {e}", exc_info=True)
                 result_map[fname] = {"status": "failed", "detail": f"解析失败: {str(e)}"}

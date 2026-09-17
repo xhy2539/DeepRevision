@@ -1,18 +1,12 @@
 import os
+import httpx
 from abc import ABC, abstractmethod
 from typing import Optional
 from pathlib import Path
 
-# 禁用代理，避免 VPN/代理软件干扰
-os.environ.pop('http_proxy', None)
-os.environ.pop('https_proxy', None)
-os.environ.pop('HTTP_PROXY', None)
-os.environ.pop('HTTPS_PROXY', None)
-
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
-from langchain_openai import ChatOpenAI
-from langchain_community.embeddings import DashScopeEmbeddings
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 from utils.config_handler import rag_conf
 from utils.logger_handler import logger
@@ -99,9 +93,83 @@ class LightChatModelFactory(BaseModelFactory):
         return model
 
 
+class DeepSeekChatModelFactory(BaseModelFactory):
+    def generate(self) -> Optional[BaseChatModel]:
+        api_key = os.environ.get("DEEPSEEK_API_KEY")
+        if not api_key:
+            return None
+        return ChatOpenAI(
+            model=os.environ.get("DEEPSEEK_CHAT_MODEL", "deepseek-v4-pro"),
+            api_key=api_key,
+            base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+            timeout=60,
+            max_retries=0,
+            max_tokens=rag_conf.get("max_tokens", 8192),
+        )
+
+
+class DeepSeekLightChatModelFactory(BaseModelFactory):
+    def generate(self) -> Optional[BaseChatModel]:
+        api_key = os.environ.get("DEEPSEEK_API_KEY")
+        if not api_key:
+            return None
+        return ChatOpenAI(
+            model=os.environ.get("DEEPSEEK_LIGHT_MODEL", "deepseek-v4-flash"),
+            api_key=api_key,
+            base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+            timeout=30,
+            max_retries=0,
+            max_tokens=2048,
+        )
+
+
+class TokenPlanChatModelFactory(BaseModelFactory):
+    """Alibaba Cloud Model Studio Token Plan (text generation only)."""
+
+    def generate(self) -> Optional[BaseChatModel]:
+        api_key = os.environ.get("TOKEN_PLAN_API_KEY")
+        if not api_key:
+            return None
+        return ChatOpenAI(
+            model=os.environ.get("TOKEN_PLAN_CHAT_MODEL", "qwen3.8-max"),
+            api_key=api_key,
+            base_url=os.environ.get(
+                "TOKEN_PLAN_BASE_URL",
+                "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+            ),
+            timeout=60,
+            max_retries=0,
+            max_tokens=rag_conf.get("max_tokens", 8192),
+            http_client=httpx.Client(trust_env=False),
+            http_async_client=httpx.AsyncClient(trust_env=False),
+        )
+
+
+class TokenPlanLightChatModelFactory(BaseModelFactory):
+    def generate(self) -> Optional[BaseChatModel]:
+        api_key = os.environ.get("TOKEN_PLAN_API_KEY")
+        if not api_key:
+            return None
+        return ChatOpenAI(
+            model=os.environ.get("TOKEN_PLAN_LIGHT_MODEL", "qwen3.8-flash"),
+            api_key=api_key,
+            base_url=os.environ.get(
+                "TOKEN_PLAN_BASE_URL",
+                "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+            ),
+            timeout=30,
+            max_retries=0,
+            max_tokens=2048,
+            http_client=httpx.Client(trust_env=False),
+            http_async_client=httpx.AsyncClient(trust_env=False),
+        )
+
+
 class BackupChatModelFactory(BaseModelFactory):
     def generate(self) -> Optional[BaseChatModel]:
-        api_key = os.environ.get("QWEN_API_KEY") or os.environ.get("DASHSCOPE_API_KEY")
+        # QWEN_API_KEY explicitly enables Qwen chat. DASHSCOPE_API_KEY may be an
+        # embedding-only workspace key and must not silently alter failover order.
+        api_key = os.environ.get("QWEN_API_KEY")
         if not api_key:
             return None
         model_name = os.environ.get("QWEN_CHAT_MODEL", "qwen-plus")
@@ -118,7 +186,7 @@ class BackupChatModelFactory(BaseModelFactory):
 
 class BackupLightChatModelFactory(BaseModelFactory):
     def generate(self) -> Optional[BaseChatModel]:
-        api_key = os.environ.get("QWEN_API_KEY") or os.environ.get("DASHSCOPE_API_KEY")
+        api_key = os.environ.get("QWEN_API_KEY")
         if not api_key:
             return None
         model_name = os.environ.get("QWEN_LIGHT_MODEL", "qwen-turbo")
@@ -135,7 +203,21 @@ class BackupLightChatModelFactory(BaseModelFactory):
 class EmbeddingsFactory(BaseModelFactory):
     def generate(self) -> Optional[Embeddings | BaseChatModel]:
         api_key = os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("QWEN_API_KEY")
-        return DashScopeEmbeddings(model=rag_conf['embedding_model_name'], dashscope_api_key=api_key)
+        if not api_key:
+            return None
+        return OpenAIEmbeddings(
+            model=rag_conf["embedding_model_name"],
+            api_key=api_key,
+            base_url=rag_conf.get(
+                "embedding_base_url",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            ),
+            dimensions=int(rag_conf.get("embedding_dimensions", 1024)),
+            check_embedding_ctx_length=False,
+            chunk_size=int(rag_conf.get("embedding_batch_size", 20)),
+            http_client=httpx.Client(trust_env=False),
+            http_async_client=httpx.AsyncClient(trust_env=False),
+        )
 
 
 class VisionModelFactory(BaseModelFactory):
@@ -143,16 +225,25 @@ class VisionModelFactory(BaseModelFactory):
         vision_model_name = rag_conf.get('vision_model_name', 'qwen-vl-max')
         # 千问模型使用 DashScope API (直接用 OpenAI 兼容接口)
         if 'qwen' in vision_model_name.lower():
-            api_key = os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("QWEN_API_KEY")
+            # Vision is opt-in and uses its own credential. An embedding-only
+            # workspace key must never trigger potentially expensive image calls.
+            api_key = os.environ.get("VISION_API_KEY")
+            if not api_key:
+                return None
             return ChatOpenAI(
                 model=vision_model_name,
                 api_key=api_key,
-                base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                base_url=os.environ.get(
+                    "VISION_BASE_URL",
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                ),
                 timeout=120,
                 max_retries=3,
             )
         else:
             # MiniMax 模型
+            if not os.environ.get("MINIMAX_API_KEY"):
+                return None
             return ChatOpenAI(
                 model=vision_model_name,
                 api_key=os.environ.get("MINIMAX_API_KEY"),
@@ -163,23 +254,15 @@ class VisionModelFactory(BaseModelFactory):
 
 
 def _validate_env():
-    """启动前校验必需的环境变量（fix #8）"""
-    missing = []
+    """启动前校验至少存在一个可用的聊天模型密钥。"""
     minimax_key = os.environ.get("MINIMAX_API_KEY", "")
     qwen_key = os.environ.get("QWEN_API_KEY", "") or os.environ.get("DASHSCOPE_API_KEY", "")
-    if not minimax_key and not qwen_key:
-        missing.append("MINIMAX_API_KEY/QWEN_API_KEY")
-    if minimax_key:
-        # 打印 API key 前缀用于调试（不打印完整 key）
-        key_prefix = minimax_key[:8] if len(minimax_key) > 8 else "***"
-        print(f"[模型工厂] MiniMax Key 前缀: {key_prefix}..., 长度: {len(minimax_key)}")
-    if qwen_key:
-        qwen_prefix = qwen_key[:8] if len(qwen_key) > 8 else "***"
-        print(f"[模型工厂] Qwen Key 前缀: {qwen_prefix}..., 长度: {len(qwen_key)}")
-    if missing:
+    token_plan_key = os.environ.get("TOKEN_PLAN_API_KEY", "")
+    deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    if not minimax_key and not qwen_key and not token_plan_key and not deepseek_key:
         raise EnvironmentError(
-            f"缺少必需的环境变量：{', '.join(missing)}。"
-            f"请在 .env 文件中配置后重启服务。"
+            "缺少聊天模型密钥：请配置 MINIMAX_API_KEY、TOKEN_PLAN_API_KEY、"
+            "QWEN_API_KEY/DASHSCOPE_API_KEY 或 DEEPSEEK_API_KEY 后重启服务。"
         )
 
 
@@ -188,29 +271,39 @@ try:
     _validate_env()
     minimax_chat_model = ChatModelFactory().generate() if os.environ.get("MINIMAX_API_KEY") else None
     minimax_light_model = LightChatModelFactory().generate() if os.environ.get("MINIMAX_API_KEY") else None
+    token_plan_chat_model = TokenPlanChatModelFactory().generate()
+    token_plan_light_model = TokenPlanLightChatModelFactory().generate()
     qwen_chat_model = BackupChatModelFactory().generate()
     qwen_light_model = BackupLightChatModelFactory().generate()
+    deepseek_chat_model = DeepSeekChatModelFactory().generate()
+    deepseek_light_model = DeepSeekLightChatModelFactory().generate()
 
     preferred_provider = str(os.environ.get("PRIMARY_LLM_PROVIDER", "minimax") or "minimax").strip().lower()
-    if preferred_provider not in {"minimax", "qwen"}:
+    if preferred_provider not in {"minimax", "token_plan", "qwen", "deepseek"}:
         preferred_provider = "minimax"
 
-    if preferred_provider == "qwen":
-        chat_model = qwen_chat_model or minimax_chat_model
-        light_chat_model = qwen_light_model or minimax_light_model
-        backup_chat_model = minimax_chat_model if (chat_model is not minimax_chat_model) else None
-        backup_light_chat_model = minimax_light_model if (light_chat_model is not minimax_light_model) else None
-    else:
-        chat_model = minimax_chat_model or qwen_chat_model
-        light_chat_model = minimax_light_model or qwen_light_model
-        backup_chat_model = qwen_chat_model if (chat_model is not qwen_chat_model) else None
-        backup_light_chat_model = qwen_light_model if (light_chat_model is not qwen_light_model) else None
+    providers = {
+        "minimax": (minimax_chat_model, minimax_light_model),
+        "token_plan": (token_plan_chat_model, token_plan_light_model),
+        "qwen": (qwen_chat_model, qwen_light_model),
+        "deepseek": (deepseek_chat_model, deepseek_light_model),
+    }
+    provider_order = [preferred_provider] + [name for name in providers if name != preferred_provider]
+    chat_candidates = [(name, providers[name][0]) for name in provider_order if providers[name][0] is not None]
+    light_candidates = [(name, providers[name][1]) for name in provider_order if providers[name][1] is not None]
+
+    selected_provider, chat_model = chat_candidates[0]
+    light_chat_model = light_candidates[0][1] if light_candidates else chat_model
+    backup_chat_model = chat_candidates[1][1] if len(chat_candidates) > 1 else None
+    backup_light_chat_model = light_candidates[1][1] if len(light_candidates) > 1 else None
 
     logger.info(
-        f"[模型工厂] 主模型提供方={preferred_provider}, "
+        f"[模型工厂] 主模型提供方={selected_provider}, "
         f"chat_model={'set' if chat_model else 'none'}, backup_chat_model={'set' if backup_chat_model else 'none'}"
     )
     embed_model = EmbeddingsFactory().generate()
+    if embed_model is None:
+        logger.warning("[模型工厂] 未配置 DashScope Embedding；普通聊天可用，课件上传与 RAG 暂不可用")
     vision_model = VisionModelFactory().generate()
 except Exception as _exc:
     import logging as _logging
